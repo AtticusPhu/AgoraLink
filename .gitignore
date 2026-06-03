@@ -1,0 +1,29 @@
+﻿
+# AgoraLink runtime secrets and local data
+*.key
+*_ed25519.key
+rudp_receiver_ed25519.key
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.pin
+*.pem
+*.p12
+
+# Runtime folders
+pins/
+chat/
+received/
+logs/
+sender_controls/
+
+# Build/cache outputs
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.zip
+*.exe
