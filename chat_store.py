@@ -37,6 +37,8 @@ class ChatStore:
         self._ensure_column("group_members", "peer_ip", "TEXT")
         self._ensure_column("group_members", "peer_port", "INTEGER")
         self._ensure_column("group_members", "last_error", "TEXT")
+        self._ensure_column("messages", "read_at", "REAL")
+        self._ensure_column("message_receipts", "read_at", "REAL")
         self.db.conn.commit()
 
     def _ensure_column(self, table: str, column: str, decl: str) -> None:
@@ -415,6 +417,17 @@ class ChatStore:
         self.db.mark_message_status(str(message_id or ""), "delivered", peer_id=str(peer_id or ""))
         self.refresh_group_message_status(str(message_id or ""))
 
+    def mark_chat_read(self, message_id: str, peer_id: str = "") -> None:
+        self.db.mark_message_status(str(message_id or ""), "read", peer_id=str(peer_id or ""))
+        self.refresh_group_message_status(str(message_id or ""))
+
+    def mark_incoming_read(self, message_id: str) -> None:
+        mid = str(message_id or "")
+        if not mid:
+            return
+        self.db.conn.execute("UPDATE messages SET status='read', read_at=? WHERE message_id=? AND direction='incoming'", (now_ts(), mid))
+        self.db.conn.commit()
+
     def mark_chat_failed(self, message_id: str, peer_id: str = "", error: str = "") -> None:
         self.db.mark_message_status(str(message_id or ""), "failed", peer_id=str(peer_id or ""), error=str(error or ""))
         self.refresh_group_message_status(str(message_id or ""))
@@ -424,9 +437,13 @@ class ChatStore:
         if not rows:
             return "pending"
         statuses = [str(r["status"] or "") for r in rows]
-        if all(s == "delivered" for s in statuses):
+        if all(s == "read" for s in statuses):
+            status = "read"
+        elif any(s == "read" for s in statuses):
+            status = "partially_read"
+        elif all(s in ("delivered", "read") for s in statuses):
             status = "delivered"
-        elif any(s == "delivered" for s in statuses):
+        elif any(s in ("delivered", "read") for s in statuses):
             status = "partially_delivered"
         elif any(s == "sent" for s in statuses):
             status = "sent"
@@ -438,8 +455,92 @@ class ChatStore:
         self.db.conn.commit()
         return status
 
+    def bind_message_file_path(self, message_id: str, saved_path: str) -> str:
+        mid = str(message_id or "").strip()
+        if not mid or not saved_path:
+            return ""
+        row = self.db.conn.execute(
+            "SELECT message_id, text FROM messages WHERE message_id=? AND body_type='file'",
+            (mid,),
+        ).fetchone()
+        if row is None:
+            return ""
+        raw = str(row["text"] or "")
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            obj = {"name": os.path.basename(str(saved_path))}
+        obj["path"] = str(saved_path)
+        if not obj.get("name"):
+            obj["name"] = os.path.basename(str(saved_path))
+        self.db.conn.execute(
+            "UPDATE messages SET text=? WHERE message_id=?",
+            (json.dumps(obj, ensure_ascii=False, separators=(",", ":")), mid),
+        )
+        self.db.conn.commit()
+        return mid
+
+    def bind_latest_incoming_file_path(self, file_name: str, saved_path: str) -> str:
+        target_name = os.path.basename(str(file_name or saved_path or "")).strip()
+        if not target_name or not saved_path:
+            return ""
+        rows = self.db.conn.execute(
+            "SELECT message_id, text FROM messages WHERE direction='incoming' AND body_type='file' ORDER BY created_at DESC LIMIT 100"
+        ).fetchall()
+        for row in rows:
+            mid = str(row["message_id"] or "")
+            raw = str(row["text"] or "")
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            existing_name = os.path.basename(str(obj.get("name") or obj.get("path") or "")).strip()
+            if existing_name != target_name:
+                continue
+            obj["path"] = str(saved_path)
+            self.db.conn.execute("UPDATE messages SET text=? WHERE message_id=?", (json.dumps(obj, ensure_ascii=False, separators=(",", ":")), mid))
+            self.db.conn.commit()
+            return mid
+        return ""
+
     def list_messages(self, group_id: str = "", conversation_id: str = "", limit: int = 100) -> List[Dict[str, object]]:
         return self.db.list_messages(group_id=group_id, conversation_id=conversation_id, limit=limit)
+
+    def unread_count_group(self, group_id: str) -> int:
+        row = self.db.conn.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE group_id=? AND direction='incoming' AND COALESCE(status,'')!='read'",
+            (str(group_id or ""),),
+        ).fetchone()
+        return int(row["n"] or 0) if row else 0
+
+    def unread_count_direct(self, peer_id: str) -> int:
+        try:
+            conv = self.create_direct_conversation(str(peer_id or ""))
+        except Exception:
+            return 0
+        row = self.db.conn.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE conversation_id=? AND direction='incoming' AND COALESCE(status,'')!='read'",
+            (conv,),
+        ).fetchone()
+        return int(row["n"] or 0) if row else 0
+
+    def unread_incoming_for_group(self, group_id: str) -> List[Dict[str, object]]:
+        rows = self.db.conn.execute(
+            "SELECT message_id, sender_peer_id, conversation_id, group_id FROM messages WHERE group_id=? AND direction='incoming' AND COALESCE(status,'')!='read' ORDER BY created_at",
+            (str(group_id or ""),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def unread_incoming_for_direct(self, peer_id: str) -> List[Dict[str, object]]:
+        try:
+            conv = self.create_direct_conversation(str(peer_id or ""))
+        except Exception:
+            return []
+        rows = self.db.conn.execute(
+            "SELECT message_id, sender_peer_id, conversation_id, group_id FROM messages WHERE conversation_id=? AND direction='incoming' AND COALESCE(status,'')!='read' ORDER BY created_at",
+            (conv,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def list_receipts(self, message_id: str) -> List[Dict[str, object]]:
         rows = self.db.conn.execute(
@@ -452,9 +553,17 @@ class ChatStore:
         rows = self.list_receipts(message_id)
         if not rows:
             return ""
-        delivered = sum(1 for r in rows if str(r.get("status") or "") == "delivered")
+        read = sum(1 for r in rows if str(r.get("status") or "") == "read")
+        delivered = sum(1 for r in rows if str(r.get("status") or "") in ("delivered", "read"))
+        sent = sum(1 for r in rows if str(r.get("status") or "") in ("sent", "delivered", "read"))
         failed = sum(1 for r in rows if str(r.get("status") or "") == "failed")
         total = len(rows)
         if failed:
-            return f"delivered {delivered}/{total}, failed {failed}"
-        return f"delivered {delivered}/{total}"
+            return f"read {read}/{total}, delivered {delivered}/{total}, failed {failed}"
+        if read:
+            return f"read {read}/{total}, delivered {delivered}/{total}"
+        if delivered:
+            return f"delivered {delivered}/{total}"
+        if sent:
+            return f"sent {sent}/{total}"
+        return f"pending 0/{total}"

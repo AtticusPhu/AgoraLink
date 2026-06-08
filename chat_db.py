@@ -120,6 +120,7 @@ class ChatDatabase:
                 received_at REAL,
                 sent_at REAL,
                 delivered_at REAL,
+                read_at REAL,
                 status TEXT NOT NULL
             );
 
@@ -129,6 +130,7 @@ class ChatDatabase:
                 status TEXT NOT NULL,
                 sent_at REAL,
                 delivered_at REAL,
+                read_at REAL,
                 failed_at REAL,
                 error TEXT,
                 PRIMARY KEY (message_id, peer_id),
@@ -142,8 +144,16 @@ class ChatDatabase:
             ON messages(conversation_id, created_at);
             """
         )
+        self._ensure_column("messages", "read_at", "REAL")
+        self._ensure_column("message_receipts", "read_at", "REAL")
         self._set_meta("schema_version", str(SCHEMA_VERSION))
         self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, decl: str) -> None:
+        rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        existing = {str(r["name"]) for r in rows}
+        if column not in existing:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def _get_meta(self, key: str) -> Optional[str]:
         row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -251,15 +261,16 @@ class ChatDatabase:
             INSERT OR IGNORE INTO messages(
                 message_id, conversation_id, group_id, sender_peer_id, receiver_peer_id,
                 direction, body_type, encrypted_body, body_nonce, body_alg,
-                created_at, received_at, sent_at, delivered_at, status
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                created_at, received_at, sent_at, delivered_at, read_at, status
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 message_id, conversation_id or None, group_id or None, sender_peer_id, receiver_peer_id or None,
                 direction, body_type, encrypted_body, nonce, alg,
                 created, now_ts() if direction == "incoming" else None,
-                now_ts() if direction == "outgoing" and status in ("sent", "delivered") else None,
-                now_ts() if status == "delivered" else None,
+                now_ts() if direction == "outgoing" and status in ("sent", "delivered", "read") else None,
+                now_ts() if status in ("delivered", "read") else None,
+                now_ts() if status == "read" else None,
                 status,
             ),
         )
@@ -273,7 +284,9 @@ class ChatDatabase:
 
     def mark_message_status(self, message_id: str, status: str, peer_id: str = "", error: str = "") -> None:
         ts = now_ts()
-        if status == "delivered":
+        if status == "read":
+            self.conn.execute("UPDATE messages SET status=?, delivered_at=COALESCE(delivered_at,?), read_at=? WHERE message_id=?", (status, ts, ts, message_id))
+        elif status == "delivered":
             self.conn.execute("UPDATE messages SET status=?, delivered_at=? WHERE message_id=?", (status, ts, message_id))
         elif status == "sent":
             self.conn.execute("UPDATE messages SET status=?, sent_at=? WHERE message_id=?", (status, ts, message_id))
@@ -285,15 +298,16 @@ class ChatDatabase:
 
     def save_receipt(self, message_id: str, peer_id: str, status: str, error: str = "") -> None:
         ts = now_ts()
-        sent_at = ts if status in ("sent", "delivered") else None
-        delivered_at = ts if status == "delivered" else None
+        sent_at = ts if status in ("sent", "delivered", "read") else None
+        delivered_at = ts if status in ("delivered", "read") else None
+        read_at = ts if status == "read" else None
         failed_at = ts if status == "failed" else None
         self.conn.execute(
             """
-            INSERT OR REPLACE INTO message_receipts(message_id,peer_id,status,sent_at,delivered_at,failed_at,error)
-            VALUES(?,?,?,?,?,?,?)
+            INSERT OR REPLACE INTO message_receipts(message_id,peer_id,status,sent_at,delivered_at,read_at,failed_at,error)
+            VALUES(?,?,?,?,?,?,?,?)
             """,
-            (message_id, peer_id, status, sent_at, delivered_at, failed_at, error or None),
+            (message_id, peer_id, status, sent_at, delivered_at, read_at, failed_at, error or None),
         )
 
     def list_messages(self, group_id: str = "", conversation_id: str = "", limit: int = 50) -> List[Dict[str, object]]:

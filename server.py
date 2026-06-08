@@ -38,6 +38,7 @@ from file_transfer_common import (
     build_discovery_response,
     build_chat_ack,
     build_chat_message_log,
+    build_chat_read_log,
     build_contact_request_log,
     build_contact_response,
     build_contact_response_log,
@@ -48,6 +49,7 @@ from file_transfer_common import (
     build_user_error,
     output_conflict_info,
     parse_chat_message,
+    parse_chat_read,
     parse_contact_request,
     parse_file_header,
     print_local_ip_candidates,
@@ -649,6 +651,20 @@ class RUDPFileReceiver:
                     session.send_app_data(server_app_seq, resp_payload)
                     server_app_seq += 1
                     self.logger.info(build_contact_response_log({"request_id": contact_req.get("request_id"), "accepted": bool(accepted), "reason": reason}, peer=f"{peer_addr[0]}:{peer_addr[1]}"))
+                    continue
+                except Exception:
+                    pass
+
+                try:
+                    chat_read = parse_chat_read(data)
+                    chat_seen = True
+                    peer_text = f"{peer_addr[0]}:{peer_addr[1]}"
+                    self.logger.info(build_chat_read_log(chat_read, peer=peer_text))
+                    if chat_db is not None:
+                        try:
+                            chat_db.mark_chat_read(str(chat_read.get("message_id") or ""), str(chat_read.get("reader_peer_id") or ""))
+                        except Exception as exc:
+                            self.logger.warning(f"failed to store chat read receipt: {exc}")
                     continue
                 except Exception:
                     pass

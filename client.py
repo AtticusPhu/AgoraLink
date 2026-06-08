@@ -35,6 +35,8 @@ from file_transfer_common import (
     SEQ_HEADER,
     build_chat_message,
     build_chat_ack_log,
+    build_chat_read,
+    build_chat_read_log,
     build_contact_request,
     build_contact_response_log,
     build_file_header,
@@ -182,6 +184,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--chat-receiver-peer-id", default="", help="Receiver peer_id")
     p.add_argument("--chat-message-id", default="", help="Optional fixed message_id for group fan-out")
     p.add_argument("--chat-created-at", type=float, default=0.0, help="Optional fixed created_at timestamp for group fan-out")
+    p.add_argument("--chat-read-message-id", action="append", default=[], help="Send CHAT_READ receipt for message_id. Repeatable.")
+    p.add_argument("--chat-reader-peer-id", default="", help="Reader peer_id for CHAT_READ receipt")
+    p.add_argument("--chat-body-type", default="text", choices=["text", "file"], help="Chat message body type")
     p.add_argument("--contact-request", action="store_true", help="Send a contact request instead of a file/chat message")
     p.add_argument("--contact-request-id", default="", help="Optional fixed contact request id")
     p.add_argument("--contact-sender-peer-id", default="", help="Contact request sender peer_id")
@@ -422,6 +427,7 @@ def run_chat_client(args: argparse.Namespace, messages: List[str]) -> int:
                 group_id=str(args.chat_group_id or ""),
                 sender_peer_id=str(args.chat_sender_peer_id or "local"),
                 receiver_peer_id=str(args.chat_receiver_peer_id or ""),
+                body_type=str(args.chat_body_type or "text"),
                 created_at=(float(args.chat_created_at) if float(args.chat_created_at or 0.0) > 0 else None),
             )
             if len(payload) > MAX_DATA_APP_PAYLOAD:
@@ -438,6 +444,7 @@ def run_chat_client(args: argparse.Namespace, messages: List[str]) -> int:
                     sender_peer_id=str(args.chat_sender_peer_id or "local"),
                     receiver_peer_id=str(args.chat_receiver_peer_id or ""),
                     direction="outgoing",
+                    body_type=str(args.chat_body_type or "text"),
                     status="sent",
                     created_at=float(chat_obj.get("created_at") or time.time()),
                 )
@@ -497,6 +504,75 @@ def run_chat_client(args: argparse.Namespace, messages: List[str]) -> int:
             pass
 
 
+def run_chat_read_client(args: argparse.Namespace, message_ids: List[str]) -> int:
+    if not bool(getattr(args, "verbose_protocol", False)):
+        os.environ.setdefault("RUDP_VERBOSE_PROTOCOL", "0")
+    logger = setup_logger("AgoraLink-ChatReadSender")
+    clean_ids = [str(m or "").strip() for m in message_ids if str(m or "").strip()]
+    if not clean_ids:
+        raise ValueError("empty_chat_read_message_id")
+
+    sock = None
+    session = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(args.sock_rcvbuf))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(args.sock_sndbuf))
+        sock.bind((str(args.bind_ip), int(args.bind_port)))
+        conn_id = secrets.randbits(64)
+        validator = make_server_identity_validator(
+            str(args.server_pin_file),
+            logger,
+            require_existing_pin=bool(args.require_existing_server_pin),
+        )
+        session = ReliableUDPSession(
+            conn_id,
+            (str(args.server_ip), int(args.server_port)),
+            sock,
+            is_client=True,
+            server_identity_validator=validator,
+        )
+        session.configure_app_delivery(len_only=False, small_payload_threshold=0)
+        session.start_threads(start_receiver=True)
+        _wait_for_handshake(session, args, logger, validator=validator)
+        seq = SEQ_HEADER
+        reader = str(args.chat_reader_peer_id or args.chat_sender_peer_id or "local")
+        for mid in clean_ids:
+            payload = build_chat_read(
+                mid,
+                conversation_id=str(args.chat_conversation_id or ""),
+                group_id=str(args.chat_group_id or ""),
+                reader_peer_id=reader,
+            )
+            if len(payload) > MAX_DATA_APP_PAYLOAD:
+                raise ValueError(f"chat_read_too_large:{len(payload)}")
+            session.send_app_data(seq, payload)
+            logger.info(build_chat_read_log({"message_id": mid, "conversation_id": str(args.chat_conversation_id or ""), "group_id": str(args.chat_group_id or ""), "reader_peer_id": reader, "status": "read"}, peer=f"{args.server_ip}:{args.server_port}"))
+            seq += 1
+        drain_start = time.time()
+        while session.get_unacked_count() > 0:
+            if session.has_fatal_error():
+                raise RuntimeError(session.get_fatal_error() or "fatal protocol error while draining chat read DATA")
+            if time.time() - drain_start > float(args.final_ack_timeout):
+                session.abort("chat_read_drain_timeout")
+                raise TimeoutError("chat read drain timeout")
+            time.sleep(0.05)
+        session.send_app_data(seq, EOF_PAYLOAD)
+        time.sleep(0.1)
+        return 0
+    finally:
+        try:
+            if session is not None:
+                session.stop()
+        except Exception:
+            pass
+        try:
+            if sock is not None:
+                sock.close()
+        except Exception:
+            pass
+
+
 def run_client(args: argparse.Namespace) -> int:
     if not bool(getattr(args, "verbose_protocol", False)):
         os.environ.setdefault("RUDP_VERBOSE_PROTOCOL", "0")
@@ -506,6 +582,10 @@ def run_client(args: argparse.Namespace) -> int:
 
     if bool(getattr(args, "contact_request", False)):
         return run_contact_request_client(args)
+
+    chat_read_ids = [str(x or "") for x in (getattr(args, "chat_read_message_id", []) or []) if str(x or "").strip()]
+    if chat_read_ids and not str(args.file or ""):
+        return run_chat_read_client(args, chat_read_ids)
 
     chat_messages = [str(x or "") for x in (getattr(args, "chat_message", []) or []) if str(x or "").strip()]
     if chat_messages and not str(args.file or ""):
@@ -532,7 +612,16 @@ def run_client(args: argparse.Namespace) -> int:
     total_bytes = input_file.stat().st_size
     logger.info(f"Calculating SHA256: {input_file}")
     file_sha256 = sha256_file(str(input_file))
-    header_msg = build_file_header(str(input_file), payload_size=payload_size, sha256_hex=file_sha256)
+    header_msg = build_file_header(
+        str(input_file),
+        payload_size=payload_size,
+        sha256_hex=file_sha256,
+        chat_message_id=str(getattr(args, "chat_message_id", "") or ""),
+        chat_conversation_id=str(getattr(args, "chat_conversation_id", "") or ""),
+        chat_group_id=str(getattr(args, "chat_group_id", "") or ""),
+        chat_sender_peer_id=str(getattr(args, "chat_sender_peer_id", "") or ""),
+        chat_receiver_peer_id=str(getattr(args, "chat_receiver_peer_id", "") or ""),
+    )
     if len(header_msg) > MAX_DATA_APP_PAYLOAD:
         raise ValueError(f"file metadata header too large: {len(header_msg)} bytes")
 

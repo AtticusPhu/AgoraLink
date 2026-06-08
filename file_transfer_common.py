@@ -19,6 +19,7 @@ APP_HEADER_COMPAT_VERSIONS = {1, 2}
 APP_HEADER_TYPE_FILE = "FILE"
 CHAT_MESSAGE_TYPE = "CHAT_MESSAGE"
 CHAT_ACK_TYPE = "CHAT_ACK"
+CHAT_READ_TYPE = "CHAT_READ"
 CONTACT_REQUEST_TYPE = "CONTACT_REQUEST"
 CONTACT_RESPONSE_TYPE = "CONTACT_RESPONSE"
 CHAT_FRAME_VERSION = 1
@@ -37,6 +38,7 @@ USER_ERROR_LOG_PREFIX = "USER_ERROR_JSON:"
 USER_STATUS_LOG_PREFIX = "USER_STATUS_JSON:"
 CHAT_MESSAGE_LOG_PREFIX = "CHAT_MESSAGE_JSON:"
 CHAT_ACK_LOG_PREFIX = "CHAT_ACK_JSON:"
+CHAT_READ_LOG_PREFIX = "CHAT_READ_JSON:"
 CONTACT_REQUEST_LOG_PREFIX = "CONTACT_REQUEST_JSON:"
 CONTACT_RESPONSE_LOG_PREFIX = "CONTACT_RESPONSE_JSON:"
 
@@ -220,6 +222,45 @@ def parse_chat_ack(data: bytes) -> Dict[str, object]:
     obj["received_at"] = float(obj.get("received_at") or time.time())
     obj["status"] = str(obj.get("status") or "delivered")
     return obj
+
+
+def build_chat_read(message_id: str, *, conversation_id: str = "", group_id: str = "", reader_peer_id: str = "", read_at: Optional[float] = None) -> bytes:
+    obj = {
+        "type": CHAT_READ_TYPE,
+        "version": CHAT_FRAME_VERSION,
+        "message_id": str(message_id or ""),
+        "conversation_id": str(conversation_id or ""),
+        "group_id": str(group_id or ""),
+        "reader_peer_id": str(reader_peer_id or ""),
+        "read_at": float(read_at if read_at is not None else time.time()),
+        "status": "read",
+    }
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def parse_chat_read(data: bytes) -> Dict[str, object]:
+    try:
+        obj = json.loads(bytes(data or b"").decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("chat_read_not_valid_json") from exc
+    if not isinstance(obj, dict) or obj.get("type") != CHAT_READ_TYPE:
+        raise ValueError("unsupported_chat_read_type")
+    if int(obj.get("version") or 0) != CHAT_FRAME_VERSION:
+        raise ValueError("unsupported_chat_read_version")
+    obj["message_id"] = str(obj.get("message_id") or "")
+    obj["conversation_id"] = str(obj.get("conversation_id") or "")
+    obj["group_id"] = str(obj.get("group_id") or "")
+    obj["reader_peer_id"] = str(obj.get("reader_peer_id") or "")
+    obj["read_at"] = float(obj.get("read_at") or time.time())
+    obj["status"] = "read"
+    return obj
+
+
+def build_chat_read_log(read: Dict[str, object], peer: str = "") -> str:
+    obj = dict(read or {})
+    obj["peer"] = str(peer or "")
+    obj["logged_at"] = time.time()
+    return CHAT_READ_LOG_PREFIX + json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
 def build_chat_message_log(message: Dict[str, object], peer: str = "") -> str:
@@ -715,6 +756,11 @@ def build_transfer_request_obj(conn_id: int, peer_addr, meta: Dict[str, object],
         "size": int(meta.get("size") or 0),
         "sha256": str(meta.get("sha256") or ""),
         "save_path": str(out_path),
+        "chat_message_id": str(meta.get("chat_message_id") or ""),
+        "chat_conversation_id": str(meta.get("chat_conversation_id") or ""),
+        "chat_group_id": str(meta.get("chat_group_id") or ""),
+        "chat_sender_peer_id": str(meta.get("chat_sender_peer_id") or ""),
+        "chat_receiver_peer_id": str(meta.get("chat_receiver_peer_id") or ""),
         "ts": time.time(),
     }
     obj.update(extra or {})
@@ -959,7 +1005,17 @@ def resume_candidate_info(directory: str, meta: Dict[str, object]) -> Dict[str, 
     })
     return info
 
-def build_file_header(path: str, payload_size: int, sha256_hex: Optional[str] = None) -> bytes:
+def build_file_header(
+    path: str,
+    payload_size: int,
+    sha256_hex: Optional[str] = None,
+    *,
+    chat_message_id: str = "",
+    chat_conversation_id: str = "",
+    chat_group_id: str = "",
+    chat_sender_peer_id: str = "",
+    chat_receiver_peer_id: str = "",
+) -> bytes:
     p = Path(path)
     if not p.is_file():
         raise FileNotFoundError(str(path))
@@ -976,6 +1032,11 @@ def build_file_header(path: str, payload_size: int, sha256_hex: Optional[str] = 
         "sha256": str(sha256_hex),
         "resume_supported": True,
         "mtime_ns": int(p.stat().st_mtime_ns),
+        "chat_message_id": str(chat_message_id or ""),
+        "chat_conversation_id": str(chat_conversation_id or ""),
+        "chat_group_id": str(chat_group_id or ""),
+        "chat_sender_peer_id": str(chat_sender_peer_id or ""),
+        "chat_receiver_peer_id": str(chat_receiver_peer_id or ""),
     }
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
@@ -1016,4 +1077,9 @@ def parse_file_header(data: bytes) -> Dict[str, object]:
         "sha256": sha256_hex,
         "resume_supported": bool(obj.get("resume_supported", version >= 2)),
         "mtime_ns": int(obj.get("mtime_ns") or 0),
+        "chat_message_id": str(obj.get("chat_message_id") or ""),
+        "chat_conversation_id": str(obj.get("chat_conversation_id") or ""),
+        "chat_group_id": str(obj.get("chat_group_id") or ""),
+        "chat_sender_peer_id": str(obj.get("chat_sender_peer_id") or ""),
+        "chat_receiver_peer_id": str(obj.get("chat_receiver_peer_id") or ""),
     }

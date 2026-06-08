@@ -33,6 +33,8 @@ PROGRESS_RE = re.compile(
     r"avg=(?P<avg>[0-9.]+)\s+Mbps.*?eta=(?P<eta>[^,\s]+)"
 )
 COMPLETE_RE = re.compile(r"Transfer complete:\s+(?P<total>\d+)\s+bytes.*?avg=(?P<avg>[0-9.]+)\s+Mbps")
+RECEIVED_SAVE_RE = re.compile(r"Session\s+(?P<conn>\d+):\s+saved\s+(?P<path>.+?),\s+bytes=")
+RECEIVE_PROGRESS_RE = re.compile(r"Session\s+(?P<conn>\d+):\s+(?P<sent>\d+)/(?:\s*)?(?P<total>\d+)\s+bytes\s+\((?P<pct>[0-9.]+)%\).*?avg=(?P<avg>[0-9.]+)\s+Mbps.*?eta=(?P<eta>[^,\s]+)")
 
 
 def user_data_dir() -> Path:
@@ -70,6 +72,34 @@ def format_file_size(num_bytes: int) -> str:
         n /= 1024.0
     return f"{int(num_bytes)} B"
 
+
+
+def is_image_file_for_preview(path_or_name: str) -> bool:
+    ext = Path(str(path_or_name or "")).suffix.lower()
+    return ext in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
+
+
+def file_type_badge(path_or_name: str) -> str:
+    ext = Path(str(path_or_name or "")).suffix.lower().lstrip(".")
+    if not ext:
+        return "FILE"
+    mapping = {
+        "zip": "ZIP", "rar": "RAR", "7z": "7Z",
+        "pdf": "PDF", "doc": "DOC", "docx": "DOC", "xls": "XLS", "xlsx": "XLS", "ppt": "PPT", "pptx": "PPT",
+        "mp4": "MP4", "mkv": "VID", "avi": "VID", "mov": "MOV",
+        "mp3": "MP3", "wav": "AUD", "flac": "AUD",
+        "exe": "EXE", "msi": "MSI",
+        "txt": "TXT", "py": "PY", "json": "JSON",
+    }
+    return mapping.get(ext, ext[:4].upper())
+
+
+def shorten_middle(value: str, max_chars: int = 34) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    keep = max(4, (max_chars - 1) // 2)
+    return text[:keep] + "…" + text[-keep:]
 
 
 def localized_error_key(code: str) -> str:
@@ -165,6 +195,7 @@ from kivy.uix.button import Button
 from kivy.uix.checkbox import CheckBox
 from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.gridlayout import GridLayout
+from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.progressbar import ProgressBar
@@ -173,10 +204,12 @@ from kivy.uix.spinner import Spinner
 from kivy.uix.tabbedpanel import TabbedPanel, TabbedPanelItem
 from kivy.uix.textinput import TextInput
 from kivy.uix.dropdown import DropDown
+from kivy.graphics import Color, RoundedRectangle
 
 from file_transfer_common import (
     CHAT_MESSAGE_LOG_PREFIX,
     CHAT_ACK_LOG_PREFIX,
+    CHAT_READ_LOG_PREFIX,
     CONTACT_REQUEST_LOG_PREFIX,
     CONTACT_RESPONSE_LOG_PREFIX,
     DEFAULT_DISCOVERY_PORT,
@@ -399,6 +432,140 @@ I18N: Dict[str, Dict[str, str]] = {
 }
 
 
+
+CHAT_UI_TEXT = {
+    "zh": {
+        "search_hint": "搜索好友 / 群聊 / 设备",
+        "recent": "最近聊天",
+        "contacts": "联系人",
+        "devices": "在线设备",
+        "scan_devices": "扫描设备",
+        "add_contact": "加联系人",
+        "choose_chat": "请选择会话",
+        "input_hint": "输入消息，按 Enter 发送",
+        "send": "发送",
+        "send_file": "发送文件",
+        "right_title": "群成员 / 设备信息",
+        "shared_files": "共享文件",
+        "new_group": "新建群",
+        "add_member": "加成员",
+        "remove_member": "移除成员",
+        "leave_group": "退出群",
+        "delete_friend": "删好友",
+        "one_to_one": "一对一：{name}",
+        "group_chat": "群聊：{title} ({gid})",
+        "device_title": "在线设备：先添加联系人后聊天",
+        "no_devices": "未发现在线设备\n点击下方“扫描设备”",
+        "chat_locked": "聊天数据库未解锁",
+        "no_chat": "暂无会话或联系人",
+        "refresh_failed": "刷新失败\n{error}",
+        "file": "文件",
+        "unknown_size": "大小未知",
+        "pending": "pending",
+        "sending_to": "发送给 {peer}",
+        "completed": "已完成",
+        "failed": "失败",
+        "waiting_receive": "等待接收",
+        "receiving": "接收中",
+        "received": "已接收",
+        "state": "状态",
+        "total_size": "总大小",
+        "open_folder": "打开所在位置",
+        "waiting_saved": "等待文件保存",
+        "not_saved": "未保存",
+        "group_prefix": "群聊",
+        "friend_prefix": "好友",
+        "no_message": "暂无消息",
+        "group_name": "群名",
+        "members_count": "成员数量",
+        "contact": "联系人",
+        "peer_id": "peer_id",
+        "fingerprint": "fingerprint",
+        "ip": "IP",
+        "group_members_title": "群成员",
+        "friend_info": "好友信息",
+        "member_detail_hint": "点击成员查看详细信息",
+        "member_detail": "成员详情",
+        "nickname": "昵称",
+        "member_state": "成员状态",
+        "endpoint": "地址",
+        "ctx_open_chat": "打开聊天",
+        "ctx_view_profile": "查看资料",
+        "ctx_delete_friend": "删除好友",
+        "ctx_join_group": "加入群",
+        "ctx_leave_group": "退出群聊",
+        "ctx_rescan_ip": "重新扫描 IP",
+        "ctx_add_contact": "添加联系人",
+        "today": "今天",
+        "yesterday": "昨天",
+    },
+    "en": {
+        "search_hint": "Search friends / groups / devices",
+        "recent": "Recent",
+        "contacts": "Contacts",
+        "devices": "Devices",
+        "scan_devices": "Scan",
+        "add_contact": "Add",
+        "choose_chat": "Select a chat",
+        "input_hint": "Type a message, press Enter to send",
+        "send": "Send",
+        "send_file": "File",
+        "right_title": "Members / Device Info",
+        "shared_files": "Shared Files",
+        "new_group": "New Group",
+        "add_member": "Add Member",
+        "remove_member": "Remove",
+        "leave_group": "Leave",
+        "delete_friend": "Delete",
+        "one_to_one": "Chat with {name}",
+        "group_chat": "Group: {title} ({gid})",
+        "device_title": "Online device: add contact first",
+        "no_devices": "No online devices\nClick Scan",
+        "chat_locked": "Chat database is locked",
+        "no_chat": "No chats or contacts",
+        "refresh_failed": "Refresh failed\n{error}",
+        "file": "File",
+        "unknown_size": "Unknown size",
+        "pending": "pending",
+        "sending_to": "Sending to {peer}",
+        "completed": "Complete",
+        "failed": "Failed",
+        "waiting_receive": "Waiting",
+        "receiving": "Receiving",
+        "received": "Received",
+        "state": "Status",
+        "total_size": "Total",
+        "open_folder": "Open Folder",
+        "waiting_saved": "Waiting for file",
+        "not_saved": "Not saved",
+        "group_prefix": "Group",
+        "friend_prefix": "Friend",
+        "no_message": "No messages",
+        "group_name": "Group",
+        "members_count": "Members",
+        "contact": "Contact",
+        "peer_id": "peer_id",
+        "fingerprint": "fingerprint",
+        "ip": "IP",
+        "group_members_title": "Group Members",
+        "friend_info": "Friend Info",
+        "member_detail_hint": "Click a member to view details",
+        "member_detail": "Member Details",
+        "nickname": "Nickname",
+        "member_state": "Member State",
+        "endpoint": "Endpoint",
+        "ctx_open_chat": "Open Chat",
+        "ctx_view_profile": "View Profile",
+        "ctx_delete_friend": "Delete Friend",
+        "ctx_join_group": "Add to Group",
+        "ctx_leave_group": "Leave Group",
+        "ctx_rescan_ip": "Rescan IP",
+        "ctx_add_contact": "Add Contact",
+        "today": "Today",
+        "yesterday": "Yesterday",
+    },
+}
+
 def find_cjk_font() -> Optional[str]:
     """Return a font that can render Chinese.
 
@@ -456,27 +623,29 @@ UI_FONT = register_ui_font()
 # Centralized UI theme. Kivy color values are RGBA floats in the range 0..1.
 # Change these values if you want a different visual style.
 THEME = {
-    # White-first application style. Kivy color values are RGBA floats.
-    "window_bg": (0.985, 0.990, 0.995, 1),
+    # Blue-white chat style. Accent background requested by user: #E0EDF8.
+    "window_bg": (0.965, 0.976, 0.992, 1),
     "panel_bg": (1.000, 1.000, 1.000, 1),
-    "primary": (0.145, 0.365, 0.760, 1),
-    "primary_active": (0.095, 0.255, 0.620, 1),
-    "secondary": (0.955, 0.965, 0.985, 1),
-    "secondary_active": (0.900, 0.925, 0.970, 1),
+    "primary": (0.330, 0.510, 0.760, 1),
+    "primary_active": (0.250, 0.435, 0.690, 1),
+    "secondary": (0.878, 0.929, 0.973, 1),
+    "secondary_active": (0.820, 0.890, 0.960, 1),
     "success": (0.150, 0.560, 0.320, 1),
     "success_active": (0.090, 0.430, 0.230, 1),
     "danger": (0.780, 0.200, 0.200, 1),
     "danger_active": (0.610, 0.130, 0.130, 1),
-    "text": (0.070, 0.085, 0.115, 1),
-    "muted_text": (0.390, 0.425, 0.500, 1),
+    "text": (0.090, 0.120, 0.180, 1),
+    "muted_text": (0.420, 0.470, 0.560, 1),
     "on_primary": (1.000, 1.000, 1.000, 1),
-    "on_secondary": (0.070, 0.085, 0.115, 1),
-    "input_bg": (1.000, 1.000, 1.000, 1),
-    "input_text": (0.070, 0.085, 0.115, 1),
-    "input_cursor": (0.145, 0.365, 0.760, 1),
-    "log_bg": (0.985, 0.990, 0.995, 1),
-    "log_text": (0.080, 0.095, 0.125, 1),
+    "on_secondary": (0.090, 0.120, 0.180, 1),
+    "input_bg": (0.980, 0.988, 0.998, 1),
+    "input_text": (0.090, 0.120, 0.180, 1),
+    "input_cursor": (0.330, 0.510, 0.760, 1),
+    "log_bg": (0.980, 0.988, 0.998, 1),
+    "log_text": (0.090, 0.120, 0.180, 1),
     "disabled": (0.720, 0.750, 0.800, 1),
+    "bubble_mine": (0.878, 0.929, 0.973, 1),
+    "bubble_other": (1.000, 1.000, 1.000, 1),
 }
 
 _BUTTON_ROLES = {
@@ -560,6 +729,23 @@ def style_popup(popup: Popup) -> Popup:
     except Exception:
         pass
     return popup
+
+
+def apply_card_background(widget, bg_key: str = "panel_bg", radius: int = 18) -> None:
+    try:
+        color = THEME.get(bg_key, THEME["panel_bg"])
+        with widget.canvas.before:
+            widget._bg_instr = Color(*color)
+            widget._bg_rect = RoundedRectangle(pos=widget.pos, size=widget.size, radius=[radius, radius, radius, radius])
+        def _sync(*_args):
+            try:
+                widget._bg_rect.pos = widget.pos
+                widget._bg_rect.size = widget.size
+            except Exception:
+                pass
+        widget.bind(pos=_sync, size=_sync)
+    except Exception:
+        pass
 
 
 def bind_label_wrap(label: Label) -> Label:
@@ -712,13 +898,22 @@ def open_file_location(path: str) -> None:
 
 
 class ChatMessageBox(BoxLayout):
-    def __init__(self, **kwargs):
+    def __init__(self, root_owner=None, **kwargs):
         super().__init__(orientation="vertical", **kwargs)
+        self.root_owner = root_owner
         self.scroll = ScrollView(size_hint_y=1)
         self.inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(8), padding=(dp(8), dp(8), dp(8), dp(8)))
         self.inner.bind(minimum_height=self.inner.setter("height"))
         self.scroll.add_widget(self.inner)
         self.add_widget(self.scroll)
+
+    def _cu(self, key: str, **kwargs) -> str:
+        owner = getattr(self, "root_owner", None)
+        if owner is not None and hasattr(owner, "cu"):
+            return owner.cu(key, **kwargs)
+        lang = "zh"
+        value = CHAT_UI_TEXT.get(lang, {}).get(key, key)
+        return value.format(**kwargs) if kwargs else value
 
     def append(self, s: str) -> None:
         def _append(_dt):
@@ -735,31 +930,126 @@ class ChatMessageBox(BoxLayout):
     def clear(self) -> None:
         self.inner.clear_widgets()
 
-    def add_message(self, *, mine: bool, sender: str, text: str, timestamp: str, summary: str = "", body_type: str = "text", file_path: str = "") -> None:
-        line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(86 if body_type == "file" else 70))
-        spacer_left = BoxLayout(size_hint_x=0.24 if mine else 0.02)
-        spacer_right = BoxLayout(size_hint_x=0.02 if mine else 0.24)
-        bubble = BoxLayout(orientation="vertical", spacing=dp(3), padding=(dp(10), dp(6), dp(10), dp(6)), size_hint_x=0.74)
-        header = f"{timestamp}  {'我' if mine else sender}"
-        if summary:
-            header += f"  {summary}"
-        bubble.add_widget(make_label(text=header, size_hint_y=None, height=dp(20), halign="right" if mine else "left", color=THEME["muted_text"]))
-        if body_type == "file":
-            file_name = os.path.basename(file_path or text) or text or "文件"
-            bubble.add_widget(make_label(text=f"[文件] {file_name}", size_hint_y=None, height=dp(24), halign="right" if mine else "left", color=THEME["text"]))
-            btn = make_button("secondary", text="打开所在位置", size_hint_y=None, height=dp(30), on_release=lambda *_p, path=file_path: open_file_location(path))
-            bubble.add_widget(btn)
+    def add_date_separator(self, label: str) -> None:
+        line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(30), padding=(0, dp(4), 0, dp(4)))
+        line.add_widget(BoxLayout())
+        chip = BoxLayout(orientation="vertical", size_hint_x=None, width=dp(112), padding=(dp(8), dp(3), dp(8), dp(3)))
+        apply_card_background(chip, "secondary", radius=14)
+        lab = make_label(text=str(label or ""), halign="center", valign="middle", color=THEME["muted_text"], size_hint_y=None, height=dp(18))
+        bind_label_wrap(lab)
+        chip.add_widget(lab)
+        line.add_widget(chip)
+        line.add_widget(BoxLayout())
+        self.inner.add_widget(line)
+
+    def _status_state(self, summary: str, mine: bool) -> tuple[str, tuple]:
+        if not mine:
+            return "", THEME["muted_text"]
+        s = str(summary or "").lower()
+        if "failed" in s:
+            return "!", THEME["danger"]
+        m_read = re.search(r"read\s+(\d+)/(\d+)", s)
+        if m_read:
+            read = int(m_read.group(1)); total = int(m_read.group(2))
+            if total > 0 and read >= total:
+                return "√√", THEME["primary_active"]
+        m_del = re.search(r"delivered\s+(\d+)/(\d+)", s)
+        if m_del:
+            delivered = int(m_del.group(1)); total = int(m_del.group(2))
+            if total > 0 and delivered >= total:
+                return "√√", THEME["primary_active"]
+            return "√", THEME["primary_active"]
+        m_sent = re.search(r"sent\s+(\d+)/(\d+)", s)
+        if m_sent:
+            return "√", THEME["primary_active"]
+        return "√√", THEME["disabled"]
+
+    def _add_footer(self, parent: BoxLayout, *, mine: bool, timestamp: str, summary: str) -> None:
+        footer = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(18), spacing=dp(4))
+        footer.add_widget(BoxLayout())
+        footer.add_widget(make_label(text=str(timestamp or ""), size_hint_x=None, width=dp(38), halign="right", valign="middle", color=THEME["muted_text"]))
+        icon, color = self._status_state(summary, mine)
+        if icon:
+            footer.add_widget(make_label(text=icon, size_hint_x=None, width=dp(22), halign="left", valign="middle", color=color, bold=True))
+        parent.add_widget(footer)
+
+    def _add_file_thumbnail(self, parent: BoxLayout, file_path: str, file_name: str) -> None:
+        thumb = BoxLayout(size_hint_x=None, width=dp(62), padding=(dp(4), dp(4), dp(4), dp(4)))
+        apply_card_background(thumb, "secondary_active", radius=12)
+        source = file_path if file_path and os.path.exists(file_path) else ""
+        if source and is_image_file_for_preview(source):
+            try:
+                img = Image(source=source, allow_stretch=True, keep_ratio=True)
+                thumb.add_widget(img)
+            except Exception:
+                thumb.add_widget(make_label(text=file_type_badge(file_name), halign="center", valign="middle", bold=True, color=THEME["primary_active"]))
         else:
-            lab = make_label(text=str(text or ""), size_hint_y=None, height=dp(34), halign="right" if mine else "left", color=THEME["text"])
+            lab = make_label(text=file_type_badge(file_name), halign="center", valign="middle", bold=True, color=THEME["primary_active"])
+            bind_label_wrap(lab)
+            thumb.add_widget(lab)
+        parent.add_widget(thumb)
+
+    def add_message(self, *, mine: bool, sender: str, text: str, timestamp: str, summary: str = "", body_type: str = "text", file_path: str = "", message_id: str = "", progress_text: str = "", total_size: int = 0) -> None:
+        is_file = body_type == "file"
+        raw_text = str(text or "")
+        if is_file:
+            line_height = 128
+            bubble_width = 300
+        else:
+            # The minimum text bubble must still contain the footer: time + double-check.
+            # 106dp = horizontal padding + timestamp width + double-check width + spacing.
+            text_len = max(1, len(raw_text))
+            line_height = 48 if text_len <= 8 else (58 if text_len <= 18 else 74)
+            char_units = 0
+            for ch in raw_text:
+                char_units += 2 if ord(ch) > 127 else 1
+            content_width = 30 + min(42, char_units) * 7
+            bubble_width = max(106, min(286, content_width))
+        line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(line_height), padding=(0, dp(3), 0, dp(3)))
+        if mine:
+            spacer_left = BoxLayout(size_hint_x=1)
+            spacer_right = BoxLayout(size_hint_x=None, width=dp(8))
+        else:
+            spacer_left = BoxLayout(size_hint_x=None, width=dp(8))
+            spacer_right = BoxLayout(size_hint_x=1)
+        bubble = BoxLayout(orientation="vertical", spacing=dp(3), padding=(dp(9), dp(6), dp(9), dp(5)), size_hint_x=None, width=dp(bubble_width))
+        apply_card_background(bubble, "bubble_mine" if mine else "bubble_other", radius=16)
+
+        if is_file:
+            file_name = os.path.basename(file_path or text) or text or self._cu("file")
+            content = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(64))
+            self._add_file_thumbnail(content, file_path, file_name)
+            meta = BoxLayout(orientation="vertical", spacing=dp(2))
+            name_lab = make_label(text=shorten_middle(file_name, 20), size_hint_y=None, height=dp(24), halign="left", valign="middle", color=THEME["text"], bold=True)
+            name_lab.shorten = True
+            name_lab.shorten_from = "right"
+            bind_label_wrap(name_lab)
+            meta.add_widget(name_lab)
+            status_line = progress_text
+            if not status_line:
+                total_part = f"{format_file_size(int(total_size or 0))}" if int(total_size or 0) > 0 else self._cu("unknown_size")
+                status_line = f"{summary or self._cu('pending')}  {total_part}"
+            status_lab = make_label(text=status_line, size_hint_y=None, height=dp(36), halign="left", valign="middle", color=THEME["muted_text"])
+            status_lab.shorten = True
+            status_lab.shorten_from = "right"
+            bind_label_wrap(status_lab)
+            meta.add_widget(status_lab)
+            content.add_widget(meta)
+            bubble.add_widget(content)
+            if not mine:
+                btn = make_button("secondary", text=self._cu("open_folder") if file_path else self._cu("waiting_saved"), size_hint_y=None, height=dp(28), on_release=lambda *_p, path=file_path: open_file_location(path))
+                btn.disabled = not bool(file_path)
+                bubble.add_widget(btn)
+            self._add_footer(bubble, mine=mine, timestamp=timestamp, summary=summary)
+        else:
+            lab_h = dp(20 if len(str(text or "")) <= 18 else 34)
+            lab = make_label(text=str(text or ""), size_hint_y=None, height=lab_h, halign="left", valign="middle", color=THEME["text"])
             bind_label_wrap(lab)
             bubble.add_widget(lab)
-        if mine:
-            line.add_widget(spacer_left); line.add_widget(bubble); line.add_widget(spacer_right)
-        else:
-            line.add_widget(spacer_left); line.add_widget(bubble); line.add_widget(spacer_right)
+            self._add_footer(bubble, mine=mine, timestamp=timestamp, summary=summary)
+        line.add_widget(spacer_left); line.add_widget(bubble); line.add_widget(spacer_right)
         self.inner.add_widget(line)
         self.scroll.scroll_y = 0
-
 
 class RUDPTransferRoot(BoxLayout):
     def __init__(self, app: "RUDPTransferApp", **kwargs):
@@ -794,16 +1084,26 @@ class RUDPTransferRoot(BoxLayout):
         self.selected_contact: Optional[Dict[str, object]] = None
         self.selected_device: Optional[Dict[str, object]] = None
         self.selected_group: Optional[Dict[str, object]] = None
+        self.selected_chat_entry_value: str = ""
+        self.file_message_progress: Dict[str, Dict[str, object]] = {}
+        self.current_receiving_file_message_id = ""
+        self.receiving_file_message_by_conn: Dict[int, str] = {}
+        self._chat_render_sig: Optional[Tuple[object, ...]] = None
         self.pending_outgoing_contact_requests: Dict[str, Dict[str, object]] = {}
         self._build()
         self.refresh_texts()
         self.refresh_local_ips()
         Clock.schedule_interval(self.poll_approval_requests, 0.5)
         Clock.schedule_interval(self.poll_contact_requests, 0.5)
+        Clock.schedule_interval(lambda _dt: self._auto_refresh_current_chat(), 0.35)
         Clock.schedule_once(lambda _dt: self.show_startup_unlock_popup(), 0.2)
 
     def t(self, key: str, **kwargs) -> str:
         text = I18N[self.lang].get(key, key)
+        return text.format(**kwargs) if kwargs else text
+
+    def cu(self, key: str, **kwargs) -> str:
+        text = CHAT_UI_TEXT.get(self.lang, CHAT_UI_TEXT.get("zh", {})).get(key, key)
         return text.format(**kwargs) if kwargs else text
 
     def _build(self) -> None:
@@ -1023,68 +1323,165 @@ class RUDPTransferRoot(BoxLayout):
 
 
     def _build_agora_chat_main(self) -> BoxLayout:
-        root = BoxLayout(orientation="horizontal", spacing=dp(8), padding=dp(8))
+        root = BoxLayout(orientation="horizontal", spacing=dp(12), padding=dp(12))
 
-        left = BoxLayout(orientation="vertical", size_hint_x=None, width=dp(260), spacing=dp(6))
-        self.chat_nav = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(4))
-        self.recent_btn = make_button("active", text="最近聊天", on_release=lambda *_: self.set_chat_section("recent"))
-        self.groups_btn = make_button("secondary", text="联系人", on_release=lambda *_: self.set_chat_section("contacts"))
-        self.devices_btn = make_button("secondary", text="在线设备", on_release=lambda *_: self.set_chat_section("devices"))
+        left = BoxLayout(orientation="vertical", size_hint_x=None, width=dp(290), spacing=dp(10), padding=(dp(12), dp(12), dp(12), dp(12)))
+        apply_card_background(left, "panel_bg", radius=22)
+        self.profile_name_label = make_label(text=self.chat_nickname or "AgoraLink", size_hint_y=None, height=dp(32), halign="left", valign="middle", bold=True)
+        bind_label_wrap(self.profile_name_label)
+        left.add_widget(self.profile_name_label)
+        self.profile_peer_label = make_label(text=self.chat_local_peer_id or "", size_hint_y=None, height=dp(20), halign="left", valign="middle", color=THEME["muted_text"])
+        bind_label_wrap(self.profile_peer_label)
+        left.add_widget(self.profile_peer_label)
+        self.chat_filter_input = make_input(text="", multiline=False, size_hint_y=None, height=dp(38))
+        self.chat_filter_input.hint_text = self.cu("search_hint")
+        self.chat_filter_input.bind(text=lambda *_: self.refresh_chat_main())
+        left.add_widget(self.chat_filter_input)
+        self.chat_nav = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(6))
+        self.recent_btn = make_button("active", text=self.cu("recent"), on_release=lambda *_: self.set_chat_section("recent"))
+        self.groups_btn = make_button("secondary", text=self.cu("contacts"), on_release=lambda *_: self.set_chat_section("contacts"))
+        self.devices_btn = make_button("secondary", text=self.cu("devices"), on_release=lambda *_: self.set_chat_section("devices"))
         self.chat_nav.add_widget(self.recent_btn)
         self.chat_nav.add_widget(self.groups_btn)
         self.chat_nav.add_widget(self.devices_btn)
         left.add_widget(self.chat_nav)
 
         self.chat_items_scroll = ScrollView(size_hint_y=1)
-        self.chat_items_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4), padding=(0, dp(2), 0, dp(2)))
+        self.chat_items_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(6), padding=(0, dp(2), 0, dp(2)))
         self.chat_items_box.bind(minimum_height=self.chat_items_box.setter("height"))
         self.chat_items_scroll.add_widget(self.chat_items_box)
         left.add_widget(self.chat_items_scroll)
-        # Hidden compatibility holders used by older selection functions.
+
         self.chat_list_box = LogBox(size_hint_y=None, height=0, opacity=0)
         self.chat_list_spinner = style_spinner(Spinner(text="", values=[], size_hint_y=None, height=0, font_name=UI_FONT))
         self.chat_list_spinner.bind(text=lambda _i, value: self.on_chat_list_selected(value))
         left.add_widget(self.chat_list_box)
         left.add_widget(self.chat_list_spinner)
-        list_actions = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(4))
-        list_actions.add_widget(make_button("secondary", text="刷新", on_release=lambda *_: self.refresh_chat_main()))
-        self.scan_devices_btn = make_button("secondary", text="扫描设备", on_release=lambda *_: self.scan_devices_for_chat())
+
+        list_actions = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(6))
+        self.scan_devices_btn = make_button("secondary", text=self.cu("scan_devices"), on_release=lambda *_: self.scan_devices_for_chat())
         list_actions.add_widget(self.scan_devices_btn)
-        list_actions.add_widget(make_button("primary", text="加联系人", on_release=lambda *_: self.request_or_add_selected_device()))
+        self.add_contact_btn = make_button("primary", text=self.cu("add_contact"), on_release=lambda *_: self.request_or_add_selected_device())
+        list_actions.add_widget(self.add_contact_btn)
         left.add_widget(list_actions)
         root.add_widget(left)
 
-        center = BoxLayout(orientation="vertical", spacing=dp(6))
-        self.current_chat_title = make_label(text="请选择会话", size_hint_y=None, height=dp(34), halign="left", valign="middle", bold=True)
+        center = BoxLayout(orientation="vertical", spacing=dp(10), padding=(dp(12), dp(12), dp(12), dp(12)))
+        apply_card_background(center, "panel_bg", radius=22)
+        title_bar = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(8))
+        self.current_chat_title = make_label(text=self.cu("choose_chat"), size_hint_y=None, height=dp(34), halign="left", valign="middle", bold=True)
         bind_label_wrap(self.current_chat_title)
-        center.add_widget(self.current_chat_title)
-        self.main_messages_box = ChatMessageBox()
+        title_bar.add_widget(self.current_chat_title)
+        self.online_state_btn = make_button("secondary", text="Online", size_hint_x=None, width=dp(88), on_release=lambda *_: self.toggle_online_state())
+        title_bar.add_widget(self.online_state_btn)
+        center.add_widget(title_bar)
+        self.main_messages_box = ChatMessageBox(root_owner=self)
         center.add_widget(self.main_messages_box)
-        input_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(6))
+        input_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(46), spacing=dp(8))
         self.main_message_input = make_input(text="", multiline=False)
+        self.main_message_input.hint_text = self.cu("input_hint")
+        self.main_message_input.bind(on_text_validate=lambda *_: self.send_current_chat_message())
         input_line.add_widget(self.main_message_input)
-        input_line.add_widget(make_button("primary", text="发送", size_hint_x=None, width=dp(90), on_release=lambda *_: self.send_current_chat_message()))
-        input_line.add_widget(make_button("secondary", text="发送文件", size_hint_x=None, width=dp(105), on_release=lambda *_: self.send_file_to_current_chat()))
+        self.main_send_btn = make_button("primary", text=self.cu("send"), size_hint_x=None, width=dp(88), on_release=lambda *_: self.send_current_chat_message())
+        input_line.add_widget(self.main_send_btn)
+        self.main_file_btn = make_button("secondary", text=self.cu("send_file"), size_hint_x=None, width=dp(104), on_release=lambda *_: self.send_file_to_current_chat())
+        input_line.add_widget(self.main_file_btn)
         center.add_widget(input_line)
         root.add_widget(center)
 
-        right = BoxLayout(orientation="vertical", size_hint_x=None, width=dp(290), spacing=dp(6))
-        self.right_title = make_label(text="群成员 / 设备信息", size_hint_y=None, height=dp(34), halign="left", valign="middle", bold=True)
+        right = BoxLayout(orientation="vertical", size_hint_x=None, width=dp(300), spacing=dp(8), padding=(dp(12), dp(12), dp(12), dp(12)))
+        apply_card_background(right, "panel_bg", radius=22)
+        self.right_title = make_label(text=self.cu("right_title"), size_hint_y=None, height=dp(30), halign="left", valign="middle", bold=True)
         bind_label_wrap(self.right_title)
         right.add_widget(self.right_title)
-        self.right_info_box = LogBox()
+        self.right_member_scroll = ScrollView(size_hint_y=None, height=dp(210))
+        self.right_member_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(6), padding=(0, 0, 0, dp(4)))
+        self.right_member_box.bind(minimum_height=self.right_member_box.setter("height"))
+        self.right_member_scroll.add_widget(self.right_member_box)
+        right.add_widget(self.right_member_scroll)
+        self.right_info_box = LogBox(size_hint_y=None, height=dp(120))
         right.add_widget(self.right_info_box)
-        action1 = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(4))
-        action1.add_widget(make_button("success", text="新建群", on_release=lambda *_: self.open_group_popup()))
-        action1.add_widget(make_button("secondary", text="加成员", on_release=lambda *_: self.add_selected_contact_to_current_group()))
-        right.add_widget(action1)
-        action2 = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(4))
-        action2.add_widget(make_button("danger", text="移除成员", on_release=lambda *_: self.confirm_remove_member()))
-        action2.add_widget(make_button("danger", text="退出群", on_release=lambda *_: self.confirm_leave_group()))
-        action2.add_widget(make_button("danger", text="删好友", on_release=lambda *_: self.confirm_delete_contact()))
-        right.add_widget(action2)
+        self.shared_title = make_label(text=self.cu("shared_files"), size_hint_y=None, height=dp(26), halign="left", valign="middle", bold=True)
+        shared_title = self.shared_title
+        right.add_widget(shared_title)
+        self.shared_files_scroll = ScrollView(size_hint_y=1)
+        self.shared_files_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(6), padding=(0, 0, 0, dp(4)))
+        self.shared_files_box.bind(minimum_height=self.shared_files_box.setter("height"))
+        self.shared_files_scroll.add_widget(self.shared_files_box)
+        right.add_widget(self.shared_files_scroll)
+        self.right_action1 = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(4))
+        self.new_group_btn = make_button("success", text=self.cu("new_group"), on_release=lambda *_: self.open_group_popup())
+        self.right_action1.add_widget(self.new_group_btn)
+        self.add_member_main_btn = make_button("secondary", text=self.cu("add_member"), on_release=lambda *_: self.add_selected_contact_to_current_group())
+        self.right_action1.add_widget(self.add_member_main_btn)
+        right.add_widget(self.right_action1)
+        self.right_action2 = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(4))
+        self.remove_member_main_btn = make_button("danger", text=self.cu("remove_member"), on_release=lambda *_: self.confirm_remove_member())
+        self.right_action2.add_widget(self.remove_member_main_btn)
+        self.leave_group_main_btn = make_button("danger", text=self.cu("leave_group"), on_release=lambda *_: self.confirm_leave_group())
+        self.right_action2.add_widget(self.leave_group_main_btn)
+        self.delete_friend_main_btn = make_button("danger", text=self.cu("delete_friend"), on_release=lambda *_: self.confirm_delete_contact())
+        self.right_action2.add_widget(self.delete_friend_main_btn)
+        right.add_widget(self.right_action2)
         root.add_widget(right)
+        Clock.schedule_once(lambda _dt: self._set_right_action_mode("none"), 0)
         return root
+
+    def toggle_online_state(self) -> None:
+        try:
+            running = self.receiver_worker.is_running()
+        except Exception:
+            running = False
+        if running:
+            try:
+                self.receiver_worker.stop()
+            except Exception:
+                pass
+            if hasattr(self, "online_state_btn"):
+                self.online_state_btn.text = "Offline"
+                style_button(self.online_state_btn, "secondary")
+        else:
+            try:
+                self.start_receiver()
+            except Exception:
+                pass
+            if hasattr(self, "online_state_btn"):
+                self.online_state_btn.text = "Online"
+                style_button(self.online_state_btn, "active")
+
+    def _set_widget_visible(self, widget, visible: bool, height: int = 38) -> None:
+        try:
+            widget.disabled = not bool(visible)
+            widget.opacity = 1.0 if visible else 0.0
+            widget.height = dp(height) if visible else 0
+            widget.size_hint_y = None
+        except Exception:
+            pass
+
+    def _set_button_visible(self, button, visible: bool) -> None:
+        try:
+            button.disabled = not bool(visible)
+            button.opacity = 1.0 if visible else 0.0
+            button.size_hint_x = 1 if visible else None
+            button.width = dp(80) if visible else 0
+        except Exception:
+            pass
+
+    def _set_right_action_mode(self, mode: str) -> None:
+        is_direct = mode == "direct"
+        is_group = mode == "group"
+        if hasattr(self, "right_action1"):
+            self._set_widget_visible(self.right_action1, False)
+        if hasattr(self, "right_action2"):
+            self._set_widget_visible(self.right_action2, is_direct or is_group)
+        if hasattr(self, "right_member_scroll"):
+            self._set_widget_visible(self.right_member_scroll, is_group, height=210)
+        if hasattr(self, "remove_member_main_btn"):
+            self._set_button_visible(self.remove_member_main_btn, is_group)
+        if hasattr(self, "leave_group_main_btn"):
+            self._set_button_visible(self.leave_group_main_btn, is_group)
+        if hasattr(self, "delete_friend_main_btn"):
+            self._set_button_visible(self.delete_friend_main_btn, is_direct)
 
     def set_chat_section(self, section: str) -> None:
         self.current_chat_section = str(section or "recent")
@@ -1103,8 +1500,19 @@ class RUDPTransferRoot(BoxLayout):
         values = []
         for label, value in entries:
             values.append(value)
-            btn = make_button("secondary", text=str(label), size_hint_y=None, height=dp(52))
+            role = "active" if str(value or "") == str(getattr(self, "selected_chat_entry_value", "") or "") else "secondary"
+            btn = make_button(role, text=str(label), size_hint_y=None, height=dp(62))
+            btn.halign = "center"
+            btn.valign = "middle"
+            btn.shorten = False
+            btn.bind(size=lambda inst, _val: setattr(inst, "text_size", (inst.width - dp(16), None)))
             btn.bind(on_release=lambda _btn, v=value: self._select_chat_entry(v))
+            def _right_click(inst, touch, v=value):
+                if getattr(touch, "button", "") == "right" and inst.collide_point(*touch.pos):
+                    self._open_chat_entry_context_menu(inst, str(v or ""))
+                    return True
+                return False
+            btn.bind(on_touch_down=_right_click)
             self.chat_items_box.add_widget(btn)
         self.chat_list_spinner.values = values
         if values and self.chat_list_spinner.text not in values:
@@ -1112,16 +1520,166 @@ class RUDPTransferRoot(BoxLayout):
         elif not values:
             self.chat_list_spinner.text = ""
 
+    def _open_chat_entry_context_menu(self, anchor, value: str) -> None:
+        value = str(value or "")
+        if not value:
+            return
+        menu = DropDown(auto_width=False, width=dp(180))
+        def add_item(label: str, callback):
+            btn = make_button("secondary", text=label, size_hint_y=None, height=dp(36))
+            def _run(*_):
+                try:
+                    menu.dismiss()
+                except Exception:
+                    pass
+                callback()
+            btn.bind(on_release=_run)
+            menu.add_widget(btn)
+        add_item(self.cu("ctx_open_chat"), lambda: self._select_chat_entry(value))
+        if value.startswith("direct::"):
+            _tag, pid, name = value.split("::", 2)
+            add_item(self.cu("ctx_view_profile"), lambda pid=pid: self._show_direct_profile_popup(pid))
+            add_item(self.cu("ctx_join_group"), lambda pid=pid: self._add_peer_to_group_popup(pid))
+            add_item(self.cu("ctx_rescan_ip"), lambda: self.search_receivers())
+            add_item(self.cu("ctx_delete_friend"), lambda v=value: (self._select_chat_entry(v), self.confirm_delete_contact()))
+        elif value.startswith("group::"):
+            add_item(self.cu("ctx_join_group"), lambda v=value: (self._select_chat_entry(v), self.add_selected_contact_to_current_group()))
+            add_item(self.cu("ctx_leave_group"), lambda v=value: (self._select_chat_entry(v), self.confirm_leave_group()))
+        else:
+            add_item(self.cu("ctx_add_contact"), lambda v=value: (self._select_chat_entry(v), self.request_or_add_selected_device()))
+            add_item(self.cu("ctx_rescan_ip"), lambda: self.search_receivers())
+        menu.open(anchor)
+
+    def _show_direct_profile_popup(self, peer_id: str) -> None:
+        if self.chat_store is None:
+            return
+        contact = None
+        for c in self.chat_store.list_contacts():
+            if str(c.get("peer_id") or "") == str(peer_id or ""):
+                contact = c
+                break
+        if not contact:
+            return
+        msg = (
+            f"{self.cu('contact')}: {contact.get('remark_name') or contact.get('display_name') or contact.get('nickname') or contact.get('peer_id')}\n"
+            f"{self.cu('peer_id')}: {contact.get('peer_id')}\n"
+            f"{self.cu('fingerprint')}: {self._short_fp(str(contact.get('fingerprint') or ''))}\n"
+            f"{self.cu('ip')}: {contact.get('peer_ip')}:{contact.get('peer_port')}\n"
+            f"{self.cu('state')}: {contact.get('trust_state')}\n"
+        )
+        content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        lab = make_label(text=msg, halign="left", valign="top")
+        bind_label_wrap(lab)
+        content.add_widget(lab)
+        popup = style_popup(Popup(title=self.cu("friend_info"), content=content, size_hint=(0.55, 0.45), auto_dismiss=True))
+        apply_ui_font(content)
+        popup.open()
+
+    def _add_peer_to_group_popup(self, peer_id: str) -> None:
+        if self.chat_store is None:
+            return
+        groups = self.chat_store.list_groups()
+        contact = next((c for c in self.chat_store.list_contacts(trusted_only=True) if str(c.get('peer_id')) == str(peer_id)), None)
+        if not groups or not contact:
+            return
+        values = [f"{g.get('group_id')} | {g.get('title') or g.get('group_id')}" for g in groups]
+        content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        sp = style_spinner(Spinner(text=values[0], values=values, font_name=UI_FONT, size_hint_y=None, height=dp(38)))
+        content.add_widget(sp)
+        popup = style_popup(Popup(title=self.cu("ctx_join_group"), content=content, size_hint=(0.62, 0.34), auto_dismiss=False))
+        buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
+        def _ok(*_):
+            gid = sp.text.split("|", 1)[0].strip()
+            self.chat_store.add_group_member(
+                gid,
+                str(peer_id),
+                peer_ip=str(contact.get('peer_ip') or ''),
+                peer_port=int(contact.get('peer_port') or 9999),
+                display_name=str(contact.get('remark_name') or contact.get('display_name') or peer_id),
+                member_state="active",
+            )
+            popup.dismiss()
+            self.refresh_chat_main()
+            self.render_current_chat()
+        buttons.add_widget(make_button("success", text=self.cu("ctx_join_group"), on_release=_ok))
+        buttons.add_widget(make_button("secondary", text="取消" if self.lang == "zh" else "Cancel", on_release=lambda *_: popup.dismiss()))
+        content.add_widget(buttons)
+        apply_ui_font(content)
+        popup.open()
+
     def _select_chat_entry(self, value: str) -> None:
         value = str(value or "")
         if not value:
             return
+        self.selected_chat_entry_value = value
         self.chat_list_spinner.text = value
         self.on_chat_list_selected(value)
+        self.refresh_chat_main()
 
     def scan_devices_for_chat(self) -> None:
         self.set_chat_section("devices")
         self.search_receivers()
+
+    def _message_preview(self, msg: Dict[str, object]) -> str:
+        body_type = str(msg.get("body_type") or "text")
+        raw = str(msg.get("text") or "")
+        if body_type == "file":
+            try:
+                obj = json.loads(raw)
+                name = str(obj.get("name") or obj.get("path") or raw)
+            except Exception:
+                name = raw
+            return "[" + self.cu("file") + "] " + shorten_middle(os.path.basename(name) or name, 20)
+        raw = raw.replace("\n", " ").strip()
+        return shorten_middle(raw, 22) if raw else self.cu("no_message")
+
+    def _message_time(self, msg: Dict[str, object]) -> str:
+        try:
+            ts = float(msg.get("sent_at") or msg.get("created_at") or 0)
+            return time.strftime("%H:%M", time.localtime(ts)) if ts else ""
+        except Exception:
+            return ""
+
+    def _list_status_icon(self, msg: Dict[str, object], store=None) -> str:
+        try:
+            if str(msg.get("direction") or "") != "outgoing":
+                return ""
+            summary = store.receipt_summary(str(msg.get("message_id") or "")) if store is not None else str(msg.get("status") or "")
+            icon, _color = self.main_messages_box._status_state(summary, True) if hasattr(self, "main_messages_box") else ("", None)
+            return icon
+        except Exception:
+            return ""
+
+    def _latest_group_preview(self, store, group_id: str) -> Tuple[str, str, float, str, int]:
+        try:
+            rows = store.list_messages(group_id=group_id, limit=1)
+            unread = store.unread_count_group(group_id) if hasattr(store, "unread_count_group") else 0
+            if not rows:
+                return self.cu("no_message"), "", 0.0, "", unread
+            msg = rows[-1]
+            return self._message_preview(msg), self._message_time(msg), float(msg.get("created_at") or 0.0), self._list_status_icon(msg, store), unread
+        except Exception:
+            return self.cu("no_message"), "", 0.0, "", 0
+
+    def _latest_direct_preview(self, store, peer_id: str) -> Tuple[str, str, float, str, int]:
+        try:
+            conv = store.create_direct_conversation(peer_id)
+            rows = store.list_messages(conversation_id=conv, limit=1)
+            unread = store.unread_count_direct(peer_id) if hasattr(store, "unread_count_direct") else 0
+            if not rows:
+                return self.cu("no_message"), "", 0.0, "", unread
+            msg = rows[-1]
+            return self._message_preview(msg), self._message_time(msg), float(msg.get("created_at") or 0.0), self._list_status_icon(msg, store), unread
+        except Exception:
+            return self.cu("no_message"), "", 0.0, "", 0
+
+    def _format_chat_list_label(self, name: str, preview: str, tlabel: str, status_icon: str = "", unread: int = 0) -> str:
+        right = tlabel or ""
+        if unread > 0:
+            right = (right + "  " if right else "") + f"({unread})"
+        first = str(name or "") + (("    " + right) if right else "")
+        second = ((status_icon + " ") if status_icon else "") + str(preview or self.cu("no_message"))
+        return f"{first}\n{second}"
 
     def refresh_chat_main(self) -> None:
         if hasattr(self, "right_info_box"):
@@ -1129,15 +1687,17 @@ class RUDPTransferRoot(BoxLayout):
         section = getattr(self, "current_chat_section", "recent")
         store = self.chat_store
         entries: List[tuple[str, str]] = []
+        query = str(getattr(getattr(self, "chat_filter_input", None), "text", "") or "").strip().lower()
 
         if section == "devices":
             devices = sorted(self.discovered, key=lambda x: float(x.get("last_seen") or 0), reverse=True)
             for d in devices:
-                ip, port = self._receiver_endpoint(d)
                 name = self._device_display_name(d)
                 fp = self._device_fingerprint(d)
                 pid = self._device_peer_id(d)
-                label = f"{name}\n{ip}:{port}  {self._short_fp(fp)}"
+                label = f"{name}"
+                if query and query not in label.lower() and query not in pid.lower() and query not in fp.lower():
+                    continue
                 entries.append((label, self._chat_device_value(d)))
             if not entries:
                 entries.append(("未发现在线设备\n点击下方“扫描设备”", ""))
@@ -1145,39 +1705,143 @@ class RUDPTransferRoot(BoxLayout):
             return
 
         if store is None:
-            self._set_chat_entry_buttons([("聊天数据库未解锁", "")])
+            self._set_chat_entry_buttons([(self.cu("chat_locked"), "")])
             return
 
         try:
             groups = store.list_groups()
             contacts = store.list_contacts(trusted_only=True)
-            if section == "contacts":
+
+            if section == "recent":
+                recent_items = []
+                for g in groups:
+                    title = str(g.get("title") or g.get("group_id") or "群聊")
+                    gid = str(g.get("group_id") or "")
+                    preview, tlabel, ts, status_icon, unread = self._latest_group_preview(store, gid)
+                    label = self._format_chat_list_label(title, preview, tlabel, status_icon, unread)
+                    if query and query not in label.lower() and query not in gid.lower():
+                        continue
+                    recent_items.append((ts or float(g.get("updated_at") or g.get("created_at") or 0), label, f"group::{gid}::{title}"))
+                for c in contacts:
+                    name = str(c.get("remark_name") or c.get("display_name") or c.get("nickname") or c.get("peer_id"))
+                    pid = str(c.get("peer_id") or "")
+                    preview, tlabel, ts, status_icon, unread = self._latest_direct_preview(store, pid)
+                    label = self._format_chat_list_label(name, preview, tlabel, status_icon, unread)
+                    if query and query not in label.lower() and query not in pid.lower():
+                        continue
+                    recent_items.append((ts, label, f"direct::{pid}::{name}"))
+                for _ts, label, value in sorted(recent_items, key=lambda x: float(x[0] or 0), reverse=True):
+                    entries.append((label, value))
+            else:
                 # 联系人页：群聊在上，好友在下。
                 for g in groups:
                     title = str(g.get("title") or g.get("group_id") or "群聊")
                     gid = str(g.get("group_id") or "")
-                    entries.append((f"[群聊] {title}\n{gid}", f"group::{gid}::{title}"))
+                    preview, tlabel, _ts, status_icon, unread = self._latest_group_preview(store, gid)
+                    label = self._format_chat_list_label(f"{self.cu('group_prefix')}  {title}", preview, tlabel, status_icon, unread)
+                    if query and query not in label.lower() and query not in gid.lower():
+                        continue
+                    entries.append((label, f"group::{gid}::{title}"))
                 for c in contacts:
                     name = str(c.get("remark_name") or c.get("display_name") or c.get("nickname") or c.get("peer_id"))
                     pid = str(c.get("peer_id") or "")
-                    endpoint = f"{c.get('peer_ip') or ''}:{c.get('peer_port') or 9999}"
-                    entries.append((f"[好友] {name}\n{endpoint}", f"direct::{pid}::{name}"))
-            else:
-                # 最近聊天：当前先按群组/联系人更新时间近似排序，后续可接入 last_message_at 字段。
-                for g in groups:
-                    title = str(g.get("title") or g.get("group_id") or "群聊")
-                    gid = str(g.get("group_id") or "")
-                    entries.append((f"[群] {title}\n{gid}", f"group::{gid}::{title}"))
-                for c in contacts:
-                    name = str(c.get("remark_name") or c.get("display_name") or c.get("nickname") or c.get("peer_id"))
-                    pid = str(c.get("peer_id") or "")
-                    endpoint = f"{c.get('peer_ip') or ''}:{c.get('peer_port') or 9999}"
-                    entries.append((f"[联系人] {name}\n{endpoint}", f"direct::{pid}::{name}"))
+                    preview, tlabel, _ts, status_icon, unread = self._latest_direct_preview(store, pid)
+                    label = self._format_chat_list_label(f"{self.cu('friend_prefix')}  {name}", preview, tlabel, status_icon, unread)
+                    if query and query not in label.lower() and query not in pid.lower():
+                        continue
+                    entries.append((label, f"direct::{pid}::{name}"))
+
             if not entries:
-                entries.append(("暂无会话或联系人", ""))
+                entries.append((self.cu("no_chat"), ""))
             self._set_chat_entry_buttons(entries)
         except Exception as exc:
-            self._set_chat_entry_buttons([(f"刷新失败\n{exc}", "")])
+            self._set_chat_entry_buttons([(self.cu("refresh_failed", error=exc), "")])
+
+    def _endpoint_for_peer(self, peer_id: str) -> Tuple[str, int]:
+        pid = str(peer_id or "").strip()
+        if not pid or self.chat_store is None:
+            return "", 9999
+        try:
+            row = self.chat_store.db.conn.execute(
+                "SELECT peer_ip, peer_port FROM contacts WHERE peer_id=?", (pid,)
+            ).fetchone()
+            if row is not None and str(row["peer_ip"] or ""):
+                return str(row["peer_ip"] or ""), int(row["peer_port"] or 9999)
+            row = self.chat_store.db.conn.execute(
+                "SELECT peer_ip, peer_port FROM group_members WHERE peer_id=? AND COALESCE(peer_ip,'')!='' LIMIT 1", (pid,)
+            ).fetchone()
+            if row is not None:
+                return str(row["peer_ip"] or ""), int(row["peer_port"] or 9999)
+        except Exception:
+            pass
+        return "", 9999
+
+    def _send_chat_read_to_endpoint(self, *, ip: str, port: int, peer_id: str, message_ids: List[str], group_id: str = "", conversation_id: str = "") -> None:
+        ids = [str(x or "").strip() for x in (message_ids or []) if str(x or "").strip()]
+        if not ids or not ip or is_unspecified_ip(ip):
+            return
+        args = [
+            "--worker", "sender",
+            "--server-ip", ip,
+            "--server-port", str(int(port or 9999)),
+            "--chat-reader-peer-id", self.chat_local_peer_id,
+            "--chat-conversation-id", str(conversation_id or ""),
+            "--chat-group-id", str(group_id or ""),
+            "--server-pin-file", str(receiver_pin_file(ip, int(port or 9999))),
+            "--complete-timeout", "8",
+            "--final-ack-timeout", "8",
+        ]
+        for mid in ids:
+            args += ["--chat-read-message-id", mid]
+        cmd = ([sys.executable] + args) if FROZEN else ([sys.executable, str(Path(__file__).resolve())] + args)
+        def _run():
+            try:
+                proc = subprocess.run(cmd, cwd=str(APP_DIR), capture_output=True, text=True, timeout=20)
+                combined = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+                if combined.strip():
+                    Clock.schedule_once(lambda _dt, s=combined[-2000:]: self.sender_log_box.append(s + ("\n" if not s.endswith("\n") else "")), 0)
+            except Exception as exc:
+                Clock.schedule_once(lambda _dt, msg=str(exc): self.sender_log_box.append(f"CHAT_READ failed for {peer_id}: {msg}\n"), 0)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _mark_current_chat_read_and_notify(self) -> None:
+        store = self.chat_store
+        if store is None:
+            return
+        try:
+            if self.current_chat_mode == "direct" and self.current_peer_id:
+                unread = store.unread_incoming_for_direct(self.current_peer_id)
+                if not unread:
+                    return
+                conv = store.create_direct_conversation(self.current_peer_id)
+                ids = [str(r.get("message_id") or "") for r in unread]
+                for mid in ids:
+                    store.mark_incoming_read(mid)
+                ip, port = self._endpoint_for_peer(self.current_peer_id)
+                self._send_chat_read_to_endpoint(ip=ip, port=port, peer_id=self.current_peer_id, message_ids=ids, conversation_id=conv)
+                Clock.schedule_once(lambda _dt: self.refresh_chat_main(), 0.05)
+            elif self.current_chat_mode == "group" and self.current_group_id:
+                unread = store.unread_incoming_for_group(self.current_group_id)
+                if not unread:
+                    return
+                by_sender: Dict[str, List[str]] = {}
+                for r in unread:
+                    mid = str(r.get("message_id") or "")
+                    sender = str(r.get("sender_peer_id") or "")
+                    if not mid:
+                        continue
+                    store.mark_incoming_read(mid)
+                    if sender and sender != self.chat_local_peer_id:
+                        by_sender.setdefault(sender, []).append(mid)
+                for sender, ids in by_sender.items():
+                    ip, port = self._endpoint_for_peer(sender)
+                    self._send_chat_read_to_endpoint(ip=ip, port=port, peer_id=sender, message_ids=ids, group_id=self.current_group_id)
+                Clock.schedule_once(lambda _dt: self.refresh_chat_main(), 0.05)
+        except Exception as exc:
+            try:
+                self.sender_log_box.append(f"mark read failed: {exc}\n")
+            except Exception:
+                pass
 
     def on_chat_list_selected(self, value: str) -> None:
         text = str(value or "")
@@ -1188,31 +1852,146 @@ class RUDPTransferRoot(BoxLayout):
             self.current_chat_mode = "group"
             self.current_group_id = gid
             self.current_peer_id = ""
-            self.current_chat_title.text = f"群聊：{title} ({gid})"
+            self.current_chat_title.text = self.cu("group_chat", title=title, gid=gid)
         elif text.startswith("direct::"):
             _tag, pid, name = text.split("::", 2)
             self.current_chat_mode = "direct"
             self.current_peer_id = pid
             self.current_group_id = ""
-            self.current_chat_title.text = f"一对一：{name}"
+            self.current_chat_title.text = self.cu("one_to_one", name=name)
         else:
             # Online device row. Do not auto-save contact.
             self.current_chat_mode = "device"
-            self.current_chat_title.text = "在线设备：先添加联系人后聊天"
+            self.current_chat_title.text = self.cu("device_title")
         self.render_current_chat()
+
+    def _file_progress_text(self, message_id: str, total_size: int = 0, summary: str = "") -> str:
+        prog = self.file_message_progress.get(str(message_id or ""), {})
+        if prog:
+            sent = int(prog.get("sent") or 0)
+            total = int(prog.get("total") or total_size or 0)
+            pct = float(prog.get("pct") or ((sent * 100.0 / total) if total else 0.0))
+            state = str(prog.get("state") or self.cu("receiving"))
+            avg = prog.get("avg")
+            eta = str(prog.get("eta") or "")
+            rate_part = f"  {float(avg):.2f} Mbps" if avg not in (None, "", 0) else ""
+            eta_part = f"  ETA {eta}" if eta and eta != "unknown" else ""
+            return f"{state}: {pct:.1f}%  {format_file_size(sent)} / {format_file_size(total)}{rate_part}{eta_part}"
+        if int(total_size or 0) > 0:
+            return f'{self.cu("state")}: {summary or self.cu("pending")}  {self.cu("total_size")}: {format_file_size(int(total_size or 0))}'
+        return f'{self.cu("state")}: {summary or self.cu("pending")}  {self.cu("total_size")}: {self.cu("unknown_size")}'
+
+    def _current_chat_signature(self) -> Optional[Tuple[object, ...]]:
+        store = self.chat_store
+        if store is None:
+            return None
+        try:
+            if self.current_chat_mode == "group" and self.current_group_id:
+                row = store.db.conn.execute(
+                    "SELECT COUNT(*) AS n, COALESCE(MAX(created_at),0) AS t, COALESCE(MAX(delivered_at),0) AS d, COALESCE(MAX(read_at),0) AS r FROM messages WHERE group_id=?",
+                    (self.current_group_id,),
+                ).fetchone()
+                return ("group", self.current_group_id, int(row["n"] or 0), float(row["t"] or 0), float(row["d"] or 0), float(row["r"] or 0), json.dumps(self.file_message_progress, sort_keys=True))
+            if self.current_chat_mode == "direct" and self.current_peer_id:
+                conv = store.create_direct_conversation(self.current_peer_id)
+                row = store.db.conn.execute(
+                    "SELECT COUNT(*) AS n, COALESCE(MAX(created_at),0) AS t, COALESCE(MAX(delivered_at),0) AS d, COALESCE(MAX(read_at),0) AS r FROM messages WHERE conversation_id=?",
+                    (conv,),
+                ).fetchone()
+                return ("direct", conv, int(row["n"] or 0), float(row["t"] or 0), float(row["d"] or 0), float(row["r"] or 0), json.dumps(self.file_message_progress, sort_keys=True))
+        except Exception:
+            return None
+        return None
+
+    def _auto_refresh_current_chat(self) -> None:
+        sig = self._current_chat_signature()
+        if sig is not None and sig != getattr(self, "_chat_render_sig", None):
+            self.render_current_chat()
+
+    def _force_chat_refresh(self) -> None:
+        self._chat_render_sig = None
+        self.refresh_chat_main()
+        self.render_current_chat()
+
+    def _date_separator_label(self, ts: float) -> str:
+        try:
+            dt = time.localtime(float(ts or time.time()))
+            date_key = time.strftime("%Y-%m-%d", dt)
+            today_key = time.strftime("%Y-%m-%d", time.localtime())
+            yesterday_key = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+            if date_key == today_key:
+                return self.cu("today")
+            if date_key == yesterday_key:
+                return self.cu("yesterday")
+            return date_key
+        except Exception:
+            return ""
+
+    def _format_member_detail(self, member: Dict[str, object]) -> str:
+        name = str(member.get("display_name") or member.get("nickname") or member.get("peer_id") or "").strip()
+        return (
+            f"{self.cu('nickname')}: {name}\n"
+            f"{self.cu('peer_id')}: {member.get('peer_id') or ''}\n"
+            f"{self.cu('fingerprint')}: {self._short_fp(str(member.get('fingerprint') or ''))}\n"
+            f"{self.cu('endpoint')}: {member.get('peer_ip') or ''}:{member.get('peer_port') or 9999}\n"
+            f"{self.cu('member_state')}: {member.get('member_state') or ''}\n"
+        )
+
+    def show_group_member_detail(self, member: Dict[str, object]) -> None:
+        if hasattr(self, "right_info_box"):
+            self.right_info_box.text.text = self._format_member_detail(member)
+        if hasattr(self, "right_title"):
+            self.right_title.text = self.cu("member_detail")
+
+    def _render_group_member_buttons(self, members: List[Dict[str, object]]) -> None:
+        if not hasattr(self, "right_member_box"):
+            return
+        self.right_member_box.clear_widgets()
+        for m in members:
+            name = str(m.get("display_name") or m.get("nickname") or m.get("peer_id") or "").strip()
+            if not name:
+                continue
+            btn = make_button("secondary", text=name, size_hint_y=None, height=dp(42), halign="center", valign="middle")
+            btn.bind(on_release=lambda _btn, member=dict(m): self.show_group_member_detail(member))
+            self.right_member_box.add_widget(btn)
 
     def render_current_chat(self) -> None:
         self.main_messages_box.clear()
         self.right_info_box.clear()
+        if hasattr(self, "shared_files_box"):
+            self.shared_files_box.clear_widgets()
+        if hasattr(self, "profile_name_label"):
+            self.profile_name_label.text = str(self.chat_nickname or self.chat_local_peer_id or "AgoraLink")
+        if hasattr(self, "profile_peer_label"):
+            self.profile_peer_label.text = str(self.chat_local_peer_id or "")
+        if hasattr(self, "online_state_btn"):
+            running = False
+            try:
+                running = self.receiver_worker.is_running()
+            except Exception:
+                running = False
+            self.online_state_btn.text = "Online" if running else "Offline"
+            style_button(self.online_state_btn, "active" if running else "secondary")
+        self._chat_render_sig = self._current_chat_signature()
         store = self.chat_store
         if store is None:
             self.main_messages_box.append("聊天数据库未解锁。\n")
             return
+        self._mark_current_chat_read_and_notify()
         try:
             if self.current_chat_mode == "group" and self.current_group_id:
+                file_cards = []
+                last_date_key = ""
                 for msg in store.list_messages(group_id=self.current_group_id, limit=200):
                     summary = store.receipt_summary(str(msg.get('message_id') or ''))
-                    ts = time.strftime("%H:%M", time.localtime(float(msg.get("created_at") or time.time())))
+                    mine_msg = str(msg.get('sender_peer_id') or '') == self.chat_local_peer_id
+                    msg_created_ts = float(msg.get("created_at") or time.time())
+                    msg_date_key = time.strftime("%Y-%m-%d", time.localtime(msg_created_ts))
+                    if msg_date_key != last_date_key:
+                        self.main_messages_box.add_date_separator(self._date_separator_label(msg_created_ts))
+                        last_date_key = msg_date_key
+                    ts_source = msg.get('sent_at') if mine_msg else msg.get('received_at')
+                    ts = time.strftime("%H:%M", time.localtime(float(ts_source or msg_created_ts)))
                     body_type = str(msg.get('body_type') or 'text')
                     text = str(msg.get('text') or '')
                     file_path = ''
@@ -1220,19 +1999,42 @@ class RUDPTransferRoot(BoxLayout):
                         try:
                             obj = json.loads(text)
                             file_path = str(obj.get('path') or '')
+                            total_size = int(obj.get('size') or 0)
                             text = str(obj.get('name') or file_path or text)
                         except Exception:
                             file_path = text
-                    self.main_messages_box.add_message(mine=str(msg.get('sender_peer_id') or '') == self.chat_local_peer_id, sender=str(msg.get('sender_peer_id') or ''), text=text, timestamp=ts, summary=summary, body_type=body_type, file_path=file_path)
+                            total_size = 0
+                    else:
+                        total_size = 0
+                    mid = str(msg.get('message_id') or '')
+                    progress_text = self._file_progress_text(mid, total_size, summary) if body_type == 'file' else ''
+                    if body_type == 'file':
+                        file_cards.append((text, file_path, total_size, ts))
+                    self.main_messages_box.add_message(mine=mine_msg, sender=str(msg.get('sender_peer_id') or ''), text=text, timestamp=ts, summary=summary, body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size)
                 members = store.list_group_members(self.current_group_id, include_inactive=True)
-                self.right_info_box.append(f"群名: {self.current_group_id}\n成员数量: {len(members)}\n\n")
-                for m in members:
-                    self.right_info_box.append(f"{m.get('display_name') or m.get('peer_id')}\n{m.get('peer_id')}\n{m.get('peer_ip')}:{m.get('peer_port')}  {m.get('member_state')}\n\n")
+                if hasattr(self, "right_title"):
+                    self.right_title.text = self.cu("group_members_title")
+                self._set_right_action_mode("group")
+                if hasattr(self, "right_member_scroll"):
+                    self._set_widget_visible(self.right_member_scroll, True, height=210)
+                self._render_group_member_buttons(members)
+                self.right_info_box.text.text = self.cu("member_detail_hint")
+                for name, path, size, tsf in reversed(file_cards[-8:]):
+                    self._add_shared_file_entry(name, path, size, tsf)
             elif self.current_chat_mode == "direct" and self.current_peer_id:
                 conv = store.create_direct_conversation(self.current_peer_id)
+                file_cards = []
+                last_date_key = ""
                 for msg in store.list_messages(conversation_id=conv, limit=200):
                     summary = store.receipt_summary(str(msg.get('message_id') or ''))
-                    ts = time.strftime("%H:%M", time.localtime(float(msg.get("created_at") or time.time())))
+                    mine_msg = str(msg.get('sender_peer_id') or '') == self.chat_local_peer_id
+                    msg_created_ts = float(msg.get("created_at") or time.time())
+                    msg_date_key = time.strftime("%Y-%m-%d", time.localtime(msg_created_ts))
+                    if msg_date_key != last_date_key:
+                        self.main_messages_box.add_date_separator(self._date_separator_label(msg_created_ts))
+                        last_date_key = msg_date_key
+                    ts_source = msg.get('sent_at') if mine_msg else msg.get('received_at')
+                    ts = time.strftime("%H:%M", time.localtime(float(ts_source or msg_created_ts)))
                     body_type = str(msg.get('body_type') or 'text')
                     text = str(msg.get('text') or '')
                     file_path = ''
@@ -1240,17 +2042,60 @@ class RUDPTransferRoot(BoxLayout):
                         try:
                             obj = json.loads(text)
                             file_path = str(obj.get('path') or '')
+                            total_size = int(obj.get('size') or 0)
                             text = str(obj.get('name') or file_path or text)
                         except Exception:
                             file_path = text
-                    self.main_messages_box.add_message(mine=str(msg.get('sender_peer_id') or '') == self.chat_local_peer_id, sender=str(msg.get('sender_peer_id') or ''), text=text, timestamp=ts, summary=summary, body_type=body_type, file_path=file_path)
+                            total_size = 0
+                    else:
+                        total_size = 0
+                    mid = str(msg.get('message_id') or '')
+                    progress_text = self._file_progress_text(mid, total_size, summary) if body_type == 'file' else ''
+                    if body_type == 'file':
+                        file_cards.append((text, file_path, total_size, ts))
+                    self.main_messages_box.add_message(mine=mine_msg, sender=str(msg.get('sender_peer_id') or ''), text=text, timestamp=ts, summary=summary, body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size)
+                contact_text = ""
+                seen_contact = False
                 for c in store.list_contacts():
-                    if str(c.get("peer_id") or "") == self.current_peer_id:
-                        self.right_info_box.append(f"联系人: {c.get('remark_name') or c.get('display_name')}\npeer_id: {c.get('peer_id')}\nIP: {c.get('peer_ip')}:{c.get('peer_port')}\n状态: {c.get('trust_state')}\n")
+                    if str(c.get("peer_id") or "") == self.current_peer_id and not seen_contact:
+                        seen_contact = True
+                        if hasattr(self, "right_title"):
+                            self.right_title.text = self.cu("friend_info")
+                        self._set_right_action_mode("direct")
+                        if hasattr(self, "right_member_scroll"):
+                            self._set_widget_visible(self.right_member_scroll, False)
+                        contact_text = (
+                            f"{self.cu('contact')}: {c.get('remark_name') or c.get('display_name') or c.get('nickname') or c.get('peer_id')}\n"
+                            f"{self.cu('peer_id')}: {c.get('peer_id')}\n"
+                            f"{self.cu('fingerprint')}: {self._short_fp(str(c.get('fingerprint') or ''))}\n"
+                            f"{self.cu('ip')}: {c.get('peer_ip')}:{c.get('peer_port')}\n"
+                            f"{self.cu('state')}: {c.get('trust_state')}\n"
+                        )
                         break
+                self.right_info_box.text.text = contact_text
+                for name, path, size, tsf in reversed(file_cards[-8:]):
+                    self._add_shared_file_entry(name, path, size, tsf)
         except Exception as exc:
-            self.main_messages_box.append(f"显示失败: {exc}\n")
+            self.main_messages_box.append(f"{self.cu('refresh_failed', error=exc)}\n")
 
+
+
+    def _add_shared_file_entry(self, file_name: str, file_path: str, total_size: int = 0, timestamp: str = "") -> None:
+        if not hasattr(self, "shared_files_box"):
+            return
+        row = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(88), spacing=dp(2), padding=(dp(8), dp(6), dp(8), dp(6)))
+        apply_card_background(row, "secondary", radius=12)
+        title = make_label(text=shorten_middle(str(file_name or self.cu("file")), 20), size_hint_y=None, height=dp(20), halign="left", color=THEME["text"], bold=True)
+        title.shorten = True
+        title.shorten_from = "right"
+        info_text = (f"{format_file_size(int(total_size or 0))}" if total_size else "") + (f"   {timestamp}" if timestamp else "")
+        info = make_label(text=info_text, size_hint_y=None, height=dp(18), halign="left", color=THEME["muted_text"])
+        row.add_widget(title)
+        row.add_widget(info)
+        btn = make_button("secondary", text=self.cu("open_folder") if file_path else self.cu("not_saved"), size_hint_y=None, height=dp(28), on_release=lambda *_p, path=file_path: open_file_location(path))
+        btn.disabled = not bool(file_path)
+        row.add_widget(btn)
+        self.shared_files_box.add_widget(row)
 
 
     def show_page(self, page: str) -> None:
@@ -1353,6 +2198,37 @@ class RUDPTransferRoot(BoxLayout):
             self.send_group_btn.text = self.t("send_group_msg")
         self._refresh_tab_button_state()
         self.update_progress_labels(0, 0, 0.0, self.t("unknown"), 0.0)
+
+        if hasattr(self, "recent_btn"):
+            self.recent_btn.text = self.cu("recent")
+            self.groups_btn.text = self.cu("contacts")
+            self.devices_btn.text = self.cu("devices")
+            self.chat_filter_input.hint_text = self.cu("search_hint")
+            self.scan_devices_btn.text = self.cu("scan_devices")
+            if hasattr(self, "add_contact_btn"):
+                self.add_contact_btn.text = self.cu("add_contact")
+            if hasattr(self, "current_chat_title") and self.current_chat_mode not in ("group", "direct", "device"):
+                self.current_chat_title.text = self.cu("choose_chat")
+            if hasattr(self, "main_message_input"):
+                self.main_message_input.hint_text = self.cu("input_hint")
+            if hasattr(self, "main_send_btn"):
+                self.main_send_btn.text = self.cu("send")
+            if hasattr(self, "main_file_btn"):
+                self.main_file_btn.text = self.cu("send_file")
+            if hasattr(self, "right_title"):
+                if self.current_chat_mode == "group":
+                    self.right_title.text = self.cu("group_members_title")
+                elif self.current_chat_mode == "direct":
+                    self.right_title.text = self.cu("friend_info")
+                else:
+                    self.right_title.text = self.cu("right_title")
+            if hasattr(self, "shared_title"):
+                self.shared_title.text = self.cu("shared_files")
+            for attr, key in [("new_group_btn", "new_group"), ("add_member_main_btn", "add_member"), ("remove_member_main_btn", "remove_member"), ("leave_group_main_btn", "leave_group"), ("delete_friend_main_btn", "delete_friend")]:
+                if hasattr(self, attr):
+                    getattr(self, attr).text = self.cu(key)
+            self.refresh_chat_main()
+            self.render_current_chat()
 
     def _set_row_label(self, widget, text: str) -> None:
         parent = widget.parent
@@ -1674,6 +2550,27 @@ class RUDPTransferRoot(BoxLayout):
 
         def _finish(found=None, error: Optional[str] = None):
             found = found or []
+            local_ips = set(get_local_ip_candidates())
+            my_ids = {str(getattr(self, "chat_local_peer_id", "") or ""), str(getattr(self, "chat_fingerprint", "") or "")}
+            cleaned = []
+            seen_ids = set()
+            for item in found:
+                if not isinstance(item, dict):
+                    continue
+                endpoint_ip = str(item.get("endpoint_ip") or item.get("ip") or "")
+                pid = str(item.get("peer_id") or "")
+                fp = str(item.get("fingerprint") or item.get("identity_fingerprint") or "")
+                if (pid and pid in my_ids) or (fp and fp in my_ids):
+                    continue
+                # Hide obvious self-responses from local virtual/network adapters.
+                if endpoint_ip in local_ips and (pid or fp):
+                    continue
+                key = fp or pid or f"{endpoint_ip}:{item.get('port') or item.get('endpoint_port') or 9999}"
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+                cleaned.append(item)
+            found = cleaned
             ts_now = time.time()
             for item in found:
                 if isinstance(item, dict):
@@ -2034,7 +2931,7 @@ class RUDPTransferRoot(BoxLayout):
                 gid = self.chat_store.create_group(gid_input.text.strip(), title_input.text.strip())
                 self.current_chat_mode = "group"
                 self.current_group_id = gid
-                self.current_chat_title.text = f"群聊：{title_input.text.strip() or gid} ({gid})"
+                self.current_chat_title.text = self.cu("group_chat", title=title_input.text.strip() or gid, gid=gid)
                 popup.dismiss()
                 self.refresh_chat_main()
                 self.render_current_chat()
@@ -2115,7 +3012,7 @@ class RUDPTransferRoot(BoxLayout):
             self.chat_store.delete_group_data(gid)
             self.current_group_id = ""
             self.current_chat_mode = ""
-            self.current_chat_title.text = "请选择会话"
+            self.current_chat_title.text = self.cu("choose_chat")
             self.refresh_chat_main()
             self.render_current_chat()
         self._confirm_action("退出群组", f"确认退出群组 {gid}？\n该群相关成员、消息、回执都会从本机删除。", _do)
@@ -2129,12 +3026,12 @@ class RUDPTransferRoot(BoxLayout):
             self.chat_store.delete_contact(pid, purge_data=True)
             self.current_peer_id = ""
             self.current_chat_mode = ""
-            self.current_chat_title.text = "请选择会话"
+            self.current_chat_title.text = self.cu("choose_chat")
             self.refresh_chat_main()
             self.render_current_chat()
         self._confirm_action("删除联系人", f"确认删除联系人 {pid}？\n该联系人、一对一聊天记录和相关回执都会从本机删除。", _do)
 
-    def _send_chat_to_endpoint(self, *, ip: str, port: int, peer_id: str, text: str, message_id: str, group_id: str = "", conversation_id: str = "", created_at: float = 0.0) -> bool:
+    def _send_chat_to_endpoint(self, *, ip: str, port: int, peer_id: str, text: str, message_id: str, group_id: str = "", conversation_id: str = "", created_at: float = 0.0, body_type: str = "text") -> bool:
         pin_file = str(receiver_pin_file(ip, port))
         args = [
             "--worker", "sender",
@@ -2147,6 +3044,7 @@ class RUDPTransferRoot(BoxLayout):
             "--chat-receiver-peer-id", peer_id,
             "--chat-message-id", message_id,
             "--chat-created-at", str(float(created_at or time.time())),
+            "--chat-body-type", body_type,
             "--chat-db", self.chat_db_path,
             "--chat-password", self.chat_password,
             "--server-pin-file", pin_file,
@@ -2200,7 +3098,9 @@ class RUDPTransferRoot(BoxLayout):
                     store.mark_chat_failed(str(msg['message_id']), peer_id, error="invalid_endpoint")
                     continue
                 try:
-                    ok = self._send_chat_to_endpoint(ip=ip, port=port, peer_id=peer_id, text=text, message_id=str(msg['message_id']), group_id=group_id, conversation_id=conversation_id, created_at=float(msg['created_at']))
+                    store.mark_chat_sent(str(msg['message_id']), peer_id)
+                    Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+                    ok = self._send_chat_to_endpoint(ip=ip, port=port, peer_id=peer_id, text=text, message_id=str(msg['message_id']), group_id=group_id, conversation_id=conversation_id, created_at=float(msg['created_at']), body_type="text")
                     if ok:
                         store.mark_chat_delivered(str(msg['message_id']), peer_id)
                     else:
@@ -2209,6 +3109,41 @@ class RUDPTransferRoot(BoxLayout):
                     store.mark_chat_failed(str(msg['message_id']), peer_id, error=str(exc))
             Clock.schedule_once(lambda _dt: self.render_current_chat(), 0)
         threading.Thread(target=_run, daemon=True).start()
+
+    def _run_file_sender_with_progress(self, *, args: List[str], message_id: str, peer_id: str, total_size: int = 0) -> bool:
+        cmd = ([sys.executable] + args) if FROZEN else ([sys.executable, str(Path(__file__).resolve())] + args)
+        mid = str(message_id or "")
+        if mid:
+            self.file_message_progress[mid] = {"sent": 0, "total": int(total_size or 0), "pct": 0.0, "state": self.cu("sending_to", peer=peer_id)}
+            Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+        try:
+            proc = subprocess.Popen(cmd, cwd=str(APP_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                try:
+                    self.sender_log_box.append(line)
+                except Exception:
+                    pass
+                m = PROGRESS_RE.search(line)
+                if m and mid:
+                    sent = int(m.group("sent"))
+                    total = int(m.group("total") or total_size or 0)
+                    pct = float(m.group("pct") or ((sent * 100.0 / total) if total else 0.0))
+                    self.file_message_progress[mid] = {"sent": sent, "total": total, "pct": pct, "avg": float(m.group("avg") or 0.0), "eta": m.group("eta") or "", "state": self.cu("sending_to", peer=peer_id)}
+                    Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+            rc = proc.wait(timeout=5)
+            if mid:
+                final_total = int(total_size or self.file_message_progress.get(mid, {}).get("total") or 0)
+                self.file_message_progress[mid] = {"sent": final_total, "total": final_total, "pct": 100.0 if rc == 0 else float(self.file_message_progress.get(mid, {}).get("pct") or 0.0), "avg": self.file_message_progress.get(mid, {}).get("avg", 0.0), "eta": "0:00" if rc == 0 else self.file_message_progress.get(mid, {}).get("eta", ""), "state": self.cu("completed") if rc == 0 else self.cu("failed")}
+                Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+            return int(rc or 0) == 0
+        except Exception as exc:
+            if mid:
+                old = self.file_message_progress.get(mid, {})
+                old.update({'state': f'{self.cu("failed")}: {exc}'})
+                self.file_message_progress[mid] = old
+                Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+            return False
 
     def send_file_to_current_chat(self) -> None:
         if self.current_chat_mode not in ("direct", "group"):
@@ -2239,7 +3174,13 @@ class RUDPTransferRoot(BoxLayout):
             self.main_messages_box.append("没有可发送文件的接收对象。\n")
             return
         self.render_current_chat()
+        chat_message_id = str(msg.get('message_id') if msg else '')
+        chat_conversation_id = str(msg.get('conversation_id') or '')
+        chat_group_id = str(self.current_group_id if self.current_chat_mode == 'group' else '')
+        chat_sender_peer_id = str(self.chat_local_peer_id or '')
         def _run():
+            file_total = os.path.getsize(path) if os.path.exists(path) else 0
+            file_meta_text = json.dumps({"kind": "file", "name": os.path.basename(path), "size": file_total, "chat_message_id": chat_message_id}, ensure_ascii=False, separators=(",", ":"))
             for r in recipients:
                 peer_id = str(r.get('peer_id') or '')
                 ip = str(r.get('peer_ip') or '')
@@ -2251,16 +3192,41 @@ class RUDPTransferRoot(BoxLayout):
                     if msg and store is not None:
                         store.mark_chat_failed(str(msg.get('message_id')), peer_id, error='invalid_endpoint')
                     continue
+                try:
+                    if msg and store is not None:
+                        store.mark_chat_sent(str(msg.get('message_id')), peer_id)
+                        Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+                    self._send_chat_to_endpoint(
+                        ip=ip, port=port, peer_id=peer_id, text=file_meta_text,
+                        message_id=chat_message_id,
+                        group_id=chat_group_id,
+                        conversation_id=chat_conversation_id,
+                        created_at=float(msg.get('created_at') or time.time()),
+                        body_type='file',
+                    )
+                except Exception:
+                    pass
                 pin_file = str(receiver_pin_file(ip, port))
-                args = ["--worker", "sender", "--server-ip", ip, "--server-port", str(port), "--file", path, "--server-pin-file", pin_file, "--request-timeout", "300"]
-                cmd = ([sys.executable] + args) if FROZEN else ([sys.executable, str(Path(__file__).resolve())] + args)
-                proc = subprocess.run(cmd, cwd=str(APP_DIR), capture_output=True, text=True, timeout=3600)
+                args = [
+                    "--worker", "sender",
+                    "--server-ip", ip,
+                    "--server-port", str(port),
+                    "--file", path,
+                    "--server-pin-file", pin_file,
+                    "--request-timeout", "300",
+                    "--chat-message-id", chat_message_id,
+                    "--chat-conversation-id", chat_conversation_id,
+                    "--chat-group-id", chat_group_id,
+                    "--chat-sender-peer-id", chat_sender_peer_id,
+                    "--chat-receiver-peer-id", peer_id,
+                ]
+                ok = self._run_file_sender_with_progress(args=args, message_id=str(msg.get('message_id') if msg else ''), peer_id=peer_id, total_size=file_total)
                 if msg and store is not None:
-                    if proc.returncode == 0:
+                    if ok:
                         store.mark_chat_delivered(str(msg.get('message_id')), peer_id)
                     else:
                         store.mark_chat_failed(str(msg.get('message_id')), peer_id, error='file_send_failed')
-            Clock.schedule_once(lambda _dt: self.render_current_chat(), 0)
+            Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
         threading.Thread(target=_run, daemon=True).start()
 
     def start_sender(self) -> None:
@@ -2551,14 +3517,73 @@ class RUDPTransferRoot(BoxLayout):
                 pass
         if CONTACT_RESPONSE_LOG_PREFIX in text:
             self.sender_log_box.append(text)
+        if CHAT_READ_LOG_PREFIX in text:
+            try:
+                payload = text.split(CHAT_READ_LOG_PREFIX, 1)[1].strip()
+                obj = json.loads(payload)
+                if self.chat_store is not None:
+                    self.chat_store.mark_chat_read(str(obj.get("message_id") or ""), str(obj.get("reader_peer_id") or ""))
+                    Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+            except Exception:
+                pass
         if CHAT_MESSAGE_LOG_PREFIX in text:
             try:
                 payload = text.split(CHAT_MESSAGE_LOG_PREFIX, 1)[1].strip()
                 obj = json.loads(payload)
                 self.chat_messages_box.append(f"Incoming {obj.get('group_id')}: {obj.get('sender_peer_id')}: {obj.get('text')}\n")
-                self.refresh_chat_view()
+                if str(obj.get("body_type") or "") == "file":
+                    mid = str(obj.get("message_id") or "")
+                    total = 0
+                    try:
+                        body = json.loads(str(obj.get("text") or ""))
+                        total = int(body.get("size") or 0)
+                    except Exception:
+                        pass
+                    if mid:
+                        self.current_receiving_file_message_id = mid
+                        self.file_message_progress[mid] = {"sent": 0, "total": total, "pct": 0.0, "avg": 0.0, "eta": "", "state": self.cu("waiting_receive")}
+                Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
             except Exception:
                 pass
+        m_recv = RECEIVE_PROGRESS_RE.search(text)
+        if m_recv:
+            try:
+                conn = int(m_recv.group("conn") or 0)
+                mid = str(self.receiving_file_message_by_conn.get(conn) or self.current_receiving_file_message_id or "")
+                if mid:
+                    sent = int(m_recv.group("sent"))
+                    total = int(m_recv.group("total") or 0)
+                    pct = float(m_recv.group("pct") or ((sent * 100.0 / total) if total else 0.0))
+                    self.file_message_progress[mid] = {
+                        "sent": sent, "total": total, "pct": pct,
+                        "avg": float(m_recv.group("avg") or 0.0),
+                        "eta": m_recv.group("eta") or "",
+                        "state": self.cu("receiving"),
+                    }
+                    Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+            except Exception:
+                pass
+        m_saved = RECEIVED_SAVE_RE.search(text)
+        if m_saved and self.chat_store is not None:
+            try:
+                conn = int(m_saved.group("conn") or 0)
+                saved_path = str(m_saved.group("path") or "").strip()
+                if saved_path:
+                    mid = str(self.receiving_file_message_by_conn.get(conn) or self.current_receiving_file_message_id or "")
+                    if mid:
+                        self.chat_store.bind_message_file_path(mid, saved_path)
+                    else:
+                        mid = self.chat_store.bind_latest_incoming_file_path(file_name=os.path.basename(saved_path), saved_path=saved_path)
+                    if mid:
+                        total = os.path.getsize(saved_path) if os.path.exists(saved_path) else int(self.file_message_progress.get(mid, {}).get("total") or 0)
+                        self.file_message_progress[mid] = {"sent": total, "total": total, "pct": 100.0, "avg": self.file_message_progress.get(mid, {}).get("avg", 0.0), "eta": "0:00", "state": self.cu("received")}
+                    self.receiving_file_message_by_conn.pop(conn, None)
+                    if self.current_receiving_file_message_id == mid:
+                        self.current_receiving_file_message_id = ""
+                    Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+            except Exception:
+                pass
+
         if "end reason=complete" in text:
             self.receiver_log_box.append(self.t("receive_transfer_finished") + "\n")
         elif "end reason=idle_timeout" in text:
@@ -2570,10 +3595,39 @@ class RUDPTransferRoot(BoxLayout):
                 req = json.loads(payload)
             except Exception:
                 return
+            try:
+                conn = int(req.get("conn_id") or 0)
+                mid = str(req.get("chat_message_id") or "")
+                total = int(req.get("size") or 0)
+                if conn > 0 and mid:
+                    self.receiving_file_message_by_conn[conn] = mid
+                    self.current_receiving_file_message_id = mid
+                    self.file_message_progress[mid] = {
+                        "sent": 0,
+                        "total": total,
+                        "pct": 0.0,
+                        "avg": 0.0,
+                        "eta": "",
+                        "state": self.cu("waiting_receive"),
+                    }
+                    Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+            except Exception:
+                pass
             Clock.schedule_once(lambda _dt, data=req: self.show_transfer_request(data), 0)
+
 
     def show_transfer_request(self, req: Dict[str, object]) -> None:
         conn_id = int(req.get("conn_id") or 0)
+        try:
+            mid = str(req.get("chat_message_id") or "")
+            total = int(req.get("size") or 0)
+            if conn_id > 0 and mid:
+                self.receiving_file_message_by_conn[conn_id] = mid
+                self.current_receiving_file_message_id = mid
+                self.file_message_progress.setdefault(mid, {"sent": 0, "total": total, "pct": 0.0, "avg": 0.0, "eta": "", "state": self.cu("waiting_receive")})
+                Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+        except Exception:
+            pass
         if conn_id in self.pending_request_popups:
             return
         self.pending_request_popups.add(conn_id)
