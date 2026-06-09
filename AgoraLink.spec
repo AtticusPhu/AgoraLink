@@ -45,6 +45,8 @@ hiddenimports += [
     'tkinter',
     'tkinter.filedialog',
     'tkinter.messagebox',
+    'app_services',
+    'transfer_store',
 ]
 
 # Keep the build smaller and avoid unnecessary scientific/GUI packages.

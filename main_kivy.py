@@ -194,6 +194,7 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.checkbox import CheckBox
 from kivy.uix.filechooser import FileChooserListView
+from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
@@ -203,8 +204,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.tabbedpanel import TabbedPanel, TabbedPanelItem
 from kivy.uix.textinput import TextInput
-from kivy.uix.dropdown import DropDown
-from kivy.graphics import Color, RoundedRectangle
+from kivy.graphics import Color, RoundedRectangle, Triangle, Line
 
 from file_transfer_common import (
     CHAT_MESSAGE_LOG_PREFIX,
@@ -496,6 +496,14 @@ CHAT_UI_TEXT = {
         "ctx_leave_group": "退出群聊",
         "ctx_rescan_ip": "重新扫描 IP",
         "ctx_add_contact": "添加联系人",
+        "ctx_pin": "置顶会话",
+        "ctx_unpin": "取消置顶",
+        "detail_hide": "隐藏详情",
+        "detail_show": "查看详情",
+        "retry": "重发",
+        "retry_text_only": "只能重发文本消息",
+        "retry_file_missing": "原文件不存在，无法重发",
+        "retry_file": "重发文件",
         "today": "今天",
         "yesterday": "昨天",
     },
@@ -561,6 +569,14 @@ CHAT_UI_TEXT = {
         "ctx_leave_group": "Leave Group",
         "ctx_rescan_ip": "Rescan IP",
         "ctx_add_contact": "Add Contact",
+        "ctx_pin": "Pin Chat",
+        "ctx_unpin": "Unpin Chat",
+        "detail_hide": "Hide Details",
+        "detail_show": "Details",
+        "retry": "Retry",
+        "retry_text_only": "Only text messages can be retried",
+        "retry_file_missing": "Original file not found; cannot retry",
+        "retry_file": "Retry file",
         "today": "Today",
         "yesterday": "Yesterday",
     },
@@ -646,6 +662,9 @@ THEME = {
     "disabled": (0.720, 0.750, 0.800, 1),
     "bubble_mine": (0.878, 0.929, 0.973, 1),
     "bubble_other": (1.000, 1.000, 1.000, 1),
+    "menu_bg": (1.000, 1.000, 1.000, 1),
+    "menu_hover": (0.940, 0.965, 0.990, 1),
+    "menu_danger_text": (0.780, 0.200, 0.200, 1),
 }
 
 _BUTTON_ROLES = {
@@ -746,6 +765,31 @@ def apply_card_background(widget, bg_key: str = "panel_bg", radius: int = 18) ->
         widget.bind(pos=_sync, size=_sync)
     except Exception:
         pass
+
+
+def apply_bubble_background(widget, bg_key: str, mine: bool, radius: int = 16) -> None:
+    """Rounded chat bubble with a small WhatsApp-like tail."""
+    try:
+        color = THEME.get(bg_key, THEME["panel_bg"])
+        with widget.canvas.before:
+            widget._bg_instr = Color(*color)
+            widget._bg_rect = RoundedRectangle(pos=widget.pos, size=widget.size, radius=[radius, radius, radius, radius])
+            widget._tail = Triangle(points=[0, 0, 0, 0, 0, 0])
+        def _sync(*_args):
+            try:
+                x, y = widget.pos
+                w, h = widget.size
+                widget._bg_rect.pos = (x, y)
+                widget._bg_rect.size = (w, h)
+                if mine:
+                    widget._tail.points = [x + w - dp(2), y + h - dp(18), x + w + dp(10), y + h - dp(12), x + w - dp(2), y + h - dp(6)]
+                else:
+                    widget._tail.points = [x + dp(2), y + h - dp(18), x - dp(10), y + h - dp(12), x + dp(2), y + h - dp(6)]
+            except Exception:
+                pass
+        widget.bind(pos=_sync, size=_sync)
+    except Exception:
+        apply_card_background(widget, bg_key, radius=radius)
 
 
 def bind_label_wrap(label: Label) -> Label:
@@ -897,12 +941,50 @@ def open_file_location(path: str) -> None:
         pass
 
 
+class CircularProgressButton(Button):
+    def __init__(self, *, pct: float = 0.0, failed: bool = False, complete: bool = False, **kwargs):
+        kwargs.setdefault("text", "↻" if failed else ("✓" if complete else f"{int(max(0, min(100, pct)))}%"))
+        kwargs.setdefault("font_name", UI_FONT)
+        kwargs.setdefault("size_hint", (None, None))
+        kwargs.setdefault("size", (dp(46), dp(46)))
+        super().__init__(**kwargs)
+        self.pct = max(0.0, min(100.0, float(pct or 0.0)))
+        self.failed = bool(failed)
+        self.complete = bool(complete)
+        self.background_normal = ""
+        self.background_down = ""
+        self.background_color = (0, 0, 0, 0)
+        self.color = THEME["danger"] if self.failed else (THEME["primary_active"] if self.complete or self.pct > 0 else THEME["muted_text"])
+        self.bold = True
+        self._draw()
+        self.bind(pos=lambda *_: self._draw(), size=lambda *_: self._draw())
+
+    def _draw(self) -> None:
+        try:
+            self.canvas.before.clear()
+            with self.canvas.before:
+                cx = self.x + self.width / 2.0
+                cy = self.y + self.height / 2.0
+                r = min(self.width, self.height) / 2.0 - dp(4)
+                Color(*THEME["secondary_active"])
+                Line(circle=(cx, cy, r, 0, 360), width=dp(2))
+                if self.failed:
+                    Color(*THEME["danger"])
+                    Line(circle=(cx, cy, r, 0, 360), width=dp(2.4))
+                else:
+                    Color(*(THEME["primary_active"] if self.complete or self.pct >= 100 else THEME["primary"]))
+                    end = max(1.0, 360.0 * self.pct / 100.0)
+                    Line(circle=(cx, cy, r, 90, 90 - end), width=dp(2.4))
+        except Exception:
+            pass
+
+
 class ChatMessageBox(BoxLayout):
     def __init__(self, root_owner=None, **kwargs):
         super().__init__(orientation="vertical", **kwargs)
         self.root_owner = root_owner
         self.scroll = ScrollView(size_hint_y=1)
-        self.inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(8), padding=(dp(8), dp(8), dp(8), dp(8)))
+        self.inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(3), padding=(dp(8), dp(8), dp(8), dp(8)))
         self.inner.bind(minimum_height=self.inner.setter("height"))
         self.scroll.add_widget(self.inner)
         self.add_widget(self.scroll)
@@ -989,22 +1071,90 @@ class ChatMessageBox(BoxLayout):
             thumb.add_widget(lab)
         parent.add_widget(thumb)
 
+    def _file_progress_state(self, message_id: str, total_size: int, summary: str, file_path: str = "") -> tuple[float, bool, bool, str]:
+        owner = getattr(self, "root_owner", None)
+        mid = str(message_id or "")
+        prog = getattr(owner, "file_message_progress", {}).get(mid, {}) if owner is not None else {}
+
+        # Persistent transfer_store is the source of truth. The runtime dict is
+        # only a fast UI cache and can lag behind completion on the receiver side.
+        row = {}
+        if owner is not None and getattr(owner, "file_transfer_service", None) is not None:
+            try:
+                row = owner.file_transfer_service.progress_for_message(mid) or {}
+            except Exception:
+                row = {}
+
+        if row:
+            sent = int(row.get("transferred_bytes") or 0)
+            total = int(row.get("total_bytes") or total_size or 0)
+            pct = float(row.get("pct") or ((sent * 100.0 / total) if total else 0.0))
+            state = str(row.get("status") or "")
+            avg = row.get("avg_mbps")
+            eta = str(row.get("eta") or "")
+        else:
+            sent = int(prog.get("sent") or 0)
+            total = int(prog.get("total") or total_size or 0)
+            pct = float(prog.get("pct") or ((sent * 100.0 / total) if total else 0.0))
+            state = str(prog.get("state") or "")
+            avg = prog.get("avg")
+            eta = str(prog.get("eta") or "")
+
+        # If the received file exists and is playable/openable, the visual card
+        # must not remain stuck at an intermediate percentage.
+        try:
+            if file_path and os.path.exists(file_path):
+                actual = os.path.getsize(file_path)
+                if actual > 0 and (total <= 0 or actual >= total or pct >= 99.0):
+                    total = max(total, actual)
+                    sent = total
+                    pct = 100.0
+                    state = self._cu("received")
+                    eta = "0:00"
+        except Exception:
+            pass
+
+        failed = "failed" in str(summary or "").lower() or "失败" in state or "failed" in state.lower()
+        complete = pct >= 99.9 or state in ("completed", "received", self._cu("completed"), self._cu("received")) or "read" in str(summary or "").lower()
+        rate_part = f"  {float(avg):.2f} Mbps" if avg not in (None, "", 0) else ""
+        eta_part = f"  ETA {eta}" if eta and eta != "unknown" else ""
+        if total > 0:
+            detail = f"{format_file_size(sent)} / {format_file_size(total)}{rate_part}{eta_part}" if sent > 0 and not complete else format_file_size(total)
+        else:
+            detail = self._cu("unknown_size")
+        return max(0.0, min(100.0, pct)), bool(failed), bool(complete), detail
+
+
     def add_message(self, *, mine: bool, sender: str, text: str, timestamp: str, summary: str = "", body_type: str = "text", file_path: str = "", message_id: str = "", progress_text: str = "", total_size: int = 0) -> None:
         is_file = body_type == "file"
         raw_text = str(text or "")
         if is_file:
-            line_height = 128
-            bubble_width = 300
+            line_height = 132
+            bubble_width = 324
         else:
-            # The minimum text bubble must still contain the footer: time + double-check.
-            # 106dp = horizontal padding + timestamp width + double-check width + spacing.
-            text_len = max(1, len(raw_text))
-            line_height = 48 if text_len <= 8 else (58 if text_len <= 18 else 74)
+            # Text bubble sizing:
+            # - minimum must contain footer: time + double-check
+            # - short messages stay compact
+            # - long messages grow to a reasonable width first, then wrap
+            # - height is calculated from wrapped line count, so text is not clipped
             char_units = 0
             for ch in raw_text:
-                char_units += 2 if ord(ch) > 127 else 1
-            content_width = 30 + min(42, char_units) * 7
-            bubble_width = max(106, min(286, content_width))
+                if ch == "\n":
+                    char_units += 24
+                else:
+                    char_units += 2 if ord(ch) > 127 else 1
+            char_units = max(1, char_units)
+            min_bubble = 118
+            max_bubble = 372
+            desired = 52 + min(char_units, 44) * 7
+            bubble_width = max(min_bubble, min(max_bubble, desired))
+            inner_units_per_line = max(12, int((bubble_width - 34) / 7))
+            manual_lines = raw_text.count("\n") + 1
+            wrap_lines = max(manual_lines, int((char_units + inner_units_per_line - 1) // inner_units_per_line))
+            text_h = max(32, 22 * wrap_lines + 14)
+            footer_h = 20
+            retry_h = 31 if mine and "failed" in str(summary or "").lower() else 0
+            line_height = int(text_h + footer_h + retry_h + 52)
         line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(line_height), padding=(0, dp(3), 0, dp(3)))
         if mine:
             spacer_left = BoxLayout(size_hint_x=1)
@@ -1012,29 +1162,31 @@ class ChatMessageBox(BoxLayout):
         else:
             spacer_left = BoxLayout(size_hint_x=None, width=dp(8))
             spacer_right = BoxLayout(size_hint_x=1)
-        bubble = BoxLayout(orientation="vertical", spacing=dp(3), padding=(dp(9), dp(6), dp(9), dp(5)), size_hint_x=None, width=dp(bubble_width))
-        apply_card_background(bubble, "bubble_mine" if mine else "bubble_other", radius=16)
+        bubble = BoxLayout(orientation="vertical", spacing=dp(7), padding=(dp(16), dp(15), dp(16), dp(13)), size_hint_x=None, width=dp(bubble_width))
+        apply_bubble_background(bubble, "bubble_mine" if mine else "bubble_other", mine=mine, radius=16)
 
         if is_file:
             file_name = os.path.basename(file_path or text) or text or self._cu("file")
-            content = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(64))
+            pct, failed, complete, detail_line = self._file_progress_state(message_id, total_size, summary, file_path=file_path)
+            content = BoxLayout(orientation="horizontal", spacing=dp(14), size_hint_y=None, height=dp(66), padding=(dp(2), 0, dp(2), 0))
             self._add_file_thumbnail(content, file_path, file_name)
-            meta = BoxLayout(orientation="vertical", spacing=dp(2))
-            name_lab = make_label(text=shorten_middle(file_name, 20), size_hint_y=None, height=dp(24), halign="left", valign="middle", color=THEME["text"], bold=True)
+            meta = BoxLayout(orientation="vertical", spacing=dp(5), padding=(dp(2), 0, dp(8), 0))
+            name_lab = make_label(text=shorten_middle(file_name, 18), size_hint_y=None, height=dp(24), halign="left", valign="middle", color=THEME["text"], bold=True)
             name_lab.shorten = True
             name_lab.shorten_from = "right"
-            bind_label_wrap(name_lab)
+            name_lab.text_size = (dp(170), None)
             meta.add_widget(name_lab)
-            status_line = progress_text
-            if not status_line:
-                total_part = f"{format_file_size(int(total_size or 0))}" if int(total_size or 0) > 0 else self._cu("unknown_size")
-                status_line = f"{summary or self._cu('pending')}  {total_part}"
-            status_lab = make_label(text=status_line, size_hint_y=None, height=dp(36), halign="left", valign="middle", color=THEME["muted_text"])
+            status_lab = make_label(text=shorten_middle(detail_line, 24), size_hint_y=None, height=dp(30), halign="left", valign="middle", color=THEME["muted_text"])
             status_lab.shorten = True
             status_lab.shorten_from = "right"
-            bind_label_wrap(status_lab)
+            status_lab.text_size = (dp(170), None)
             meta.add_widget(status_lab)
             content.add_widget(meta)
+            owner = getattr(self, "root_owner", None)
+            circle = CircularProgressButton(pct=pct, failed=failed, complete=complete, size_hint=(None, None), size=(dp(46), dp(46)))
+            if mine and failed and owner is not None:
+                circle.bind(on_release=lambda *_p, mid=message_id: owner.retry_file_message(mid))
+            content.add_widget(circle)
             bubble.add_widget(content)
             if not mine:
                 btn = make_button("secondary", text=self._cu("open_folder") if file_path else self._cu("waiting_saved"), size_hint_y=None, height=dp(28), on_release=lambda *_p, path=file_path: open_file_location(path))
@@ -1042,14 +1194,21 @@ class ChatMessageBox(BoxLayout):
                 bubble.add_widget(btn)
             self._add_footer(bubble, mine=mine, timestamp=timestamp, summary=summary)
         else:
-            lab_h = dp(20 if len(str(text or "")) <= 18 else 34)
-            lab = make_label(text=str(text or ""), size_hint_y=None, height=lab_h, halign="left", valign="middle", color=THEME["text"])
-            bind_label_wrap(lab)
+            # Label wrapping must be width-only. If height is included in text_size,
+            # Kivy can clip long text and wrap too aggressively.
+            label_width = max(1, bubble_width - 32)
+            lab = make_label(text=raw_text, size_hint_y=None, height=dp(text_h), halign="left", valign="top", color=THEME["text"])
+            lab.text_size = (dp(label_width), None)
+            lab.bind(width=lambda inst, _val: setattr(inst, "text_size", (max(1, inst.width), None)))
             bubble.add_widget(lab)
             self._add_footer(bubble, mine=mine, timestamp=timestamp, summary=summary)
+            if mine and "failed" in str(summary or "").lower() and getattr(self, "root_owner", None) is not None and body_type == "text":
+                retry_btn = make_button("danger", text=self._cu("retry"), size_hint_y=None, height=dp(26), on_release=lambda *_p, mid=message_id: self.root_owner.retry_outgoing_message(mid))
+                bubble.add_widget(retry_btn)
         line.add_widget(spacer_left); line.add_widget(bubble); line.add_widget(spacer_right)
         self.inner.add_widget(line)
         self.scroll.scroll_y = 0
+
 
 class RUDPTransferRoot(BoxLayout):
     def __init__(self, app: "RUDPTransferApp", **kwargs):
@@ -1072,6 +1231,11 @@ class RUDPTransferRoot(BoxLayout):
         self.last_sender_file: str = ""
         self.last_sender_failure_code: str = ""
         self.chat_store = None
+        self.transfer_store = None
+        self.contact_service = None
+        self.group_service = None
+        self.message_service = None
+        self.file_transfer_service = None
         self.chat_unlocked = False
         self.basic_mode = False
         self.chat_db_path = str(user_data_dir() / "chat" / "agoralink_chat.db")
@@ -1088,6 +1252,15 @@ class RUDPTransferRoot(BoxLayout):
         self.file_message_progress: Dict[str, Dict[str, object]] = {}
         self.current_receiving_file_message_id = ""
         self.receiving_file_message_by_conn: Dict[int, str] = {}
+        self.file_message_tasks: Dict[str, Dict[str, object]] = {}
+        self.live_message_cache: Dict[str, List[Dict[str, object]]] = {}
+        self.debug_protocol_lines: List[str] = []
+        self.debug_runtime_lines: List[str] = []
+        # Deduplicate the receiver's two log lines for one chat frame:
+        #   CHAT_MESSAGE_JSON:{...}
+        #   Chat from sender: text
+        # The second line is informational; it must not create another UI message.
+        self._recent_chat_json_seen: Dict[Tuple[str, str], float] = {}
         self._chat_render_sig: Optional[Tuple[object, ...]] = None
         self.pending_outgoing_contact_requests: Dict[str, Dict[str, object]] = {}
         self._build()
@@ -1369,10 +1542,10 @@ class RUDPTransferRoot(BoxLayout):
         center = BoxLayout(orientation="vertical", spacing=dp(10), padding=(dp(12), dp(12), dp(12), dp(12)))
         apply_card_background(center, "panel_bg", radius=22)
         title_bar = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(8))
-        self.current_chat_title = make_label(text=self.cu("choose_chat"), size_hint_y=None, height=dp(34), halign="left", valign="middle", bold=True)
-        bind_label_wrap(self.current_chat_title)
+        self.current_chat_title = make_button("secondary", text=self.cu("choose_chat"), size_hint_y=None, height=dp(34), halign="left", valign="middle", bold=True, on_release=lambda *_: self.toggle_detail_panel())
+        self.current_chat_title.bind(size=lambda inst, _val: setattr(inst, "text_size", (inst.width - dp(16), None)))
         title_bar.add_widget(self.current_chat_title)
-        self.online_state_btn = make_button("secondary", text="Online", size_hint_x=None, width=dp(88), on_release=lambda *_: self.toggle_online_state())
+        self.online_state_btn = make_button("secondary", text="Online", size_hint_x=None, width=0, opacity=0, disabled=True, on_release=lambda *_: self.toggle_online_state())
         title_bar.add_widget(self.online_state_btn)
         center.add_widget(title_bar)
         self.main_messages_box = ChatMessageBox(root_owner=self)
@@ -1423,9 +1596,43 @@ class RUDPTransferRoot(BoxLayout):
         self.delete_friend_main_btn = make_button("danger", text=self.cu("delete_friend"), on_release=lambda *_: self.confirm_delete_contact())
         self.right_action2.add_widget(self.delete_friend_main_btn)
         right.add_widget(self.right_action2)
+        self.chat_detail_panel = right
         root.add_widget(right)
+        self.detail_panel_visible = False
+        Clock.schedule_once(lambda _dt: self._hide_detail_panel(), 0)
         Clock.schedule_once(lambda _dt: self._set_right_action_mode("none"), 0)
         return root
+
+    def _hide_detail_panel(self) -> None:
+        try:
+            self.detail_panel_visible = False
+            panel = self.chat_detail_panel
+            panel.disabled = True
+            panel.opacity = 0.0
+            panel.width = 0
+            panel.size_hint_x = None
+        except Exception:
+            pass
+
+    def _show_detail_panel(self) -> None:
+        try:
+            self.detail_panel_visible = True
+            panel = self.chat_detail_panel
+            panel.disabled = False
+            panel.opacity = 1.0
+            panel.width = dp(300)
+            panel.size_hint_x = None
+        except Exception:
+            pass
+
+    def toggle_detail_panel(self) -> None:
+        if getattr(self, "current_chat_mode", "") not in ("direct", "group"):
+            return
+        if getattr(self, "detail_panel_visible", False):
+            self._hide_detail_panel()
+        else:
+            self._show_detail_panel()
+            self.render_current_chat()
 
     def toggle_online_state(self) -> None:
         try:
@@ -1493,23 +1700,28 @@ class RUDPTransferRoot(BoxLayout):
         text = str(fp or "")
         return text[:12] + ("…" if len(text) > 12 else "")
 
-    def _set_chat_entry_buttons(self, entries: List[tuple[str, str]]) -> None:
+    def _set_chat_entry_buttons(self, entries: List[tuple]) -> None:
         if not hasattr(self, "chat_items_box"):
             return
         self.chat_items_box.clear_widgets()
         values = []
-        for label, value in entries:
+        for item in entries:
+            if len(item) >= 3:
+                label, value, meta = item[0], item[1], item[2] or {}
+            else:
+                label, value, meta = item[0], item[1], {}
             values.append(value)
             role = "active" if str(value or "") == str(getattr(self, "selected_chat_entry_value", "") or "") else "secondary"
             btn = make_button(role, text=str(label), size_hint_y=None, height=dp(62))
             btn.halign = "center"
             btn.valign = "middle"
+            btn.bold = bool(meta.get("unread"))
             btn.shorten = False
             btn.bind(size=lambda inst, _val: setattr(inst, "text_size", (inst.width - dp(16), None)))
             btn.bind(on_release=lambda _btn, v=value: self._select_chat_entry(v))
             def _right_click(inst, touch, v=value):
                 if getattr(touch, "button", "") == "right" and inst.collide_point(*touch.pos):
-                    self._open_chat_entry_context_menu(inst, str(v or ""))
+                    self._open_chat_entry_context_menu(inst, str(v or ""), tuple(touch.pos))
                     return True
                 return False
             btn.bind(on_touch_down=_right_click)
@@ -1520,44 +1732,157 @@ class RUDPTransferRoot(BoxLayout):
         elif not values:
             self.chat_list_spinner.text = ""
 
-    def _open_chat_entry_context_menu(self, anchor, value: str) -> None:
+    def _close_chat_context_menu(self, *_args) -> None:
+        overlay = getattr(self, "_chat_context_overlay", None)
+        if overlay is not None:
+            try:
+                Window.remove_widget(overlay)
+            except Exception:
+                pass
+        self._chat_context_overlay = None
+
+    def _build_context_menu_button(self, label: str, role: str, callback) -> Button:
+        btn = Button(
+            text=str(label or ""),
+            size_hint_y=None,
+            height=dp(40),
+            font_name=UI_FONT,
+            background_normal="",
+            background_down="",
+            halign="left",
+            valign="middle",
+        )
+        btn.text_size = (dp(190), None)
+        btn.padding = (dp(14), 0)
+        # The menu item background is never danger-red. Dangerous actions only use red text.
+        btn.background_color = THEME.get("menu_bg", THEME["panel_bg"])
+        btn.color = THEME.get("menu_danger_text", THEME["danger"]) if role == "danger" else THEME["text"]
+
+        def _sync_text_size(inst, _value):
+            try:
+                inst.text_size = (max(1, inst.width - dp(28)), None)
+            except Exception:
+                pass
+
+        def _run(*_):
+            self._close_chat_context_menu()
+            try:
+                callback()
+            except Exception as exc:
+                try:
+                    self.status_text.text = f"context action failed: {exc}"
+                except Exception:
+                    pass
+
+        btn.bind(size=_sync_text_size)
+        btn.bind(on_release=_run)
+        return btn
+
+    def _show_context_menu_overlay(self, actions: List[tuple[str, str, object]], pos) -> None:
+        self._close_chat_context_menu()
+        if not actions:
+            return
+        item_h = dp(40)
+        width = dp(224)
+        height = dp(16) + item_h * len(actions)
+        overlay = FloatLayout(size=Window.size, pos=(0, 0))
+        # Transparent full-window catcher: clicking outside the panel closes the menu.
+        catcher = Button(
+            text="",
+            size_hint=(None, None),
+            size=Window.size,
+            pos=(0, 0),
+            background_normal="",
+            background_down="",
+            background_color=(0, 0, 0, 0),
+        )
+        catcher.bind(on_release=lambda *_: self._close_chat_context_menu())
+        overlay.add_widget(catcher)
+
+        panel = BoxLayout(
+            orientation="vertical",
+            spacing=dp(2),
+            padding=(dp(8), dp(8), dp(8), dp(8)),
+            size_hint=(None, None),
+            width=width,
+            height=height,
+        )
+        apply_card_background(panel, "menu_bg", radius=10)
+        for label, role, callback in actions:
+            panel.add_widget(self._build_context_menu_button(label, role, callback))
+
+        try:
+            x, y = float(pos[0]), float(pos[1])
+        except Exception:
+            x, y = Window.mouse_pos
+        margin = dp(8)
+        x = max(margin, min(x, Window.width - width - margin))
+        y = max(margin, min(y - height, Window.height - height - margin))
+        panel.pos = (x, y)
+        overlay.add_widget(panel)
+
+        def _resize(_win, w, h):
+            try:
+                overlay.size = (w, h)
+                catcher.size = (w, h)
+                px, py = panel.pos
+                panel.pos = (max(margin, min(px, w - width - margin)), max(margin, min(py, h - height - margin)))
+            except Exception:
+                pass
+
+        Window.bind(on_resize=_resize)
+        overlay._context_resize_cb = _resize
+        self._chat_context_overlay = overlay
+        Window.add_widget(overlay)
+
+    def _open_chat_entry_context_menu(self, anchor, value: str, pos=None) -> None:
         value = str(value or "")
         if not value:
             return
-        menu = DropDown(auto_width=False, width=dp(180))
-        def add_item(label: str, callback):
-            btn = make_button("secondary", text=label, size_hint_y=None, height=dp(36))
-            def _run(*_):
-                try:
-                    menu.dismiss()
-                except Exception:
-                    pass
-                callback()
-            btn.bind(on_release=_run)
-            menu.add_widget(btn)
-        add_item(self.cu("ctx_open_chat"), lambda: self._select_chat_entry(value))
+
+        actions: List[tuple[str, str, object]] = []
+
+        def add_action(label: str, callback, role: str = "normal") -> None:
+            actions.append((str(label or ""), str(role or "normal"), callback))
+
+        add_action(self.cu("ctx_open_chat"), lambda: self._select_chat_entry(value))
+
+        if value.startswith("direct::") and self.message_service is not None:
+            _tag0, pid0, _name0 = value.split("::", 2)
+            add_action(
+                self.cu("ctx_unpin") if self.message_service.is_pinned("direct", pid0) else self.cu("ctx_pin"),
+                lambda pid=pid0: (self.message_service.toggle_pinned("direct", pid), self.refresh_chat_main()),
+            )
+        elif value.startswith("group::") and self.message_service is not None:
+            _tag0, gid0, _title0 = value.split("::", 2)
+            add_action(
+                self.cu("ctx_unpin") if self.message_service.is_pinned("group", gid0) else self.cu("ctx_pin"),
+                lambda gid=gid0: (self.message_service.toggle_pinned("group", gid), self.refresh_chat_main()),
+            )
+
         if value.startswith("direct::"):
             _tag, pid, name = value.split("::", 2)
-            add_item(self.cu("ctx_view_profile"), lambda pid=pid: self._show_direct_profile_popup(pid))
-            add_item(self.cu("ctx_join_group"), lambda pid=pid: self._add_peer_to_group_popup(pid))
-            add_item(self.cu("ctx_rescan_ip"), lambda: self.search_receivers())
-            add_item(self.cu("ctx_delete_friend"), lambda v=value: (self._select_chat_entry(v), self.confirm_delete_contact()))
+            add_action(self.cu("ctx_view_profile"), lambda pid=pid: self._show_direct_profile_popup(pid))
+            add_action(self.cu("ctx_join_group"), lambda pid=pid: self._add_peer_to_group_popup(pid))
+            add_action(self.cu("ctx_rescan_ip"), lambda: self.search_receivers())
+            add_action(self.cu("ctx_delete_friend"), lambda v=value: (self._select_chat_entry(v), self.confirm_delete_contact()), role="danger")
         elif value.startswith("group::"):
-            add_item(self.cu("ctx_join_group"), lambda v=value: (self._select_chat_entry(v), self.add_selected_contact_to_current_group()))
-            add_item(self.cu("ctx_leave_group"), lambda v=value: (self._select_chat_entry(v), self.confirm_leave_group()))
+            add_action(self.cu("ctx_join_group"), lambda v=value: (self._select_chat_entry(v), self.add_selected_contact_to_current_group()))
+            add_action(self.cu("ctx_leave_group"), lambda v=value: (self._select_chat_entry(v), self.confirm_leave_group()), role="danger")
         else:
-            add_item(self.cu("ctx_add_contact"), lambda v=value: (self._select_chat_entry(v), self.request_or_add_selected_device()))
-            add_item(self.cu("ctx_rescan_ip"), lambda: self.search_receivers())
-        menu.open(anchor)
+            add_action(self.cu("ctx_add_contact"), lambda v=value: (self._select_chat_entry(v), self.request_or_add_selected_device()))
+            add_action(self.cu("ctx_rescan_ip"), lambda: self.search_receivers())
+
+        try:
+            menu_pos = tuple(pos) if pos is not None else tuple(anchor.to_window(anchor.x, anchor.y))
+        except Exception:
+            menu_pos = Window.mouse_pos
+        self._show_context_menu_overlay(actions, menu_pos)
 
     def _show_direct_profile_popup(self, peer_id: str) -> None:
-        if self.chat_store is None:
+        if self.contact_service is None:
             return
-        contact = None
-        for c in self.chat_store.list_contacts():
-            if str(c.get("peer_id") or "") == str(peer_id or ""):
-                contact = c
-                break
+        contact = self.contact_service.find_contact(peer_id)
         if not contact:
             return
         msg = (
@@ -1571,41 +1896,37 @@ class RUDPTransferRoot(BoxLayout):
         lab = make_label(text=msg, halign="left", valign="top")
         bind_label_wrap(lab)
         content.add_widget(lab)
-        popup = style_popup(Popup(title=self.cu("friend_info"), content=content, size_hint=(0.55, 0.45), auto_dismiss=True))
+        btn = make_button("secondary", text="OK", size_hint_y=None, height=dp(38), on_release=lambda *_: popup.dismiss())
+        content.add_widget(btn)
+        popup = style_popup(Popup(title=self.cu("friend_info"), content=content, size_hint=(0.6, 0.5), auto_dismiss=True))
         apply_ui_font(content)
         popup.open()
 
+
     def _add_peer_to_group_popup(self, peer_id: str) -> None:
-        if self.chat_store is None:
+        if self.group_service is None or self.contact_service is None:
             return
-        groups = self.chat_store.list_groups()
-        contact = next((c for c in self.chat_store.list_contacts(trusted_only=True) if str(c.get('peer_id')) == str(peer_id)), None)
+        groups = self.group_service.list_groups()
+        contact = self.contact_service.find_contact(peer_id)
         if not groups or not contact:
             return
         values = [f"{g.get('group_id')} | {g.get('title') or g.get('group_id')}" for g in groups]
         content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
         sp = style_spinner(Spinner(text=values[0], values=values, font_name=UI_FONT, size_hint_y=None, height=dp(38)))
         content.add_widget(sp)
-        popup = style_popup(Popup(title=self.cu("ctx_join_group"), content=content, size_hint=(0.62, 0.34), auto_dismiss=False))
+        popup = style_popup(Popup(title=self.cu("ctx_join_group"), content=content, size_hint=(0.6, 0.35), auto_dismiss=False))
         buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
         def _ok(*_):
             gid = sp.text.split("|", 1)[0].strip()
-            self.chat_store.add_group_member(
-                gid,
-                str(peer_id),
-                peer_ip=str(contact.get('peer_ip') or ''),
-                peer_port=int(contact.get('peer_port') or 9999),
-                display_name=str(contact.get('remark_name') or contact.get('display_name') or peer_id),
-                member_state="active",
-            )
+            self.group_service.add_member_from_contact(gid, contact)
             popup.dismiss()
             self.refresh_chat_main()
-            self.render_current_chat()
-        buttons.add_widget(make_button("success", text=self.cu("ctx_join_group"), on_release=_ok))
-        buttons.add_widget(make_button("secondary", text="取消" if self.lang == "zh" else "Cancel", on_release=lambda *_: popup.dismiss()))
+        buttons.add_widget(make_button("success", text=self.cu("add_member"), on_release=_ok))
+        buttons.add_widget(make_button("secondary", text="Cancel", on_release=lambda *_: popup.dismiss()))
         content.add_widget(buttons)
         apply_ui_font(content)
         popup.open()
+
 
     def _select_chat_entry(self, value: str) -> None:
         value = str(value or "")
@@ -1704,13 +2025,13 @@ class RUDPTransferRoot(BoxLayout):
             self._set_chat_entry_buttons(entries)
             return
 
-        if store is None:
+        if self.message_service is None or self.group_service is None or self.contact_service is None:
             self._set_chat_entry_buttons([(self.cu("chat_locked"), "")])
             return
 
         try:
-            groups = store.list_groups()
-            contacts = store.list_contacts(trusted_only=True)
+            groups = self.group_service.list_groups()
+            contacts = self.contact_service.trusted_contacts()
 
             if section == "recent":
                 recent_items = []
@@ -1718,38 +2039,42 @@ class RUDPTransferRoot(BoxLayout):
                     title = str(g.get("title") or g.get("group_id") or "群聊")
                     gid = str(g.get("group_id") or "")
                     preview, tlabel, ts, status_icon, unread = self._latest_group_preview(store, gid)
-                    label = self._format_chat_list_label(title, preview, tlabel, status_icon, unread)
+                    pinned = store.is_pinned("group", gid) if hasattr(store, "is_pinned") else False
+                    label = self._format_chat_list_label(("[PIN] " if pinned else "") + title, preview, tlabel, status_icon, unread)
                     if query and query not in label.lower() and query not in gid.lower():
                         continue
-                    recent_items.append((ts or float(g.get("updated_at") or g.get("created_at") or 0), label, f"group::{gid}::{title}"))
+                    recent_items.append((1 if pinned else 0, ts or float(g.get("updated_at") or g.get("created_at") or 0), label, f"group::{gid}::{title}", {"unread": unread > 0, "pinned": pinned}))
                 for c in contacts:
                     name = str(c.get("remark_name") or c.get("display_name") or c.get("nickname") or c.get("peer_id"))
                     pid = str(c.get("peer_id") or "")
                     preview, tlabel, ts, status_icon, unread = self._latest_direct_preview(store, pid)
-                    label = self._format_chat_list_label(name, preview, tlabel, status_icon, unread)
+                    pinned = store.is_pinned("direct", pid) if hasattr(store, "is_pinned") else False
+                    label = self._format_chat_list_label(("[PIN] " if pinned else "") + name, preview, tlabel, status_icon, unread)
                     if query and query not in label.lower() and query not in pid.lower():
                         continue
-                    recent_items.append((ts, label, f"direct::{pid}::{name}"))
-                for _ts, label, value in sorted(recent_items, key=lambda x: float(x[0] or 0), reverse=True):
-                    entries.append((label, value))
+                    recent_items.append((1 if pinned else 0, ts, label, f"direct::{pid}::{name}", {"unread": unread > 0, "pinned": pinned}))
+                for _pin, _ts, label, value, meta in sorted(recent_items, key=lambda x: (int(x[0] or 0), float(x[1] or 0)), reverse=True):
+                    entries.append((label, value, meta))
             else:
                 # 联系人页：群聊在上，好友在下。
                 for g in groups:
                     title = str(g.get("title") or g.get("group_id") or "群聊")
                     gid = str(g.get("group_id") or "")
                     preview, tlabel, _ts, status_icon, unread = self._latest_group_preview(store, gid)
-                    label = self._format_chat_list_label(f"{self.cu('group_prefix')}  {title}", preview, tlabel, status_icon, unread)
+                    pinned = store.is_pinned("group", gid) if hasattr(store, "is_pinned") else False
+                    label = self._format_chat_list_label(("[PIN] " if pinned else "") + f"{self.cu('group_prefix')}  {title}", preview, tlabel, status_icon, unread)
                     if query and query not in label.lower() and query not in gid.lower():
                         continue
-                    entries.append((label, f"group::{gid}::{title}"))
+                    entries.append((label, f"group::{gid}::{title}", {"unread": unread > 0, "pinned": pinned}))
                 for c in contacts:
                     name = str(c.get("remark_name") or c.get("display_name") or c.get("nickname") or c.get("peer_id"))
                     pid = str(c.get("peer_id") or "")
                     preview, tlabel, _ts, status_icon, unread = self._latest_direct_preview(store, pid)
-                    label = self._format_chat_list_label(f"{self.cu('friend_prefix')}  {name}", preview, tlabel, status_icon, unread)
+                    pinned = store.is_pinned("direct", pid) if hasattr(store, "is_pinned") else False
+                    label = self._format_chat_list_label(("[PIN] " if pinned else "") + f"{self.cu('friend_prefix')}  {name}", preview, tlabel, status_icon, unread)
                     if query and query not in label.lower() and query not in pid.lower():
                         continue
-                    entries.append((label, f"direct::{pid}::{name}"))
+                    entries.append((label, f"direct::{pid}::{name}", {"unread": unread > 0, "pinned": pinned}))
 
             if not entries:
                 entries.append((self.cu("no_chat"), ""))
@@ -1758,23 +2083,10 @@ class RUDPTransferRoot(BoxLayout):
             self._set_chat_entry_buttons([(self.cu("refresh_failed", error=exc), "")])
 
     def _endpoint_for_peer(self, peer_id: str) -> Tuple[str, int]:
-        pid = str(peer_id or "").strip()
-        if not pid or self.chat_store is None:
+        if self.contact_service is None:
             return "", 9999
-        try:
-            row = self.chat_store.db.conn.execute(
-                "SELECT peer_ip, peer_port FROM contacts WHERE peer_id=?", (pid,)
-            ).fetchone()
-            if row is not None and str(row["peer_ip"] or ""):
-                return str(row["peer_ip"] or ""), int(row["peer_port"] or 9999)
-            row = self.chat_store.db.conn.execute(
-                "SELECT peer_ip, peer_port FROM group_members WHERE peer_id=? AND COALESCE(peer_ip,'')!='' LIMIT 1", (pid,)
-            ).fetchone()
-            if row is not None:
-                return str(row["peer_ip"] or ""), int(row["peer_port"] or 9999)
-        except Exception:
-            pass
-        return "", 9999
+        return self.contact_service.endpoint_for_peer(str(peer_id or ""))
+
 
     def _send_chat_read_to_endpoint(self, *, ip: str, port: int, peer_id: str, message_ids: List[str], group_id: str = "", conversation_id: str = "") -> None:
         ids = [str(x or "").strip() for x in (message_ids or []) if str(x or "").strip()]
@@ -1805,34 +2117,28 @@ class RUDPTransferRoot(BoxLayout):
         threading.Thread(target=_run, daemon=True).start()
 
     def _mark_current_chat_read_and_notify(self) -> None:
-        store = self.chat_store
-        if store is None:
+        if self.message_service is None:
             return
         try:
             if self.current_chat_mode == "direct" and self.current_peer_id:
-                unread = store.unread_incoming_for_direct(self.current_peer_id)
-                if not unread:
+                by_sender = self.message_service.mark_read_and_collect_receipts(
+                    peer_id=self.current_peer_id,
+                    local_peer_id=self.chat_local_peer_id,
+                )
+                if not by_sender:
                     return
-                conv = store.create_direct_conversation(self.current_peer_id)
-                ids = [str(r.get("message_id") or "") for r in unread]
-                for mid in ids:
-                    store.mark_incoming_read(mid)
-                ip, port = self._endpoint_for_peer(self.current_peer_id)
-                self._send_chat_read_to_endpoint(ip=ip, port=port, peer_id=self.current_peer_id, message_ids=ids, conversation_id=conv)
+                conv = self.message_service.create_direct_conversation(self.current_peer_id) if self.message_service is not None else ""
+                for sender, ids in by_sender.items():
+                    ip, port = self._endpoint_for_peer(sender)
+                    self._send_chat_read_to_endpoint(ip=ip, port=port, peer_id=sender, message_ids=ids, conversation_id=conv)
                 Clock.schedule_once(lambda _dt: self.refresh_chat_main(), 0.05)
             elif self.current_chat_mode == "group" and self.current_group_id:
-                unread = store.unread_incoming_for_group(self.current_group_id)
-                if not unread:
+                by_sender = self.message_service.mark_read_and_collect_receipts(
+                    group_id=self.current_group_id,
+                    local_peer_id=self.chat_local_peer_id,
+                )
+                if not by_sender:
                     return
-                by_sender: Dict[str, List[str]] = {}
-                for r in unread:
-                    mid = str(r.get("message_id") or "")
-                    sender = str(r.get("sender_peer_id") or "")
-                    if not mid:
-                        continue
-                    store.mark_incoming_read(mid)
-                    if sender and sender != self.chat_local_peer_id:
-                        by_sender.setdefault(sender, []).append(mid)
                 for sender, ids in by_sender.items():
                     ip, port = self._endpoint_for_peer(sender)
                     self._send_chat_read_to_endpoint(ip=ip, port=port, peer_id=sender, message_ids=ids, group_id=self.current_group_id)
@@ -1842,6 +2148,7 @@ class RUDPTransferRoot(BoxLayout):
                 self.sender_log_box.append(f"mark read failed: {exc}\n")
             except Exception:
                 pass
+
 
     def on_chat_list_selected(self, value: str) -> None:
         text = str(value or "")
@@ -1865,13 +2172,46 @@ class RUDPTransferRoot(BoxLayout):
             self.current_chat_title.text = self.cu("device_title")
         self.render_current_chat()
 
+    def _transfer_store_tick(self) -> float:
+        if self.file_transfer_service is None:
+            return 0.0
+        return self.file_transfer_service.max_updated_at()
+
     def _file_progress_text(self, message_id: str, total_size: int = 0, summary: str = "") -> str:
-        prog = self.file_message_progress.get(str(message_id or ""), {})
+        mid = str(message_id or "")
+        row = {}
+        if self.file_transfer_service is not None:
+            try:
+                row = self.file_transfer_service.progress_for_message(mid) or {}
+            except Exception:
+                row = {}
+        prog = {}
+        if row:
+            prog = {
+                "sent": int(row.get("transferred_bytes") or 0),
+                "total": int(row.get("total_bytes") or total_size or 0),
+                "pct": float(row.get("pct") or 0.0),
+                "avg": float(row.get("avg_mbps") or 0.0),
+                "eta": str(row.get("eta") or ""),
+                "state": str(row.get("status") or self.cu("receiving")),
+            }
+        else:
+            prog = self.file_message_progress.get(mid, {})
         if prog:
             sent = int(prog.get("sent") or 0)
             total = int(prog.get("total") or total_size or 0)
             pct = float(prog.get("pct") or ((sent * 100.0 / total) if total else 0.0))
-            state = str(prog.get("state") or self.cu("receiving"))
+            state_raw = str(prog.get("state") or self.cu("receiving"))
+            status_map = {
+                "queued": self.cu("pending"),
+                "offered": self.cu("pending"),
+                "accepted": self.cu("pending"),
+                "transferring": self.cu("receiving"),
+                "completed": self.cu("completed"),
+                "received": self.cu("received"),
+                "failed": self.cu("failed"),
+            }
+            state = status_map.get(state_raw, state_raw)
             avg = prog.get("avg")
             eta = str(prog.get("eta") or "")
             rate_part = f"  {float(avg):.2f} Mbps" if avg not in (None, "", 0) else ""
@@ -1891,14 +2231,14 @@ class RUDPTransferRoot(BoxLayout):
                     "SELECT COUNT(*) AS n, COALESCE(MAX(created_at),0) AS t, COALESCE(MAX(delivered_at),0) AS d, COALESCE(MAX(read_at),0) AS r FROM messages WHERE group_id=?",
                     (self.current_group_id,),
                 ).fetchone()
-                return ("group", self.current_group_id, int(row["n"] or 0), float(row["t"] or 0), float(row["d"] or 0), float(row["r"] or 0), json.dumps(self.file_message_progress, sort_keys=True))
+                return ("group", self.current_group_id, int(row["n"] or 0), float(row["t"] or 0), float(row["d"] or 0), float(row["r"] or 0), json.dumps(self.file_message_progress, sort_keys=True), self._transfer_store_tick())
             if self.current_chat_mode == "direct" and self.current_peer_id:
-                conv = store.create_direct_conversation(self.current_peer_id)
+                conv = self.message_service.create_direct_conversation(self.current_peer_id)
                 row = store.db.conn.execute(
                     "SELECT COUNT(*) AS n, COALESCE(MAX(created_at),0) AS t, COALESCE(MAX(delivered_at),0) AS d, COALESCE(MAX(read_at),0) AS r FROM messages WHERE conversation_id=?",
                     (conv,),
                 ).fetchone()
-                return ("direct", conv, int(row["n"] or 0), float(row["t"] or 0), float(row["d"] or 0), float(row["r"] or 0), json.dumps(self.file_message_progress, sort_keys=True))
+                return ("direct", conv, int(row["n"] or 0), float(row["t"] or 0), float(row["d"] or 0), float(row["r"] or 0), json.dumps(self.file_message_progress, sort_keys=True), self._transfer_store_tick())
         except Exception:
             return None
         return None
@@ -1974,27 +2314,35 @@ class RUDPTransferRoot(BoxLayout):
             style_button(self.online_state_btn, "active" if running else "secondary")
         self._chat_render_sig = self._current_chat_signature()
         store = self.chat_store
-        if store is None:
+        if self.message_service is None or self.group_service is None or self.contact_service is None:
             self.main_messages_box.append("聊天数据库未解锁。\n")
             return
         self._mark_current_chat_read_and_notify()
         try:
             if self.current_chat_mode == "group" and self.current_group_id:
                 file_cards = []
+                seen_message_ids = set()
                 last_date_key = ""
-                for msg in store.list_messages(group_id=self.current_group_id, limit=200):
-                    summary = store.receipt_summary(str(msg.get('message_id') or ''))
+                last_sender = ""
+                last_ts_for_grouping = 0.0
+                for msg in self.message_service.list_messages(group_id=self.current_group_id, limit=200):
+                    summary = self.message_service.receipt_summary(str(msg.get('message_id') or ''))
                     mine_msg = str(msg.get('sender_peer_id') or '') == self.chat_local_peer_id
                     msg_created_ts = float(msg.get("created_at") or time.time())
                     msg_date_key = time.strftime("%Y-%m-%d", time.localtime(msg_created_ts))
                     if msg_date_key != last_date_key:
                         self.main_messages_box.add_date_separator(self._date_separator_label(msg_created_ts))
                         last_date_key = msg_date_key
+                        last_sender = ""
+                        last_ts_for_grouping = 0.0
+                        last_sender = ""
+                        last_ts_for_grouping = 0.0
                     ts_source = msg.get('sent_at') if mine_msg else msg.get('received_at')
                     ts = time.strftime("%H:%M", time.localtime(float(ts_source or msg_created_ts)))
                     body_type = str(msg.get('body_type') or 'text')
                     text = str(msg.get('text') or '')
                     file_path = ''
+                    mid = str(msg.get('message_id') or '')
                     if body_type == 'file':
                         try:
                             obj = json.loads(text)
@@ -2004,14 +2352,39 @@ class RUDPTransferRoot(BoxLayout):
                         except Exception:
                             file_path = text
                             total_size = 0
+                        if not file_path:
+                            file_path = self._file_path_from_transfer_store(mid)
                     else:
                         total_size = 0
-                    mid = str(msg.get('message_id') or '')
                     progress_text = self._file_progress_text(mid, total_size, summary) if body_type == 'file' else ''
                     if body_type == 'file':
                         file_cards.append((text, file_path, total_size, ts))
-                    self.main_messages_box.add_message(mine=mine_msg, sender=str(msg.get('sender_peer_id') or ''), text=text, timestamp=ts, summary=summary, body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size)
-                members = store.list_group_members(self.current_group_id, include_inactive=True)
+                    sender_id = str(msg.get('sender_peer_id') or '')
+                    compact = (sender_id == last_sender and (msg_created_ts - last_ts_for_grouping) <= 300 and body_type != 'file')
+                    self.main_messages_box.add_message(mine=mine_msg, sender=sender_id, text=text, timestamp=ts, summary=summary, body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size)
+                    last_sender = sender_id
+                    last_ts_for_grouping = msg_created_ts
+                for live in self._live_messages_for_current_chat(seen_message_ids):
+                    mid = str(live.get("message_id") or "")
+                    if mid:
+                        seen_message_ids.add(mid)
+                    msg_created_ts = float(live.get("created_at") or time.time())
+                    ts = time.strftime("%H:%M", time.localtime(msg_created_ts))
+                    body_type = str(live.get("body_type") or "text")
+                    text_live = str(live.get("text") or "")
+                    file_path = ""
+                    total_size = 0
+                    if body_type == "file":
+                        try:
+                            obj_live = json.loads(text_live)
+                            file_path = str(obj_live.get("path") or self._file_path_from_transfer_store(mid) or "")
+                            total_size = int(obj_live.get("size") or 0)
+                            text_live = str(obj_live.get("name") or file_path or text_live)
+                        except Exception:
+                            pass
+                    progress_text = self._file_progress_text(mid, total_size, "") if body_type == "file" else ""
+                    self.main_messages_box.add_message(mine=False, sender=str(live.get("sender_peer_id") or ""), text=text_live, timestamp=ts, summary="", body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size)
+                members = self.group_service.members(self.current_group_id, include_inactive=True)
                 if hasattr(self, "right_title"):
                     self.right_title.text = self.cu("group_members_title")
                 self._set_right_action_mode("group")
@@ -2022,11 +2395,14 @@ class RUDPTransferRoot(BoxLayout):
                 for name, path, size, tsf in reversed(file_cards[-8:]):
                     self._add_shared_file_entry(name, path, size, tsf)
             elif self.current_chat_mode == "direct" and self.current_peer_id:
-                conv = store.create_direct_conversation(self.current_peer_id)
+                conv = self.message_service.create_direct_conversation(self.current_peer_id)
                 file_cards = []
+                seen_message_ids = set()
                 last_date_key = ""
-                for msg in store.list_messages(conversation_id=conv, limit=200):
-                    summary = store.receipt_summary(str(msg.get('message_id') or ''))
+                last_sender = ""
+                last_ts_for_grouping = 0.0
+                for msg in self.message_service.list_messages(conversation_id=conv, limit=200):
+                    summary = self.message_service.receipt_summary(str(msg.get('message_id') or ''))
                     mine_msg = str(msg.get('sender_peer_id') or '') == self.chat_local_peer_id
                     msg_created_ts = float(msg.get("created_at") or time.time())
                     msg_date_key = time.strftime("%Y-%m-%d", time.localtime(msg_created_ts))
@@ -2038,6 +2414,7 @@ class RUDPTransferRoot(BoxLayout):
                     body_type = str(msg.get('body_type') or 'text')
                     text = str(msg.get('text') or '')
                     file_path = ''
+                    mid = str(msg.get('message_id') or '')
                     if body_type == 'file':
                         try:
                             obj = json.loads(text)
@@ -2047,16 +2424,43 @@ class RUDPTransferRoot(BoxLayout):
                         except Exception:
                             file_path = text
                             total_size = 0
+                        if not file_path:
+                            file_path = self._file_path_from_transfer_store(mid)
                     else:
                         total_size = 0
-                    mid = str(msg.get('message_id') or '')
                     progress_text = self._file_progress_text(mid, total_size, summary) if body_type == 'file' else ''
                     if body_type == 'file':
                         file_cards.append((text, file_path, total_size, ts))
-                    self.main_messages_box.add_message(mine=mine_msg, sender=str(msg.get('sender_peer_id') or ''), text=text, timestamp=ts, summary=summary, body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size)
+                    sender_id = str(msg.get('sender_peer_id') or '')
+                    compact = (sender_id == last_sender and (msg_created_ts - last_ts_for_grouping) <= 300 and body_type != 'file')
+                    if mid:
+                        seen_message_ids.add(mid)
+                    self.main_messages_box.add_message(mine=mine_msg, sender=sender_id, text=text, timestamp=ts, summary=summary, body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size)
+                    last_sender = sender_id
+                    last_ts_for_grouping = msg_created_ts
+                for live in self._live_messages_for_current_chat(seen_message_ids):
+                    mid = str(live.get("message_id") or "")
+                    if mid:
+                        seen_message_ids.add(mid)
+                    msg_created_ts = float(live.get("created_at") or time.time())
+                    ts = time.strftime("%H:%M", time.localtime(msg_created_ts))
+                    body_type = str(live.get("body_type") or "text")
+                    text_live = str(live.get("text") or "")
+                    file_path = ""
+                    total_size = 0
+                    if body_type == "file":
+                        try:
+                            obj_live = json.loads(text_live)
+                            file_path = str(obj_live.get("path") or self._file_path_from_transfer_store(mid) or "")
+                            total_size = int(obj_live.get("size") or 0)
+                            text_live = str(obj_live.get("name") or file_path or text_live)
+                        except Exception:
+                            pass
+                    progress_text = self._file_progress_text(mid, total_size, "") if body_type == "file" else ""
+                    self.main_messages_box.add_message(mine=False, sender=str(live.get("sender_peer_id") or ""), text=text_live, timestamp=ts, summary="", body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size)
                 contact_text = ""
                 seen_contact = False
-                for c in store.list_contacts():
+                for c in self.contact_service.list_contacts(trusted_only=False):
                     if str(c.get("peer_id") or "") == self.current_peer_id and not seen_contact:
                         seen_contact = True
                         if hasattr(self, "right_title"):
@@ -2426,8 +2830,48 @@ class RUDPTransferRoot(BoxLayout):
         apply_ui_font(content)
         popup.open()
 
+    def _purge_debug_live_messages(self) -> None:
+        """Remove old live_* rows created by the temporary Chat-from fallback.
+
+        These rows were diagnostic artifacts. They duplicate real msg_* messages
+        and can also cause CHAT_READ foreign-key errors on the sender side.
+        """
+        try:
+            if self.chat_store is None:
+                return
+            conn = self.chat_store.db.conn
+            conn.execute("DELETE FROM message_receipts WHERE message_id LIKE 'live_%'")
+            conn.execute("DELETE FROM messages WHERE message_id LIKE 'live_%'")
+            conn.commit()
+        except Exception as exc:
+            try:
+                self._append_debug_line(f"purge live_* messages failed: {exc}", protocol=True)
+            except Exception:
+                pass
+
+    def _refresh_services(self) -> None:
+        """Wire service-layer adapters after chat/transfer stores change.
+
+        The UI should call these adapters for contact, message and file-transfer
+        business operations instead of reaching into storage directly.  This keeps
+        the Kivy layer replaceable by a future desktop/mobile UI.
+        """
+        try:
+            from app_services import ContactService, GroupService, MessageService, FileTransferService
+            self.contact_service = ContactService(self.chat_store)
+            self.group_service = GroupService(self.chat_store)
+            self.message_service = MessageService(self.chat_store)
+            self.file_transfer_service = FileTransferService(self.transfer_store, self.chat_store)
+            self._purge_debug_live_messages()
+        except Exception:
+            self.contact_service = None
+            self.group_service = None
+            self.message_service = None
+            self.file_transfer_service = None
+
     def unlock_chat_with(self, db_path: str, password: str, nickname: str) -> None:
         from chat_store import ChatStore
+        from transfer_store import TransferStore
         # First use a temporary peer id; after opening, persist a stable local id in meta.
         initial_peer = re.sub(r"[^A-Za-z0-9_.-]+", "_", nickname.strip()) or "local"
         self.chat_db_path = str(Path(db_path).expanduser().resolve())
@@ -2437,7 +2881,14 @@ class RUDPTransferRoot(BoxLayout):
                 self.chat_store.close()
             except Exception:
                 pass
+        if self.transfer_store is not None:
+            try:
+                self.transfer_store.close()
+            except Exception:
+                pass
         self.chat_store = ChatStore(self.chat_db_path, self.chat_password, my_peer_id=initial_peer)
+        self.transfer_store = TransferStore(self.chat_db_path)
+        self._refresh_services()
         profile = self.chat_store.get_local_profile()
         if not profile.get("peer_id") or profile.get("peer_id") == "local":
             import hashlib, secrets
@@ -2470,7 +2921,18 @@ class RUDPTransferRoot(BoxLayout):
         theme_line.add_widget(theme_spinner)
         content.add_widget(theme_line)
         log = LogBox(size_hint_y=1)
-        log.append("调试日志入口\n\n运行日志：接收端和发送端日志仍在旧页面/本窗口记录。\n传输日志：文件传输进度和错误。\n协议错误：USER_ERROR_JSON / CHAT_ACK_JSON / CONTACT_REQUEST_JSON。\n")
+        protocol_text = "\n".join(self.debug_protocol_lines[-160:]) or "暂无协议日志。"
+        runtime_text = "\n".join(self.debug_runtime_lines[-120:]) or "暂无运行日志。"
+        log.append(
+            "调试日志入口\n\n"
+            "B 端接收日志查看方式：设置 / 调试 -> 本窗口下方日志。\n"
+            "重点搜索：CHAT_MESSAGE_JSON、TRANSFER_REQUEST_JSON、Session saved、end reason=complete。\n\n"
+            "=== 协议日志 / Protocol ===\n"
+            + protocol_text[-12000:] +
+            "\n\n=== 运行日志 / Runtime ===\n"
+            + runtime_text[-12000:] +
+            "\n"
+        )
         content.add_widget(log)
         buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
         popup = style_popup(Popup(title="设置 / 调试", content=content, size_hint=(0.78, 0.72)))
@@ -2522,21 +2984,17 @@ class RUDPTransferRoot(BoxLayout):
         return f"{name}  {ip}:{port}"
 
     def _refresh_known_contact_endpoints(self, found: List[Dict[str, object]]) -> None:
-        if self.chat_store is None:
+        if self.contact_service is None:
             return
-        for rec in found or []:
-            if not isinstance(rec, dict):
-                continue
-            ip, port = self._receiver_endpoint(rec)
-            if not ip or is_unspecified_ip(ip):
-                continue
-            self.chat_store.update_known_endpoint(
-                peer_id=self._device_peer_id(rec),
-                fingerprint=self._device_fingerprint(rec),
-                nickname=self._device_display_name(rec),
-                peer_ip=ip,
-                peer_port=port,
-            )
+        self.contact_service.update_known_endpoints(
+            found or [],
+            endpoint_getter=self._receiver_endpoint,
+            peer_id_getter=self._device_peer_id,
+            fingerprint_getter=self._device_fingerprint,
+            nickname_getter=self._device_display_name,
+            invalid_ip_checker=is_unspecified_ip,
+        )
+
 
     def search_receivers(self) -> None:
         """Search LAN receivers without blocking the Kivy UI thread."""
@@ -2624,6 +3082,7 @@ class RUDPTransferRoot(BoxLayout):
     def unlock_chat_db(self) -> None:
         try:
             from chat_store import ChatStore
+            from transfer_store import TransferStore
             self.chat_db_path = self.chat_db_input.text.strip() or str(user_data_dir() / "chat" / "agoralink_chat.db")
             self.chat_password = self.chat_password_input.text
             self.chat_local_peer_id = self.chat_local_peer_input.text.strip() or "local"
@@ -2636,6 +3095,8 @@ class RUDPTransferRoot(BoxLayout):
                 except Exception:
                     pass
             self.chat_store = ChatStore(self.chat_db_path, self.chat_password, my_peer_id=self.chat_local_peer_id)
+            self.transfer_store = TransferStore(self.chat_db_path)
+            self._refresh_services()
             self.chat_messages_box.append(self.t("chat_unlocked") + f" {self.chat_db_path}\n")
             self.refresh_chat_view()
         except Exception as exc:
@@ -2648,21 +3109,20 @@ class RUDPTransferRoot(BoxLayout):
         return self.chat_store
 
     def create_chat_group(self) -> None:
-        store = self._require_chat_store()
-        if store is None:
+        if self.group_service is None:
             return
         gid = self.chat_group_id_input.text.strip()
         if not gid:
             self.chat_messages_box.append(self.t("need_group") + "\n")
             return
         title = self.chat_group_title_input.text.strip() or gid
-        store.create_group(gid, title)
+        self.group_service.create_group(gid, title)
         self.chat_messages_box.append(f"Group saved: {gid}\n")
         self.refresh_chat_view()
 
+
     def add_chat_member(self) -> None:
-        store = self._require_chat_store()
-        if store is None:
+        if self.group_service is None:
             return
         gid = self.chat_group_id_input.text.strip()
         pid = self.member_peer_input.text.strip()
@@ -2676,61 +3136,68 @@ class RUDPTransferRoot(BoxLayout):
             port = int(self.member_port_input.text.strip() or "9999")
         except Exception:
             port = 9999
-        store.add_group_member(gid, pid, peer_ip=self.member_ip_input.text.strip(), peer_port=port, display_name=pid, member_state="active")
+        self.group_service.add_member_manual(
+            gid, pid,
+            peer_ip=self.member_ip_input.text.strip(),
+            peer_port=port,
+            display_name=pid,
+        )
         self.chat_messages_box.append(f"Member saved: {pid}\n")
         self.refresh_chat_view()
 
+
     def remove_chat_member(self) -> None:
-        store = self._require_chat_store()
-        if store is None:
+        if self.group_service is None:
             return
         gid = self.chat_group_id_input.text.strip()
         pid = self.member_peer_input.text.strip()
         if not gid or not pid:
             self.chat_messages_box.append(self.t("need_member") + "\n")
             return
-        store.remove_group_member(gid, pid, removed=True)
+        self.group_service.remove_member(gid, pid, removed=True)
         self.chat_messages_box.append(f"Member removed: {pid}\n")
         self.refresh_chat_view()
 
+
     def leave_chat_group(self) -> None:
-        store = self._require_chat_store()
-        if store is None:
+        if self.group_service is None:
             return
         gid = self.chat_group_id_input.text.strip()
         if not gid:
             self.chat_messages_box.append(self.t("need_group") + "\n")
             return
-        store.leave_group(gid, self.chat_local_peer_id)
+        self.group_service.leave_group_local(gid, self.chat_local_peer_id)
         self.chat_messages_box.append(f"Left group: {gid}\n")
         self.refresh_chat_view()
 
+
     def refresh_chat_view(self) -> None:
-        store = self.chat_store
-        if store is None:
+        if self.group_service is None or self.message_service is None:
             return
         gid = self.chat_group_id_input.text.strip()
         self.chat_members_box.clear()
         self.chat_messages_box.clear()
         try:
-            groups = store.list_groups()
+            groups = self.group_service.list_groups()
             self.chat_members_box.append("Groups:\n")
             for g in groups:
                 self.chat_members_box.append(f"  {g.get('group_id')}  {g.get('title')}  {g.get('group_state')}\n")
             if gid:
                 self.chat_members_box.append("\nMembers:\n")
-                for m in store.list_group_members(gid, include_inactive=True):
+                for m in self.group_service.members(gid, include_inactive=True):
                     self.chat_members_box.append(f"  {m.get('peer_id')}  {m.get('peer_ip')}:{m.get('peer_port')}  {m.get('member_state')}\n")
                 self.chat_messages_box.append(f"Messages for {gid}:\n")
-                for msg in store.list_messages(group_id=gid, limit=100):
-                    summary = store.receipt_summary(str(msg.get('message_id') or ''))
+                for msg in self.message_service.list_messages(group_id=gid, limit=100):
+                    summary = self.message_service.receipt_summary(str(msg.get('message_id') or ''))
                     self.chat_messages_box.append(f"[{msg.get('status')}] {msg.get('sender_peer_id')}: {msg.get('text')}  {summary}\n")
         except Exception as exc:
             self.chat_messages_box.append(f"Chat refresh failed: {exc}\n")
 
+
+
     def send_group_message_gui(self) -> None:
-        store = self._require_chat_store()
-        if store is None:
+        if self.message_service is None:
+            self.chat_messages_box.append(self.t("chat_locked") + "\n")
             return
         gid = self.chat_group_id_input.text.strip()
         text = self.group_message_input.text.strip()
@@ -2741,7 +3208,7 @@ class RUDPTransferRoot(BoxLayout):
             self.chat_messages_box.append(self.t("need_chat_message") + "\n")
             return
         try:
-            msg, recipients = store.send_group_message(gid, text)
+            msg, recipients = self.message_service.create_group_text(gid, text)
         except Exception as exc:
             self.chat_messages_box.append(f"Failed to create message: {exc}\n")
             return
@@ -2758,7 +3225,7 @@ class RUDPTransferRoot(BoxLayout):
                 except Exception:
                     port = 9999
                 if not ip:
-                    store.mark_chat_failed(str(msg["message_id"]), peer_id, error="missing_member_ip")
+                    self.message_service.mark_failed(str(msg["message_id"]), peer_id, error="missing_member_ip")
                     Clock.schedule_once(lambda _dt, pid=peer_id: self.chat_messages_box.append(f"Failed {pid}: missing IP\n"), 0)
                     continue
                 pin_file = str(receiver_pin_file(ip, port))
@@ -2782,14 +3249,14 @@ class RUDPTransferRoot(BoxLayout):
                     cmd = ([sys.executable] + args) if FROZEN else ([sys.executable, str(Path(__file__).resolve())] + args)
                     proc = subprocess.run(cmd, cwd=str(APP_DIR), capture_output=True, text=True, timeout=60)
                     if proc.returncode == 0:
-                        store.mark_chat_delivered(str(msg["message_id"]), peer_id)
+                        self.message_service.mark_delivered(str(msg["message_id"]), peer_id)
                         Clock.schedule_once(lambda _dt, pid=peer_id: self.chat_messages_box.append(f"Delivered to {pid}\n"), 0)
                     else:
                         err = (proc.stderr or proc.stdout or "send_failed")[-500:]
-                        store.mark_chat_failed(str(msg["message_id"]), peer_id, error=err)
+                        self.message_service.mark_failed(str(msg["message_id"]), peer_id, error=err)
                         Clock.schedule_once(lambda _dt, pid=peer_id, e=err: self.chat_messages_box.append(f"Failed {pid}: {e}\n"), 0)
                 except Exception as exc:
-                    store.mark_chat_failed(str(msg["message_id"]), peer_id, error=str(exc))
+                    self.message_service.mark_failed(str(msg["message_id"]), peer_id, error=str(exc))
                     Clock.schedule_once(lambda _dt, pid=peer_id, e=str(exc): self.chat_messages_box.append(f"Failed {pid}: {e}\n"), 0)
             Clock.schedule_once(lambda _dt: self.refresh_chat_view(), 0)
         threading.Thread(target=_run, daemon=True).start()
@@ -2828,7 +3295,7 @@ class RUDPTransferRoot(BoxLayout):
         if not accepted:
             self.sender_log_box.append(f"Contact request rejected: {obj.get('reason') or 'rejected'}\n")
             return
-        if self.chat_store is None:
+        if self.contact_service is None:
             self.sender_log_box.append("Contact accepted, but chat database is not unlocked; contact was not saved locally.\n")
             return
         peer_id = str(obj.get("receiver_peer_id") or pending.get("peer_id") or pending.get("fingerprint") or "").strip()
@@ -2843,20 +3310,19 @@ class RUDPTransferRoot(BoxLayout):
             self.sender_log_box.append("Contact accepted, but peer_id is empty; contact was not saved.\n")
             return
         try:
-            self.chat_store.upsert_contact(
-                peer_id,
-                display_name=nickname or peer_id,
+            self.contact_service.save_accepted_contact(
+                peer_id=peer_id,
                 nickname=nickname or peer_id,
-                remark_name=str(pending.get("remark_name") or ""),
                 fingerprint=fp or peer_id,
                 peer_ip=ip,
                 peer_port=port,
-                trust_state="trusted",
+                remark_name=str(pending.get("remark_name") or ""),
             )
             self.sender_log_box.append(f"Contact saved: {nickname or peer_id} {ip}:{port}\n")
             self.refresh_chat_main()
         except Exception as exc:
             self.sender_log_box.append(f"Failed to save accepted contact: {exc}\n")
+
 
     def request_or_add_selected_device(self) -> None:
         value = str(getattr(self.chat_list_spinner, "text", "") or "")
@@ -2886,7 +3352,7 @@ class RUDPTransferRoot(BoxLayout):
         if is_unspecified_ip(ip):
             self.chat_list_box.append("设备地址无效，不能使用 0.0.0.0；请重新扫描在线设备。\n")
             return
-        if self.chat_store is None:
+        if self.contact_service is None:
             self.chat_list_box.append("请先解锁聊天数据库。\n")
             return
         # Send a real contact request. B side will pop up allow/reject.
@@ -2916,38 +3382,44 @@ class RUDPTransferRoot(BoxLayout):
         self.contact_worker.start(args)
 
     def open_group_popup(self) -> None:
-        if self.chat_store is None:
+        if self.group_service is None:
             self.main_messages_box.append("请先解锁聊天数据库。\n")
             return
         content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
-        gid_input = make_input(text="group1", multiline=False)
-        title_input = make_input(text="LAN Group", multiline=False)
-        content.add_widget(row("群 ID", gid_input, label_width=90))
-        content.add_widget(row("群名", title_input, label_width=90))
-        popup = style_popup(Popup(title="新建群", content=content, size_hint=(0.52, 0.36), auto_dismiss=False))
+        gid_input = make_input(text="group_" + secrets.token_hex(4), multiline=False, size_hint_y=None, height=dp(38))
+        title_input = make_input(text="New Group", multiline=False, size_hint_y=None, height=dp(38))
+        content.add_widget(make_label(text="Group ID", size_hint_y=None, height=dp(24), halign="left"))
+        content.add_widget(gid_input)
+        content.add_widget(make_label(text="Title", size_hint_y=None, height=dp(24), halign="left"))
+        content.add_widget(title_input)
+        popup = style_popup(Popup(title=self.cu("new_group"), content=content, size_hint=(0.65, 0.45), auto_dismiss=False))
         buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
         def _ok(*_):
             try:
-                gid = self.chat_store.create_group(gid_input.text.strip(), title_input.text.strip())
+                gid = gid_input.text.strip()
+                title = title_input.text.strip() or gid
+                self.group_service.create_group(gid, title)
                 self.current_chat_mode = "group"
                 self.current_group_id = gid
-                self.current_chat_title.text = self.cu("group_chat", title=title_input.text.strip() or gid, gid=gid)
-                popup.dismiss()
-                self.refresh_chat_main()
-                self.render_current_chat()
+                self.current_peer_id = ""
+                self.current_chat_title.text = title
             except Exception as exc:
-                self.main_messages_box.append(f"创建群失败: {exc}\n")
-        buttons.add_widget(make_button("success", text="保存", on_release=_ok))
-        buttons.add_widget(make_button("secondary", text="取消", on_release=lambda *_: popup.dismiss()))
+                self.main_messages_box.append(f"group create failed: {exc}\n")
+            popup.dismiss()
+            self.refresh_chat_main()
+            self.render_current_chat()
+        buttons.add_widget(make_button("success", text=self.cu("new_group"), on_release=_ok))
+        buttons.add_widget(make_button("secondary", text="Cancel", on_release=lambda *_: popup.dismiss()))
         content.add_widget(buttons)
         apply_ui_font(content)
         popup.open()
 
+
     def add_selected_contact_to_current_group(self) -> None:
-        if self.chat_store is None or not self.current_group_id:
+        if self.contact_service is None or self.group_service is None or not self.current_group_id:
             self.main_messages_box.append("请先选择群聊。\n")
             return
-        contacts = self.chat_store.list_contacts(trusted_only=True)
+        contacts = self.contact_service.trusted_contacts()
         if not contacts:
             self.main_messages_box.append("没有已允许的联系人。\n")
             return
@@ -2961,14 +3433,7 @@ class RUDPTransferRoot(BoxLayout):
             pid = sp.text.split("|", 1)[0].strip()
             contact = next((c for c in contacts if str(c.get('peer_id')) == pid), None)
             if contact:
-                self.chat_store.add_group_member(
-                    self.current_group_id,
-                    pid,
-                    peer_ip=str(contact.get('peer_ip') or ''),
-                    peer_port=int(contact.get('peer_port') or 9999),
-                    display_name=str(contact.get('remark_name') or contact.get('display_name') or pid),
-                    member_state="active",
-                )
+                self.group_service.add_member_from_contact(self.current_group_id, contact)
             popup.dismiss()
             self.render_current_chat()
         buttons.add_widget(make_button("success", text="加入", on_release=_ok))
@@ -2976,6 +3441,7 @@ class RUDPTransferRoot(BoxLayout):
         content.add_widget(buttons)
         apply_ui_font(content)
         popup.open()
+
 
     def _confirm_action(self, title: str, msg: str, action) -> None:
         content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
@@ -2994,22 +3460,23 @@ class RUDPTransferRoot(BoxLayout):
         popup.open()
 
     def confirm_remove_member(self) -> None:
-        if self.chat_store is None or not self.current_group_id:
+        if self.group_service is None or not self.current_group_id:
             return
-        members = [m for m in self.chat_store.list_group_members(self.current_group_id, include_inactive=False) if str(m.get('peer_id')) != self.chat_local_peer_id]
+        members = [m for m in self.group_service.members(self.current_group_id, include_inactive=False) if str(m.get('peer_id')) != self.chat_local_peer_id]
         if not members:
             self.right_info_box.append("没有可移除的成员。\n")
             return
         # First non-self member for first UI version; details are shown in right panel.
         pid = str(members[0].get('peer_id') or '')
-        self._confirm_action("移除成员", f"确认移除成员 {pid}？", lambda: (self.chat_store.remove_group_member(self.current_group_id, pid, removed=True), self.render_current_chat()))
+        self._confirm_action("移除成员", f"确认移除成员 {pid}？", lambda: (self.group_service.remove_member(self.current_group_id, pid, removed=True), self.render_current_chat()))
+
 
     def confirm_leave_group(self) -> None:
-        if self.chat_store is None or not self.current_group_id:
+        if self.group_service is None or not self.current_group_id:
             return
         gid = self.current_group_id
         def _do():
-            self.chat_store.delete_group_data(gid)
+            self.group_service.delete_group_data(gid)
             self.current_group_id = ""
             self.current_chat_mode = ""
             self.current_chat_title.text = self.cu("choose_chat")
@@ -3017,19 +3484,21 @@ class RUDPTransferRoot(BoxLayout):
             self.render_current_chat()
         self._confirm_action("退出群组", f"确认退出群组 {gid}？\n该群相关成员、消息、回执都会从本机删除。", _do)
 
+
     def confirm_delete_contact(self) -> None:
-        if self.chat_store is None or self.current_chat_mode != "direct" or not self.current_peer_id:
+        if self.contact_service is None or self.current_chat_mode != "direct" or not self.current_peer_id:
             self.right_info_box.append("请先选择要删除的联系人。\n")
             return
         pid = self.current_peer_id
         def _do():
-            self.chat_store.delete_contact(pid, purge_data=True)
+            self.contact_service.delete_contact_local(pid)
             self.current_peer_id = ""
             self.current_chat_mode = ""
             self.current_chat_title.text = self.cu("choose_chat")
             self.refresh_chat_main()
             self.render_current_chat()
         self._confirm_action("删除联系人", f"确认删除联系人 {pid}？\n该联系人、一对一聊天记录和相关回执都会从本机删除。", _do)
+
 
     def _send_chat_to_endpoint(self, *, ip: str, port: int, peer_id: str, text: str, message_id: str, group_id: str = "", conversation_id: str = "", created_at: float = 0.0, body_type: str = "text") -> bool:
         pin_file = str(receiver_pin_file(ip, port))
@@ -3057,35 +3526,125 @@ class RUDPTransferRoot(BoxLayout):
         if combined.strip():
             # Keep the subprocess log available in the debug sender log; this is
             # essential for diagnosing CHAT_ACK and pin/handshake issues.
+            log_text = combined[-4000:] + ("\n" if not combined.endswith("\n") else "")
+            self._append_debug_line(log_text, protocol=True)
             try:
-                self.sender_log_box.append(combined[-4000:] + ("\n" if not combined.endswith("\n") else ""))
+                Clock.schedule_once(lambda _dt, s=log_text: self.sender_log_box.append(s), 0)
             except Exception:
                 pass
         ack_seen = (CHAT_ACK_LOG_PREFIX in combined) or ("CHAT_ACK received" in combined)
         return proc.returncode == 0 or ack_seen
 
+    def retry_outgoing_message(self, message_id: str) -> None:
+        mid = str(message_id or "").strip()
+        if self.message_service is None or not mid:
+            return
+        try:
+            ctx = self.message_service.retry_text_context(mid, current_peer_id=self.current_peer_id)
+            if not ctx:
+                return
+            if ctx.get("error") == "retry_text_only":
+                self.sender_log_box.append(self.cu("retry_text_only") + "\n")
+                return
+            text_body = str(ctx.get("text") or "")
+            group_id = str(ctx.get("group_id") or "")
+            conv_id = str(ctx.get("conversation_id") or "")
+            created_at = float(ctx.get("created_at") or time.time())
+            recipients = [dict(r) for r in (ctx.get("recipients") or [])]
+
+            def _mark_delivered(pid: str) -> None:
+                try:
+                    if self.message_service is not None:
+                        self.message_service.mark_delivered(mid, pid)
+                except Exception as exc:
+                    self._append_debug_line(f"retry mark_delivered failed: {exc}", protocol=True)
+
+            def _mark_failed(pid: str, err: str) -> None:
+                try:
+                    if self.message_service is not None:
+                        self.message_service.mark_failed(mid, pid, error=err)
+                except Exception as exc:
+                    self._append_debug_line(f"retry mark_failed failed: {exc}; original={err}", protocol=True)
+
+            def _run():
+                for r in recipients:
+                    pid = str(r.get("peer_id") or "")
+                    ip = str(r.get("peer_ip") or "")
+                    try:
+                        port = int(r.get("peer_port") or 9999)
+                    except Exception:
+                        port = 9999
+                    if not pid or not ip or is_unspecified_ip(ip):
+                        Clock.schedule_once(lambda _dt, peer=pid: _mark_failed(peer, "invalid_endpoint"), 0)
+                        continue
+                    try:
+                        ok = self._send_chat_to_endpoint(ip=ip, port=port, peer_id=pid, text=text_body, message_id=mid, group_id=group_id, conversation_id=conv_id, created_at=created_at, body_type="text")
+                    except Exception as exc:
+                        ok = False
+                        self._append_debug_line(f"retry _send_chat_to_endpoint exception: {exc}", protocol=True)
+                    if ok:
+                        Clock.schedule_once(lambda _dt, peer=pid: (_mark_delivered(peer), self._force_chat_refresh()), 0)
+                    else:
+                        Clock.schedule_once(lambda _dt, peer=pid: (_mark_failed(peer, "retry_failed"), self._force_chat_refresh()), 0)
+                Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+            threading.Thread(target=_run, daemon=True).start()
+        except Exception as exc:
+            try:
+                self.sender_log_box.append(f"retry failed: {exc}\n")
+            except Exception:
+                pass
+
+
     def send_current_chat_message(self) -> None:
-        store = self.chat_store
-        if store is None:
+        if self.message_service is None:
             self.main_messages_box.append("请先解锁聊天数据库。\n")
             return
         text = self.main_message_input.text.strip()
         if not text:
             return
         self.main_message_input.text = ""
-        if self.current_chat_mode == "direct" and self.current_peer_id:
-            msg, contact = store.send_direct_message(self.current_peer_id, text)
-            recipients = [contact]
-            group_id = ""
-            conversation_id = str(msg.get('conversation_id') or '')
-        elif self.current_chat_mode == "group" and self.current_group_id:
-            msg, recipients = store.send_group_message(self.current_group_id, text)
-            group_id = self.current_group_id
-            conversation_id = ""
-        else:
-            self.main_messages_box.append("请先选择联系人或群聊。\n")
+        try:
+            if self.current_chat_mode == "direct" and self.current_peer_id:
+                msg, contact = self.message_service.create_direct_text(self.current_peer_id, text)
+                recipients = [contact]
+                group_id = ""
+                conversation_id = str(msg.get('conversation_id') or '')
+            elif self.current_chat_mode == "group" and self.current_group_id:
+                msg, recipients = self.message_service.create_group_text(self.current_group_id, text)
+                group_id = self.current_group_id
+                conversation_id = ""
+            else:
+                self.main_messages_box.append("请先选择联系人或群聊。\n")
+                return
+        except Exception as exc:
+            self.main_messages_box.append(f"消息创建失败: {exc}\n")
             return
+
+        mid = str(msg.get("message_id") or "")
+        created_at = float(msg.get("created_at") or time.time())
         self.render_current_chat()
+
+        def _mark_sent(pid: str) -> None:
+            try:
+                if self.message_service is not None:
+                    self.message_service.mark_sent(mid, pid)
+            except Exception as exc:
+                self._append_debug_line(f"mark_sent failed: {exc}", protocol=True)
+
+        def _mark_delivered(pid: str) -> None:
+            try:
+                if self.message_service is not None:
+                    self.message_service.mark_delivered(mid, pid)
+            except Exception as exc:
+                self._append_debug_line(f"mark_delivered failed: {exc}", protocol=True)
+
+        def _mark_failed(pid: str, err: str) -> None:
+            try:
+                if self.message_service is not None:
+                    self.message_service.mark_failed(mid, pid, error=err)
+            except Exception as exc:
+                self._append_debug_line(f"mark_failed failed: {exc}; original={err}", protocol=True)
+
         def _run():
             for r in recipients:
                 peer_id = str(r.get('peer_id') or '')
@@ -3095,26 +3654,43 @@ class RUDPTransferRoot(BoxLayout):
                 except Exception:
                     port = 9999
                 if not peer_id or not ip or is_unspecified_ip(ip):
-                    store.mark_chat_failed(str(msg['message_id']), peer_id, error="invalid_endpoint")
+                    Clock.schedule_once(lambda _dt, pid=peer_id: _mark_failed(pid, "invalid_endpoint"), 0)
                     continue
+
+                # Important: SQLite/Kivy operations must stay on the UI thread.
+                # The background thread only performs the blocking subprocess send.
+                Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_sent(pid), self._force_chat_refresh()), 0)
                 try:
-                    store.mark_chat_sent(str(msg['message_id']), peer_id)
-                    Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
-                    ok = self._send_chat_to_endpoint(ip=ip, port=port, peer_id=peer_id, text=text, message_id=str(msg['message_id']), group_id=group_id, conversation_id=conversation_id, created_at=float(msg['created_at']), body_type="text")
-                    if ok:
-                        store.mark_chat_delivered(str(msg['message_id']), peer_id)
-                    else:
-                        store.mark_chat_failed(str(msg['message_id']), peer_id, error="send_failed")
+                    ok = self._send_chat_to_endpoint(
+                        ip=ip,
+                        port=port,
+                        peer_id=peer_id,
+                        text=text,
+                        message_id=mid,
+                        group_id=group_id,
+                        conversation_id=conversation_id,
+                        created_at=created_at,
+                        body_type="text",
+                    )
                 except Exception as exc:
-                    store.mark_chat_failed(str(msg['message_id']), peer_id, error=str(exc))
+                    ok = False
+                    self._append_debug_line(f"_send_chat_to_endpoint exception: {exc}", protocol=True)
+                if ok:
+                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_delivered(pid), self._force_chat_refresh()), 0)
+                else:
+                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_failed(pid, "send_failed"), self._force_chat_refresh()), 0)
             Clock.schedule_once(lambda _dt: self.render_current_chat(), 0)
         threading.Thread(target=_run, daemon=True).start()
+
 
     def _run_file_sender_with_progress(self, *, args: List[str], message_id: str, peer_id: str, total_size: int = 0) -> bool:
         cmd = ([sys.executable] + args) if FROZEN else ([sys.executable, str(Path(__file__).resolve())] + args)
         mid = str(message_id or "")
         if mid:
             self.file_message_progress[mid] = {"sent": 0, "total": int(total_size or 0), "pct": 0.0, "state": self.cu("sending_to", peer=peer_id)}
+            if self.file_transfer_service is not None:
+                self.file_transfer_service.update_progress(chat_message_id=mid, direction="outgoing", peer_id=peer_id, transferred_bytes=0, total_bytes=int(total_size or 0), pct=0.0, status="transferring")
+
             Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
         try:
             proc = subprocess.Popen(cmd, cwd=str(APP_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
@@ -3130,11 +3706,17 @@ class RUDPTransferRoot(BoxLayout):
                     total = int(m.group("total") or total_size or 0)
                     pct = float(m.group("pct") or ((sent * 100.0 / total) if total else 0.0))
                     self.file_message_progress[mid] = {"sent": sent, "total": total, "pct": pct, "avg": float(m.group("avg") or 0.0), "eta": m.group("eta") or "", "state": self.cu("sending_to", peer=peer_id)}
+                    if self.file_transfer_service is not None:
+                        self.file_transfer_service.update_progress(chat_message_id=mid, direction="outgoing", peer_id=peer_id, transferred_bytes=sent, total_bytes=total, pct=pct, avg_mbps=float(m.group("avg") or 0.0), eta=m.group("eta") or "", status="transferring")
+
                     Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
             rc = proc.wait(timeout=5)
             if mid:
                 final_total = int(total_size or self.file_message_progress.get(mid, {}).get("total") or 0)
                 self.file_message_progress[mid] = {"sent": final_total, "total": final_total, "pct": 100.0 if rc == 0 else float(self.file_message_progress.get(mid, {}).get("pct") or 0.0), "avg": self.file_message_progress.get(mid, {}).get("avg", 0.0), "eta": "0:00" if rc == 0 else self.file_message_progress.get(mid, {}).get("eta", ""), "state": self.cu("completed") if rc == 0 else self.cu("failed")}
+                if self.file_transfer_service is not None:
+                    self.file_transfer_service.update_progress(chat_message_id=mid, direction="outgoing", peer_id=peer_id, transferred_bytes=final_total if rc == 0 else int(self.file_message_progress.get(mid, {}).get("sent") or 0), total_bytes=final_total, pct=100.0 if rc == 0 else float(self.file_message_progress.get(mid, {}).get("pct") or 0.0), avg_mbps=float(self.file_message_progress.get(mid, {}).get("avg") or 0.0), eta="0:00" if rc == 0 else str(self.file_message_progress.get(mid, {}).get("eta") or ""), status="completed" if rc == 0 else "failed", error="" if rc == 0 else "file_send_failed")
+
                 Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
             return int(rc or 0) == 0
         except Exception as exc:
@@ -3154,19 +3736,21 @@ class RUDPTransferRoot(BoxLayout):
     def _send_file_path_to_current_chat(self, path: str) -> None:
         if not path or not os.path.isfile(path):
             return
-        store = self.chat_store
+        if self.message_service is None:
+            self.main_messages_box.append("请先解锁聊天数据库。\n")
+            return
         recipients = []
         msg = None
-        if self.current_chat_mode == "direct" and self.current_peer_id and store is not None:
+        if self.current_chat_mode == "direct" and self.current_peer_id:
             try:
-                msg, contact = store.send_direct_file_message(self.current_peer_id, path)
+                msg, contact = self.message_service.create_direct_file(self.current_peer_id, path)
                 recipients = [contact]
             except Exception as exc:
                 self.main_messages_box.append(f"文件消息创建失败: {exc}\n")
                 return
-        elif self.current_chat_mode == "group" and self.current_group_id and store is not None:
+        elif self.current_chat_mode == "group" and self.current_group_id:
             try:
-                msg, recipients = store.send_group_file_message(self.current_group_id, path)
+                msg, recipients = self.message_service.create_group_file(self.current_group_id, path)
             except Exception as exc:
                 self.main_messages_box.append(f"文件消息创建失败: {exc}\n")
                 return
@@ -3174,12 +3758,79 @@ class RUDPTransferRoot(BoxLayout):
             self.main_messages_box.append("没有可发送文件的接收对象。\n")
             return
         self.render_current_chat()
-        chat_message_id = str(msg.get('message_id') if msg else '')
+        self._start_file_transfer_for_message(msg=msg, recipients=recipients, path=path)
+
+
+    def _start_file_transfer_for_message(self, *, msg: Dict[str, object], recipients: List[Dict[str, object]], path: str) -> None:
+        if self.message_service is None or not msg:
+            return
+        if not path or not os.path.isfile(path):
+            try:
+                self.sender_log_box.append(self.cu("retry_file_missing") + "\n")
+            except Exception:
+                pass
+            return
+        chat_message_id = str(msg.get('message_id') or '')
         chat_conversation_id = str(msg.get('conversation_id') or '')
-        chat_group_id = str(self.current_group_id if self.current_chat_mode == 'group' else '')
-        chat_sender_peer_id = str(self.chat_local_peer_id or '')
+        chat_group_id = str(msg.get('group_id') or (self.current_group_id if self.current_chat_mode == 'group' else ''))
+        chat_sender_peer_id = str(msg.get('sender_peer_id') or self.chat_local_peer_id or '')
+        created_at = float(msg.get('created_at') or time.time())
+        file_total = os.path.getsize(path) if os.path.exists(path) else 0
+
+        if self.file_transfer_service is not None:
+            self.file_transfer_service.remember_runtime_task(
+                self.file_message_tasks,
+                chat_message_id=chat_message_id,
+                path=path,
+                recipients=[dict(r) for r in recipients],
+                conversation_id=chat_conversation_id,
+                group_id=chat_group_id,
+                sender_peer_id=chat_sender_peer_id,
+                created_at=created_at,
+                total_bytes=file_total,
+            )
+            self.file_transfer_service.create_outgoing_tasks(
+                chat_message_id=chat_message_id,
+                recipients=recipients,
+                path=path,
+                total_bytes=file_total,
+                conversation_id=chat_conversation_id,
+                group_id=chat_group_id,
+            )
+        else:
+            self.file_message_tasks[chat_message_id] = {
+                "message_id": chat_message_id,
+                "path": path,
+                "recipients": [dict(r) for r in recipients],
+                "conversation_id": chat_conversation_id,
+                "group_id": chat_group_id,
+                "sender_peer_id": chat_sender_peer_id,
+                "created_at": created_at,
+                "total": file_total,
+            }
+
+        def _mark_sent(pid: str) -> None:
+            try:
+                if self.message_service is not None:
+                    self.message_service.mark_sent(chat_message_id, pid)
+            except Exception as exc:
+                self._append_debug_line(f"file mark_sent failed: {exc}", protocol=True)
+
+        def _mark_delivered(pid: str) -> None:
+            try:
+                if self.message_service is not None:
+                    self.message_service.mark_delivered(chat_message_id, pid)
+            except Exception as exc:
+                self._append_debug_line(f"file mark_delivered failed: {exc}", protocol=True)
+
+        def _mark_failed(pid: str, err: str) -> None:
+            try:
+                if self.message_service is not None:
+                    self.message_service.mark_failed(chat_message_id, pid, error=err)
+            except Exception as exc:
+                self._append_debug_line(f"file mark_failed failed: {exc}; original={err}", protocol=True)
+
         def _run():
-            file_total = os.path.getsize(path) if os.path.exists(path) else 0
             file_meta_text = json.dumps({"kind": "file", "name": os.path.basename(path), "size": file_total, "chat_message_id": chat_message_id}, ensure_ascii=False, separators=(",", ":"))
             for r in recipients:
                 peer_id = str(r.get('peer_id') or '')
@@ -3189,23 +3840,22 @@ class RUDPTransferRoot(BoxLayout):
                 except Exception:
                     port = 9999
                 if not ip or is_unspecified_ip(ip):
-                    if msg and store is not None:
-                        store.mark_chat_failed(str(msg.get('message_id')), peer_id, error='invalid_endpoint')
+                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_failed(pid, 'invalid_endpoint'), self._force_chat_refresh()), 0)
+                    if self.file_transfer_service is not None:
+                        self.file_transfer_service.mark_failed(chat_message_id, peer_id=peer_id, direction='outgoing', error='invalid_endpoint')
                     continue
                 try:
-                    if msg and store is not None:
-                        store.mark_chat_sent(str(msg.get('message_id')), peer_id)
-                        Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_sent(pid), self._force_chat_refresh()), 0)
                     self._send_chat_to_endpoint(
                         ip=ip, port=port, peer_id=peer_id, text=file_meta_text,
                         message_id=chat_message_id,
                         group_id=chat_group_id,
                         conversation_id=chat_conversation_id,
-                        created_at=float(msg.get('created_at') or time.time()),
+                        created_at=created_at,
                         body_type='file',
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._append_debug_line(f"file chat metadata send failed: {exc}", protocol=True)
                 pin_file = str(receiver_pin_file(ip, port))
                 args = [
                     "--worker", "sender",
@@ -3220,14 +3870,48 @@ class RUDPTransferRoot(BoxLayout):
                     "--chat-sender-peer-id", chat_sender_peer_id,
                     "--chat-receiver-peer-id", peer_id,
                 ]
-                ok = self._run_file_sender_with_progress(args=args, message_id=str(msg.get('message_id') if msg else ''), peer_id=peer_id, total_size=file_total)
-                if msg and store is not None:
-                    if ok:
-                        store.mark_chat_delivered(str(msg.get('message_id')), peer_id)
-                    else:
-                        store.mark_chat_failed(str(msg.get('message_id')), peer_id, error='file_send_failed')
+                ok = self._run_file_sender_with_progress(args=args, message_id=chat_message_id, peer_id=peer_id, total_size=file_total)
+                if ok:
+                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_delivered(pid), self._force_chat_refresh()), 0)
+                else:
+                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_failed(pid, 'file_send_failed'), self._force_chat_refresh()), 0)
+                    if self.file_transfer_service is not None:
+                        self.file_transfer_service.mark_failed(chat_message_id, peer_id=peer_id, direction='outgoing', error='file_send_failed')
             Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
         threading.Thread(target=_run, daemon=True).start()
+
+
+    def retry_file_message(self, message_id: str) -> None:
+        mid = str(message_id or "")
+        if not mid or self.file_transfer_service is None:
+            return
+        try:
+            ctx = self.file_transfer_service.retry_context_from_message(mid, self.file_message_tasks, local_peer_id=self.chat_local_peer_id)
+            if not ctx:
+                return
+            path = str(ctx.get("path") or "")
+            recipients = [dict(r) for r in (ctx.get("recipients") or [])]
+            if not path or not os.path.isfile(path):
+                self.sender_log_box.append(self.cu("retry_file_missing") + "\n")
+                return
+            if not recipients:
+                self.sender_log_box.append("no file recipient\n")
+                return
+            msg = {
+                "message_id": mid,
+                "conversation_id": str(ctx.get("conversation_id") or ""),
+                "group_id": str(ctx.get("group_id") or ""),
+                "sender_peer_id": str(ctx.get("sender_peer_id") or self.chat_local_peer_id or ""),
+                "created_at": float(ctx.get("created_at") or time.time()),
+                "body_type": "file",
+            }
+            self._start_file_transfer_for_message(msg=msg, recipients=recipients, path=path)
+        except Exception as exc:
+            try:
+                self.sender_log_box.append(f"file retry failed: {exc}\n")
+            except Exception:
+                pass
+
 
     def start_sender(self) -> None:
         rec = getattr(self, "selected_receiver", None)
@@ -3418,6 +4102,11 @@ class RUDPTransferRoot(BoxLayout):
         return False
 
     def sender_log(self, text: str) -> None:
+        self._append_debug_line(text, protocol=any(marker in str(text or "") for marker in (
+            CHAT_MESSAGE_LOG_PREFIX, CHAT_ACK_LOG_PREFIX, CHAT_READ_LOG_PREFIX,
+            CONTACT_REQUEST_LOG_PREFIX, CONTACT_RESPONSE_LOG_PREFIX, TRANSFER_REQUEST_LOG_PREFIX,
+            USER_ERROR_LOG_PREFIX, USER_STATUS_LOG_PREFIX,
+        )))
         self.sender_log_box.append(text)
         self._try_parse_user_event(text, "sender")
         if CONTACT_RESPONSE_LOG_PREFIX in text:
@@ -3492,9 +4181,15 @@ class RUDPTransferRoot(BoxLayout):
                 target.write_text(json.dumps({"accepted": accepted}, ensure_ascii=False), encoding="utf-8")
             except Exception as exc:
                 self.receiver_log_box.append(f"Failed to write contact decision: {exc}\n")
-            if accepted and self.chat_store is not None and pid:
+            if accepted and self.contact_service is not None and pid:
                 try:
-                    self.chat_store.upsert_contact(pid, display_name=name, nickname=name, fingerprint=fp, peer_ip=ip, peer_port=port, trust_state="trusted")
+                    self.contact_service.save_accepted_contact(
+                        peer_id=pid,
+                        nickname=name,
+                        fingerprint=fp,
+                        peer_ip=ip,
+                        peer_port=port,
+                    )
                     self.refresh_chat_main()
                 except Exception as exc:
                     self.receiver_log_box.append(f"Failed to save contact: {exc}\n")
@@ -3505,7 +4200,387 @@ class RUDPTransferRoot(BoxLayout):
         apply_ui_font(content)
         popup.open()
 
+    def _peer_ip_from_log_obj(self, obj: Dict[str, object]) -> str:
+        peer_text = str(obj.get("peer") or obj.get("sender") or "")
+        ip = str(obj.get("sender_ip") or "").strip()
+        if not ip and peer_text:
+            ip = peer_text.split(":", 1)[0].strip()
+        return ip
+
+    def _incoming_matches_current_direct(self, obj: Dict[str, object]) -> bool:
+        if self.current_chat_mode != "direct" or not self.current_peer_id:
+            return False
+        if str(obj.get("group_id") or obj.get("chat_group_id") or ""):
+            return False
+
+        incoming_ip = self._peer_ip_from_log_obj(obj)
+        current_ip, _port = self._endpoint_for_peer(self.current_peer_id)
+
+        # If the sender peer_id matches the current chat, this is a direct match.
+        sender = str(obj.get("sender_peer_id") or obj.get("chat_sender_peer_id") or "")
+        if sender and sender == self.current_peer_id:
+            return True
+
+        # If the incoming IP maps to a known contact, only attach it to that contact.
+        # This avoids stealing messages from another peer while still tolerating
+        # nickname/fingerprint/peer_id migrations for the current contact.
+        if incoming_ip and self.contact_service is not None:
+            try:
+                for c in self.contact_service.list_contacts(trusted_only=False):
+                    contact_ip = str(c.get("peer_ip") or "").strip()
+                    contact_pid = str(c.get("peer_id") or "").strip()
+                    if contact_ip and contact_ip == incoming_ip:
+                        return contact_pid == self.current_peer_id
+            except Exception:
+                pass
+
+        # If the current contact has the same IP, treat it as the current chat even
+        # when the transmitted peer_id differs from the locally stored peer_id.
+        if incoming_ip and current_ip and incoming_ip == current_ip:
+            return True
+
+        # Recovery fallback: if a direct chat is actively open and the incoming log
+        # cannot be mapped to any other known contact, bind it to the visible chat.
+        # This keeps the receiver UI usable when old databases saved peer_id as a
+        # nickname but new messages use a stable peer_* identity.
+        if incoming_ip:
+            return True
+        if sender:
+            try:
+                if self.contact_service is not None and self.contact_service.find_contact(sender):
+                    return False
+            except Exception:
+                pass
+        return True
+
+
+    def _normalize_incoming_chat_for_visible_context(self, obj: Dict[str, object]) -> Dict[str, object]:
+        fixed = dict(obj or {})
+        if self._incoming_matches_current_direct(fixed):
+            fixed["sender_peer_id"] = self.current_peer_id
+            fixed["receiver_peer_id"] = self.chat_local_peer_id
+            if self.message_service is not None:
+                fixed["conversation_id"] = self.message_service.create_direct_conversation(self.current_peer_id)
+        return fixed
+
+    def _normalize_transfer_request_for_visible_context(self, req: Dict[str, object]) -> Dict[str, object]:
+        fixed = dict(req or {})
+        if self.current_chat_mode == "direct" and self.current_peer_id and not str(fixed.get("chat_group_id") or ""):
+            incoming_ip = str(fixed.get("sender_ip") or "").strip()
+            current_ip, _port = self._endpoint_for_peer(self.current_peer_id)
+            if (incoming_ip and current_ip and incoming_ip == current_ip) or not str(fixed.get("chat_sender_peer_id") or ""):
+                fixed["chat_sender_peer_id"] = self.current_peer_id
+                fixed["chat_receiver_peer_id"] = self.chat_local_peer_id
+                if self.message_service is not None:
+                    fixed["chat_conversation_id"] = self.message_service.create_direct_conversation(self.current_peer_id)
+        return fixed
+
+    def _file_path_from_transfer_store(self, message_id: str) -> str:
+        if self.file_transfer_service is None:
+            return ""
+        try:
+            row = self.file_transfer_service.progress_for_message(str(message_id or "")) or {}
+            for key in ("local_path", "remote_path"):
+                value = str(row.get(key) or "")
+                if value:
+                    return value
+        except Exception:
+            pass
+        return ""
+
+    def _schedule_force_chat_refresh(self, *delays: float) -> None:
+        if not delays:
+            delays = (0.0,)
+        for delay in delays:
+            try:
+                Clock.schedule_once(lambda _dt: self._force_chat_refresh(), max(0.0, float(delay or 0.0)))
+            except Exception:
+                pass
+
+    def _handle_incoming_chat_read_ui(self, obj: Dict[str, object]) -> None:
+        try:
+            if self.message_service is not None:
+                self.message_service.mark_read(str(obj.get("message_id") or ""), str(obj.get("reader_peer_id") or ""))
+                self._schedule_force_chat_refresh(0.0, 0.2)
+        except Exception as exc:
+            try:
+                self.receiver_log_box.append(f"Failed to apply CHAT_READ in UI DB: {exc}\n")
+            except Exception:
+                pass
+
+    def _handle_incoming_chat_message_ui(self, obj: Dict[str, object]) -> None:
+        """Handle a CHAT_MESSAGE log on the Kivy/UI thread.
+
+        The receiver worker reads stdout on a background thread. SQLite objects in
+        chat_db.py are created on the UI thread, so writing incoming messages from
+        the reader thread can fail silently or be swallowed by the old broad
+        exception handler.  All chat DB writes must be performed here on the main
+        Kivy thread.
+        """
+        try:
+            obj = self._normalize_incoming_chat_for_visible_context(dict(obj or {}))
+            self._mark_chat_json_seen(obj)
+            # Cache first so the currently opened chat can display the message
+            # even if SQLite saving fails or an old DB has inconsistent peer IDs.
+            self._cache_live_incoming_message(obj)
+            if self.message_service is not None:
+                try:
+                    self.message_service.save_incoming_message(obj, local_peer_id=self.chat_local_peer_id)
+                except Exception as exc:
+                    try:
+                        self.receiver_log_box.append(f"Failed to save incoming chat message in UI DB: {exc}\n")
+                        self._append_debug_line(f"Failed to save incoming chat message in UI DB: {exc}", protocol=True)
+                    except Exception:
+                        pass
+            try:
+                self.chat_messages_box.append(f"Incoming {obj.get('group_id')}: {obj.get('sender_peer_id')}: {obj.get('text')}\n")
+            except Exception:
+                pass
+            if str(obj.get("body_type") or "") == "file":
+                mid = str(obj.get("message_id") or "")
+                total = 0
+                body_name = ""
+                try:
+                    body = json.loads(str(obj.get("text") or ""))
+                    total = int(body.get("size") or 0)
+                    body_name = str(body.get("name") or "")
+                except Exception:
+                    pass
+                if mid:
+                    self.current_receiving_file_message_id = mid
+                    self.file_message_progress[mid] = {"sent": 0, "total": total, "pct": 0.0, "avg": 0.0, "eta": "", "state": self.cu("waiting_receive")}
+                    if self.file_transfer_service is not None:
+                        try:
+                            self.file_transfer_service.upsert_incoming_task(
+                                chat_message_id=mid,
+                                peer_id=str(obj.get("sender_peer_id") or ""),
+                                conversation_id=str(obj.get("conversation_id") or ""),
+                                group_id=str(obj.get("group_id") or ""),
+                                file_name=body_name,
+                                total_bytes=total,
+                                status="queued",
+                            )
+                        except Exception:
+                            pass
+            self._schedule_force_chat_refresh(0.0, 0.15, 0.5)
+        except Exception as exc:
+            try:
+                self.receiver_log_box.append(f"CHAT_MESSAGE UI handler failed: {exc}\n")
+            except Exception:
+                pass
+
+    def _handle_receiver_saved_file_ui(self, conn: int, saved_path: str) -> None:
+        try:
+            saved_path = str(saved_path or "").strip()
+            if not saved_path:
+                return
+            mid = str(self.receiving_file_message_by_conn.get(int(conn or 0)) or self.current_receiving_file_message_id or "")
+            if mid and self.message_service is not None:
+                self.message_service.bind_file_path(mid, saved_path)
+            elif self.message_service is not None:
+                mid = self.message_service.bind_latest_incoming_file_path(file_name=os.path.basename(saved_path), saved_path=saved_path)
+            if mid:
+                total = os.path.getsize(saved_path) if os.path.exists(saved_path) else int(self.file_message_progress.get(mid, {}).get("total") or 0)
+                self.file_message_progress[mid] = {"sent": total, "total": total, "pct": 100.0, "avg": self.file_message_progress.get(mid, {}).get("avg", 0.0), "eta": "0:00", "state": self.cu("received")}
+                if self.file_transfer_service is not None:
+                    self.file_transfer_service.bind_saved_path(mid, saved_path)
+            self.receiving_file_message_by_conn.pop(int(conn or 0), None)
+            if self.current_receiving_file_message_id == mid:
+                self.current_receiving_file_message_id = ""
+            # Rebuild immediately and again after delayed DB/log updates so the
+            # visible circular widget does not remain at the last progress tick.
+            self._force_chat_refresh()
+            self._schedule_force_chat_refresh(0.15, 0.5, 1.2, 2.0)
+        except Exception as exc:
+            try:
+                self.receiver_log_box.append(f"saved-file UI handler failed: {exc}\n")
+            except Exception:
+                pass
+
+    def _handle_receiver_complete_ui(self) -> None:
+        try:
+            mids = set()
+            if self.current_receiving_file_message_id:
+                mids.add(str(self.current_receiving_file_message_id))
+            for _conn, _mid in list(self.receiving_file_message_by_conn.items()):
+                if _mid:
+                    mids.add(str(_mid))
+            for mid in mids:
+                saved_path = self._file_path_from_transfer_store(mid)
+                if saved_path and self.message_service is not None:
+                    self.message_service.bind_file_path(mid, saved_path)
+                total = 0
+                try:
+                    total = os.path.getsize(saved_path) if saved_path and os.path.exists(saved_path) else int(self.file_message_progress.get(mid, {}).get("total") or 0)
+                except Exception:
+                    total = int(self.file_message_progress.get(mid, {}).get("total") or 0)
+                if total:
+                    self.file_message_progress[mid] = {
+                        "sent": total,
+                        "total": total,
+                        "pct": 100.0,
+                        "avg": self.file_message_progress.get(mid, {}).get("avg", 0.0),
+                        "eta": "0:00",
+                        "state": self.cu("received"),
+                    }
+                    if self.file_transfer_service is not None:
+                        self.file_transfer_service.update_progress(
+                            chat_message_id=mid,
+                            direction="incoming",
+                            transferred_bytes=total,
+                            total_bytes=total,
+                            pct=100.0,
+                            eta="0:00",
+                            status="received",
+                        )
+            self.receiving_file_message_by_conn.clear()
+            self.current_receiving_file_message_id = ""
+            self._force_chat_refresh()
+            self._schedule_force_chat_refresh(0.15, 0.5, 1.2, 2.0)
+        except Exception as exc:
+            try:
+                self.receiver_log_box.append(f"complete UI handler failed: {exc}\n")
+            except Exception:
+                pass
+
+    def _handle_transfer_request_ui(self, req: Dict[str, object]) -> None:
+        try:
+            req = self._normalize_transfer_request_for_visible_context(dict(req or {}))
+            conn = int(req.get("conn_id") or 0)
+            mid = str(req.get("chat_message_id") or "")
+            total = int(req.get("size") or 0)
+            if mid and self.message_service is not None:
+                try:
+                    self.message_service.ensure_incoming_file_placeholder_from_transfer_request(req, local_peer_id=self.chat_local_peer_id)
+                except Exception as exc:
+                    try:
+                        self.receiver_log_box.append(f"Failed to create incoming file card: {exc}\n")
+                    except Exception:
+                        pass
+            if conn > 0 and mid:
+                self.receiving_file_message_by_conn[conn] = mid
+                self.current_receiving_file_message_id = mid
+                self.file_message_progress[mid] = {
+                    "sent": 0,
+                    "total": total,
+                    "pct": 0.0,
+                    "avg": 0.0,
+                    "eta": "",
+                    "state": self.cu("waiting_receive"),
+                }
+                if self.file_transfer_service is not None:
+                    self.file_transfer_service.upsert_incoming_task(
+                        chat_message_id=mid,
+                        file_name=str(req.get("name") or ""),
+                        local_path=str(req.get("save_path") or ""),
+                        remote_path=str(req.get("save_path") or ""),
+                        total_bytes=total,
+                        status="accepted",
+                    )
+                self._schedule_force_chat_refresh(0.0, 0.15)
+            self.show_transfer_request(req)
+        except Exception as exc:
+            try:
+                self.receiver_log_box.append(f"transfer request UI handler failed: {exc}\n")
+            except Exception:
+                pass
+
+    def _append_debug_line(self, line: str, *, protocol: bool = False) -> None:
+        try:
+            s = str(line or "").rstrip("\n")
+            if not s:
+                return
+            self.debug_runtime_lines.append(s)
+            if len(self.debug_runtime_lines) > 600:
+                self.debug_runtime_lines = self.debug_runtime_lines[-600:]
+            if protocol or any(marker in s for marker in (
+                CHAT_MESSAGE_LOG_PREFIX,
+                CHAT_ACK_LOG_PREFIX,
+                CHAT_READ_LOG_PREFIX,
+                CONTACT_REQUEST_LOG_PREFIX,
+                CONTACT_RESPONSE_LOG_PREFIX,
+                TRANSFER_REQUEST_LOG_PREFIX,
+                USER_ERROR_LOG_PREFIX,
+                USER_STATUS_LOG_PREFIX,
+            )):
+                self.debug_protocol_lines.append(s)
+                if len(self.debug_protocol_lines) > 600:
+                    self.debug_protocol_lines = self.debug_protocol_lines[-600:]
+        except Exception:
+            pass
+
+    def _live_cache_key_for_message(self, obj: Dict[str, object]) -> str:
+        group_id = str(obj.get("group_id") or "")
+        if group_id:
+            return "group:" + group_id
+        sender = str(obj.get("sender_peer_id") or "")
+        if self.current_chat_mode == "direct" and self.current_peer_id:
+            sender = self.current_peer_id
+        return "direct:" + sender
+
+    def _cache_live_incoming_message(self, obj: Dict[str, object]) -> None:
+        try:
+            mid = str(obj.get("message_id") or "")
+            if not mid:
+                return
+            key = self._live_cache_key_for_message(obj)
+            arr = self.live_message_cache.setdefault(key, [])
+            if not any(str(m.get("message_id") or "") == mid for m in arr):
+                arr.append(dict(obj))
+            if len(arr) > 100:
+                self.live_message_cache[key] = arr[-100:]
+        except Exception:
+            pass
+
+    def _mark_chat_json_seen(self, obj: Dict[str, object]) -> None:
+        try:
+            sender = str(obj.get("sender_peer_id") or obj.get("chat_sender_peer_id") or "").strip()
+            body = str(obj.get("text") or "").strip()
+            if not sender or not body:
+                return
+            now = time.time()
+            self._recent_chat_json_seen[(sender, body)] = now
+            # Keep the cache small and recent.
+            for k, ts in list(self._recent_chat_json_seen.items()):
+                if now - float(ts or 0.0) > 8.0:
+                    self._recent_chat_json_seen.pop(k, None)
+        except Exception:
+            pass
+
+    def _was_chat_json_recently_seen(self, sender: str, body: str) -> bool:
+        try:
+            sender = str(sender or "").strip()
+            body = str(body or "").strip()
+            if not sender or not body:
+                return False
+            ts = float(self._recent_chat_json_seen.get((sender, body)) or 0.0)
+            return bool(ts and (time.time() - ts) <= 8.0)
+        except Exception:
+            return False
+
+    def _live_messages_for_current_chat(self, seen_ids: set) -> List[Dict[str, object]]:
+        try:
+            if self.current_chat_mode == "group" and self.current_group_id:
+                key = "group:" + self.current_group_id
+            elif self.current_chat_mode == "direct" and self.current_peer_id:
+                key = "direct:" + self.current_peer_id
+            else:
+                return []
+            result = []
+            for m in self.live_message_cache.get(key, []) or []:
+                mid = str(m.get("message_id") or "")
+                if mid and mid not in seen_ids:
+                    result.append(dict(m))
+            return result
+        except Exception:
+            return []
+
     def receiver_log(self, text: str) -> None:
+        self._append_debug_line(text, protocol=any(marker in str(text or "") for marker in (
+            CHAT_MESSAGE_LOG_PREFIX, CHAT_ACK_LOG_PREFIX, CHAT_READ_LOG_PREFIX,
+            CONTACT_REQUEST_LOG_PREFIX, CONTACT_RESPONSE_LOG_PREFIX, TRANSFER_REQUEST_LOG_PREFIX,
+            USER_ERROR_LOG_PREFIX, USER_STATUS_LOG_PREFIX,
+        )))
         self.receiver_log_box.append(text)
         self._try_parse_user_event(text, "receiver")
         if CONTACT_REQUEST_LOG_PREFIX in text:
@@ -3521,30 +4596,23 @@ class RUDPTransferRoot(BoxLayout):
             try:
                 payload = text.split(CHAT_READ_LOG_PREFIX, 1)[1].strip()
                 obj = json.loads(payload)
-                if self.chat_store is not None:
-                    self.chat_store.mark_chat_read(str(obj.get("message_id") or ""), str(obj.get("reader_peer_id") or ""))
-                    Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+                Clock.schedule_once(lambda _dt, data=obj: self._handle_incoming_chat_read_ui(data), 0)
             except Exception:
                 pass
         if CHAT_MESSAGE_LOG_PREFIX in text:
             try:
                 payload = text.split(CHAT_MESSAGE_LOG_PREFIX, 1)[1].strip()
                 obj = json.loads(payload)
-                self.chat_messages_box.append(f"Incoming {obj.get('group_id')}: {obj.get('sender_peer_id')}: {obj.get('text')}\n")
-                if str(obj.get("body_type") or "") == "file":
-                    mid = str(obj.get("message_id") or "")
-                    total = 0
-                    try:
-                        body = json.loads(str(obj.get("text") or ""))
-                        total = int(body.get("size") or 0)
-                    except Exception:
-                        pass
-                    if mid:
-                        self.current_receiving_file_message_id = mid
-                        self.file_message_progress[mid] = {"sent": 0, "total": total, "pct": 0.0, "avg": 0.0, "eta": "", "state": self.cu("waiting_receive")}
-                Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
-            except Exception:
-                pass
+                Clock.schedule_once(lambda _dt, data=obj: self._handle_incoming_chat_message_ui(data), 0)
+            except Exception as exc:
+                try:
+                    self.receiver_log_box.append(f"Failed to parse CHAT_MESSAGE_JSON: {exc}\n")
+                except Exception:
+                    pass
+        # Do not parse "Chat from ..." as a message. That line is a human-readable
+        # server log emitted after CHAT_MESSAGE_JSON and must not create a second
+        # live_* message. If CHAT_MESSAGE_JSON is absent, keep it as a diagnostic
+        # problem instead of inventing a UI message.
         m_recv = RECEIVE_PROGRESS_RE.search(text)
         if m_recv:
             try:
@@ -3560,31 +4628,31 @@ class RUDPTransferRoot(BoxLayout):
                         "eta": m_recv.group("eta") or "",
                         "state": self.cu("receiving"),
                     }
-                    Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+                    if self.file_transfer_service is not None:
+                        self.file_transfer_service.update_progress(
+                            chat_message_id=mid,
+                            direction="incoming",
+                            transferred_bytes=sent,
+                            total_bytes=total,
+                            pct=pct,
+                            avg_mbps=float(m_recv.group("avg") or 0.0),
+                            eta=m_recv.group("eta") or "",
+                            status="transferring",
+                        )
+                    self._schedule_force_chat_refresh(0.0)
             except Exception:
                 pass
         m_saved = RECEIVED_SAVE_RE.search(text)
-        if m_saved and self.chat_store is not None:
+        if m_saved:
             try:
                 conn = int(m_saved.group("conn") or 0)
                 saved_path = str(m_saved.group("path") or "").strip()
-                if saved_path:
-                    mid = str(self.receiving_file_message_by_conn.get(conn) or self.current_receiving_file_message_id or "")
-                    if mid:
-                        self.chat_store.bind_message_file_path(mid, saved_path)
-                    else:
-                        mid = self.chat_store.bind_latest_incoming_file_path(file_name=os.path.basename(saved_path), saved_path=saved_path)
-                    if mid:
-                        total = os.path.getsize(saved_path) if os.path.exists(saved_path) else int(self.file_message_progress.get(mid, {}).get("total") or 0)
-                        self.file_message_progress[mid] = {"sent": total, "total": total, "pct": 100.0, "avg": self.file_message_progress.get(mid, {}).get("avg", 0.0), "eta": "0:00", "state": self.cu("received")}
-                    self.receiving_file_message_by_conn.pop(conn, None)
-                    if self.current_receiving_file_message_id == mid:
-                        self.current_receiving_file_message_id = ""
-                    Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+                Clock.schedule_once(lambda _dt, c=conn, p=saved_path: self._handle_receiver_saved_file_ui(c, p), 0)
             except Exception:
                 pass
 
         if "end reason=complete" in text:
+            Clock.schedule_once(lambda _dt: self._handle_receiver_complete_ui(), 0)
             self.receiver_log_box.append(self.t("receive_transfer_finished") + "\n")
         elif "end reason=idle_timeout" in text:
             self.receiver_log_box.append(self.t("receive_idle_timeout_msg") + "\n")
@@ -3595,25 +4663,7 @@ class RUDPTransferRoot(BoxLayout):
                 req = json.loads(payload)
             except Exception:
                 return
-            try:
-                conn = int(req.get("conn_id") or 0)
-                mid = str(req.get("chat_message_id") or "")
-                total = int(req.get("size") or 0)
-                if conn > 0 and mid:
-                    self.receiving_file_message_by_conn[conn] = mid
-                    self.current_receiving_file_message_id = mid
-                    self.file_message_progress[mid] = {
-                        "sent": 0,
-                        "total": total,
-                        "pct": 0.0,
-                        "avg": 0.0,
-                        "eta": "",
-                        "state": self.cu("waiting_receive"),
-                    }
-                    Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
-            except Exception:
-                pass
-            Clock.schedule_once(lambda _dt, data=req: self.show_transfer_request(data), 0)
+            Clock.schedule_once(lambda _dt, data=req: self._handle_transfer_request_ui(data), 0)
 
 
     def show_transfer_request(self, req: Dict[str, object]) -> None:
@@ -3621,10 +4671,26 @@ class RUDPTransferRoot(BoxLayout):
         try:
             mid = str(req.get("chat_message_id") or "")
             total = int(req.get("size") or 0)
+            if mid and self.message_service is not None:
+                try:
+                    self.message_service.ensure_incoming_file_placeholder_from_transfer_request(req, local_peer_id=self.chat_local_peer_id)
+                except Exception as exc:
+                    try:
+                        self.receiver_log_box.append(f"Failed to create incoming file card: {exc}\n")
+                    except Exception:
+                        pass
             if conn_id > 0 and mid:
                 self.receiving_file_message_by_conn[conn_id] = mid
                 self.current_receiving_file_message_id = mid
                 self.file_message_progress.setdefault(mid, {"sent": 0, "total": total, "pct": 0.0, "avg": 0.0, "eta": "", "state": self.cu("waiting_receive")})
+                if self.file_transfer_service is not None:
+                    self.file_transfer_service.upsert_incoming_task(
+                        chat_message_id=mid,
+                        file_name=str(req.get("name") or ""),
+                        remote_path=str(req.get("save_path") or ""),
+                        total_bytes=total,
+                        status="accepted",
+                    )
                 Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
         except Exception:
             pass
@@ -3755,6 +4821,11 @@ class RUDPTransferRoot(BoxLayout):
         if self.chat_store is not None:
             try:
                 self.chat_store.close()
+            except Exception:
+                pass
+        if self.transfer_store is not None:
+            try:
+                self.transfer_store.close()
             except Exception:
                 pass
 

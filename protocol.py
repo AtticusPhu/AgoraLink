@@ -299,6 +299,12 @@ class ReliableUDPSession:
         self._app_pacing_burst_bytes = float(2 * MSS)
         self._app_last_pacing_bps = None
         self._pacing_stats_lock = threading.Lock()
+        # Application DATA scheduling lanes.  Control/chat frames are allowed to
+        # use a very small cwnd reserve and skip application pacing so ACK/READ
+        # and chat messages are not trapped behind large FILE_BODY streams.
+        self._app_control_reserve_pkts = 4
+        self._app_control_reserve_bytes = int(4 * MSS)
+        self._app_send_priority_stats = {"control": 0, "file_control": 0, "bulk": 0}
         self._late_cleartext_retransmit_count = 0
         self._unexpected_cleartext_handshake_count = 0
 
@@ -2080,19 +2086,78 @@ class ReliableUDPSession:
                     cc.inflight_bytes = max(0, int(inflight))
         return int(inflight)
 
-    def can_send(self, packet_size: int) -> bool:
+    def can_send(self, packet_size: int, priority: str = "bulk") -> bool:
         """Unified gating for the application send path.
 
-        Applies:
-        - hard outstanding cap (send_max_unacked_pkts) if configured
-        - congestion control (cc) if enabled
+        ``priority`` distinguishes small control/chat frames from bulk file data.
+        Control frames still respect the hard outstanding cap, but get a tiny
+        reserve and may pass when the congestion window is momentarily filled by
+        FILE_BODY packets.  This keeps CHAT_ACK / CHAT_READ / chat text responsive
+        during large transfers without removing congestion control for bulk data.
         """
+        priority = self._normalize_app_priority(priority)
         with self.lock:
             cap = int(getattr(self, "send_max_unacked_pkts", 0) or 0)
-            if cap > 0 and len(self.unacked) >= cap:
+            reserve = int(getattr(self, "_app_control_reserve_pkts", 0) or 0) if priority == "control" else 0
+            if cap > 0 and len(self.unacked) >= cap + reserve:
                 return False
+
         self._sync_cc_inflight_bytes()
-        return self.cc_can_send(int(packet_size))
+        if self.cc_can_send(int(packet_size)):
+            return True
+
+        if priority != "control":
+            return False
+
+        # Small reserve for urgent control frames.  Avoid unbounded bypass: only
+        # allow up to cwnd + control_reserve_bytes and only for reasonably small
+        # packets.
+        try:
+            if int(packet_size) > int(2 * MSS):
+                return False
+            inflight = self._snapshot_true_inflight_bytes()
+            with self._cc_lock:
+                cc = self.cc
+                if cc is None:
+                    return True
+                cwnd = int(getattr(cc, "cwnd", 0) or 0)
+            reserve_bytes = int(getattr(self, "_app_control_reserve_bytes", 0) or 0)
+            return bool(cwnd > 0 and inflight + int(packet_size) <= cwnd + reserve_bytes)
+        except Exception:
+            return False
+
+    def _normalize_app_priority(self, priority: str) -> str:
+        p = str(priority or "bulk").strip().lower()
+        if p in ("control", "chat", "ack", "read", "contact", "decision", "urgent"):
+            return "control"
+        if p in ("file_control", "header", "offer", "accept", "meta"):
+            return "file_control"
+        return "bulk"
+
+    def _classify_app_payload_priority(self, payload: bytes) -> str:
+        data = bytes(payload or b"")
+        if not data:
+            return "control"
+        if data == b"__RUDP_FILE_EOF__":
+            return "file_control"
+        if data[:1] not in (b"{", b"["):
+            return "bulk"
+        try:
+            import json as _json
+            obj = _json.loads(data.decode("utf-8"))
+            if not isinstance(obj, dict):
+                return "bulk"
+            typ = str(obj.get("type") or "")
+            magic = str(obj.get("magic") or "")
+            if typ in {"CHAT_MESSAGE", "CHAT_ACK", "CHAT_READ", "CONTACT_REQUEST", "CONTACT_RESPONSE"}:
+                return "control"
+            if magic == "RUDP_TRANSFER_DECISION_V1":
+                return "control"
+            if typ in {"FILE", "FILE_OFFER", "FILE_OFFER_ACCEPT"}:
+                return "file_control"
+        except Exception:
+            pass
+        return "bulk"
 
     def _app_pacing_params(self):
         with self._cc_lock:
@@ -2134,39 +2199,48 @@ class ReliableUDPSession:
             self._app_last_pacing_bps = float(byte_rate)
         return float(byte_rate), byte_burst, pkt_rate, pkt_burst
 
-    def wait_for_data_send(self, packet_size: int) -> None:
+    def wait_for_data_send(self, packet_size: int, priority: str = "bulk") -> None:
         packet_size = max(0, int(packet_size or 0))
+        priority = self._normalize_app_priority(priority)
         while self.running:
             if self.has_fatal_error():
                 raise RuntimeError(self.get_fatal_error() or "fatal protocol error")
 
-            while self.running and (not self.can_send(packet_size)):
+            while self.running and (not self.can_send(packet_size, priority=priority)):
                 if self.has_fatal_error():
                     raise RuntimeError(self.get_fatal_error() or "fatal protocol error")
-                time.sleep(0.001)
+                # Bulk data yields slightly longer than control frames.  This is
+                # not a full queue scheduler, but it gives urgent frames a chance
+                # to grab the small reserve when large file loops are active.
+                time.sleep(0.002 if priority == "bulk" else 0.0005)
 
             if (not self.running):
                 break
 
-            if self.app_pacing_enabled:
+            # Do not pace urgent control frames.  They are small, rare, and must
+            # not be delayed behind FILE_BODY pacing tokens.
+            if self.app_pacing_enabled and priority != "control":
                 params = self._app_pacing_params()
                 if params is not None:
                     byte_rate, byte_burst, pkt_rate, pkt_burst = params
                     self._app_send_pacer.wait(packet_size, byte_rate, byte_burst, pkt_rate, pkt_burst)
-                    # While waiting for pacing tokens, retransmissions or loss events may have
-                    # changed inflight/cwnd. Re-check the window gate before returning.
-                    if not self.can_send(packet_size):
+                    if not self.can_send(packet_size, priority=priority):
                         continue
 
             return
 
         raise RuntimeError("session stopped")
 
-    def send_app_data(self, seq: int, payload: bytes):
+    def send_app_data(self, seq: int, payload: bytes, priority: str = "auto"):
         app_payload = bytes(payload or b"")
+        app_priority = self._classify_app_payload_priority(app_payload) if str(priority or "auto").lower() == "auto" else self._normalize_app_priority(priority)
         expected_wire_size = int(self.data_packet_wire_size(len(app_payload)))
-        self.wait_for_data_send(expected_wire_size)
+        self.wait_for_data_send(expected_wire_size, priority=app_priority)
         sent_wire_size = int(self.send_precise(int(seq), app_payload))
+        try:
+            self._app_send_priority_stats[app_priority] = int(self._app_send_priority_stats.get(app_priority, 0)) + 1
+        except Exception:
+            pass
         self.cc_on_packet_sent(sent_wire_size)
 
     # ---------------- Congestion-control wrappers (thread-safe) ----------------

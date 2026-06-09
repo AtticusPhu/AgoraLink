@@ -16,6 +16,7 @@ from file_transfer_common import is_unspecified_ip, normalize_peer_endpoint_ip
 from typing import Dict, List, Optional, Tuple
 
 from chat_db import ChatDatabase, make_id, now_ts
+from chat_crypto import decrypt_json_body
 
 
 class ChatStore:
@@ -39,6 +40,14 @@ class ChatStore:
         self._ensure_column("group_members", "last_error", "TEXT")
         self._ensure_column("messages", "read_at", "REAL")
         self._ensure_column("message_receipts", "read_at", "REAL")
+        self.db.conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_pins (
+                kind TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                pinned_at REAL NOT NULL,
+                PRIMARY KEY(kind, target_id)
+            )
+        """)
         self.db.conn.commit()
 
     def _ensure_column(self, table: str, column: str, decl: str) -> None:
@@ -390,11 +399,15 @@ class ChatStore:
             if receiver:
                 self.add_group_member(gid, receiver, display_name=receiver, member_state="active")
         else:
+            # Direct-message conversation IDs are local database identifiers.
+            # The sender's conversation_id is meaningful only on the sender side,
+            # so the receiver must always rebind incoming direct messages to its
+            # own local direct conversation for the sender. Otherwise the message
+            # is stored but the receiver UI cannot find it when opening the contact.
             peer = sender if sender != self.my_peer_id else receiver
             if peer:
                 conv_id = self.create_direct_conversation(peer)
-                if not str(message.get("conversation_id") or ""):
-                    message["conversation_id"] = conv_id
+                message["conversation_id"] = conv_id
         if not self.db.message_exists(mid):
             self.db.save_message(
                 message_id=mid,
@@ -408,6 +421,16 @@ class ChatStore:
                 created_at=created,
                 body_type=str(message.get("body_type") or "text"),
             )
+        else:
+            # Repair rows written by older builds that stored the sender-side
+            # conversation_id on the receiver side. Without this, the file/text
+            # exists in SQLite but is invisible in the receiver's direct chat UI.
+            if not gid and str(message.get("conversation_id") or ""):
+                self.db.conn.execute(
+                    "UPDATE messages SET conversation_id=?, group_id='', sender_peer_id=?, receiver_peer_id=?, direction='incoming' WHERE message_id=?",
+                    (str(message.get("conversation_id") or ""), sender, receiver, mid),
+                )
+                self.db.conn.commit()
         return mid
 
     def mark_chat_sent(self, message_id: str, peer_id: str = "") -> None:
@@ -503,6 +526,32 @@ class ChatStore:
             return mid
         return ""
 
+    def is_pinned(self, kind: str, target_id: str) -> bool:
+        row = self.db.conn.execute(
+            "SELECT 1 FROM chat_pins WHERE kind=? AND target_id=?",
+            (str(kind or ""), str(target_id or "")),
+        ).fetchone()
+        return row is not None
+
+    def set_pinned(self, kind: str, target_id: str, pinned: bool = True) -> None:
+        k = str(kind or "").strip()
+        tid = str(target_id or "").strip()
+        if not k or not tid:
+            return
+        if pinned:
+            self.db.conn.execute(
+                "INSERT OR REPLACE INTO chat_pins(kind,target_id,pinned_at) VALUES(?,?,?)",
+                (k, tid, now_ts()),
+            )
+        else:
+            self.db.conn.execute("DELETE FROM chat_pins WHERE kind=? AND target_id=?", (k, tid))
+        self.db.conn.commit()
+
+    def toggle_pinned(self, kind: str, target_id: str) -> bool:
+        new_state = not self.is_pinned(kind, target_id)
+        self.set_pinned(kind, target_id, new_state)
+        return new_state
+
     def list_messages(self, group_id: str = "", conversation_id: str = "", limit: int = 100) -> List[Dict[str, object]]:
         return self.db.list_messages(group_id=group_id, conversation_id=conversation_id, limit=limit)
 
@@ -541,6 +590,16 @@ class ChatStore:
             (conv,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_message(self, message_id: str) -> Dict[str, object]:
+        row = self.db.conn.execute("SELECT * FROM messages WHERE message_id=?", (str(message_id or ""),)).fetchone()
+        if row is None:
+            return {}
+        obj = dict(row)
+        aad = self.db._aad_fields(obj["message_id"], obj.get("conversation_id"), obj.get("group_id"), obj["sender_peer_id"], obj.get("receiver_peer_id"), obj["created_at"])
+        body = decrypt_json_body(self.db.storage_key, obj["encrypted_body"], obj["body_nonce"], aad)
+        obj["text"] = body.get("text", "")
+        return obj
 
     def list_receipts(self, message_id: str) -> List[Dict[str, object]]:
         rows = self.db.conn.execute(
