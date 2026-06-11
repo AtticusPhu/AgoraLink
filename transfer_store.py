@@ -47,6 +47,9 @@ class TransferStore:
                 transferred_bytes INTEGER DEFAULT 0,
                 pct REAL DEFAULT 0,
                 avg_mbps REAL DEFAULT 0,
+                current_mbps REAL DEFAULT 0,
+                peak_mbps REAL DEFAULT 0,
+                elapsed_sec REAL DEFAULT 0,
                 eta TEXT,
                 status TEXT DEFAULT 'queued',
                 error TEXT,
@@ -62,6 +65,9 @@ class TransferStore:
             "remote_path": "ALTER TABLE file_transfers ADD COLUMN remote_path TEXT",
             "pct": "ALTER TABLE file_transfers ADD COLUMN pct REAL DEFAULT 0",
             "avg_mbps": "ALTER TABLE file_transfers ADD COLUMN avg_mbps REAL DEFAULT 0",
+            "current_mbps": "ALTER TABLE file_transfers ADD COLUMN current_mbps REAL DEFAULT 0",
+            "peak_mbps": "ALTER TABLE file_transfers ADD COLUMN peak_mbps REAL DEFAULT 0",
+            "elapsed_sec": "ALTER TABLE file_transfers ADD COLUMN elapsed_sec REAL DEFAULT 0",
             "eta": "ALTER TABLE file_transfers ADD COLUMN eta TEXT",
             "error": "ALTER TABLE file_transfers ADD COLUMN error TEXT",
             "completed_at": "ALTER TABLE file_transfers ADD COLUMN completed_at REAL",
@@ -111,9 +117,9 @@ class TransferStore:
             INSERT INTO file_transfers(
                 transfer_key, chat_message_id, transfer_id, file_id, direction, peer_id,
                 conversation_id, group_id, local_path, remote_path, file_name,
-                total_bytes, transferred_bytes, pct, avg_mbps, eta, status, error,
+                total_bytes, transferred_bytes, pct, avg_mbps, current_mbps, peak_mbps, elapsed_sec, eta, status, error,
                 created_at, updated_at, completed_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(transfer_key) DO UPDATE SET
                 transfer_id=COALESCE(NULLIF(excluded.transfer_id,''), file_transfers.transfer_id),
                 file_id=COALESCE(NULLIF(excluded.file_id,''), file_transfers.file_id),
@@ -129,7 +135,7 @@ class TransferStore:
             (
                 key, mid, transfer_id, file_id, direction, peer_id,
                 conversation_id or None, group_id or None, local_path or None, remote_path or None, file_name or None,
-                int(total_bytes or 0), 0, 0.0, 0.0, "", status or "queued", None,
+                int(total_bytes or 0), 0, 0.0, 0.0, 0.0, 0.0, 0.0, "", status or "queued", None,
                 now, now, None,
             ),
         )
@@ -146,6 +152,9 @@ class TransferStore:
         total_bytes: int = 0,
         pct: float = 0.0,
         avg_mbps: float = 0.0,
+        current_mbps: float = 0.0,
+        peak_mbps: float = 0.0,
+        elapsed_sec: float = 0.0,
         eta: str = "",
         status: str = "transferring",
         error: str = "",
@@ -176,6 +185,9 @@ class TransferStore:
                     total_bytes=CASE WHEN ? > 0 THEN ? ELSE total_bytes END,
                     pct=?,
                     avg_mbps=?,
+                    current_mbps=?,
+                    peak_mbps=CASE WHEN ? > peak_mbps THEN ? ELSE peak_mbps END,
+                    elapsed_sec=CASE WHEN ? > 0 THEN ? ELSE elapsed_sec END,
                     eta=?,
                     status=?,
                     error=?,
@@ -189,6 +201,11 @@ class TransferStore:
                     int(total_bytes or 0),
                     float(pct or 0.0),
                     float(avg_mbps or 0.0),
+                    float(current_mbps or 0.0),
+                    float(peak_mbps or 0.0),
+                    float(peak_mbps or 0.0),
+                    float(elapsed_sec or 0.0),
+                    float(elapsed_sec or 0.0),
                     str(eta or ""),
                     str(status or "transferring"),
                     str(error or "") or None,
@@ -256,26 +273,29 @@ class TransferStore:
         if not rows:
             return {}
 
-        # Prefer a completed/received row, especially when it has a valid local
-        # path. This prevents the UI from showing an older in-progress row after
-        # the file has already been saved successfully.
+        # Prefer a completed/received row. For incoming transfers, a valid local
+        # saved path can also prove completion. Do not use the outgoing source
+        # file path as proof of transfer completion; otherwise the sender card
+        # jumps to 100% immediately because the source file exists from the start.
         for r in rows:
             status = str(r.get("status") or "")
+            direction = str(r.get("direction") or "")
             local_path = str(r.get("local_path") or r.get("remote_path") or "")
             try:
                 actual_size = os.path.getsize(local_path) if local_path and os.path.exists(local_path) else 0
             except Exception:
                 actual_size = 0
-            if status in ("completed", "received") or actual_size > 0:
+            path_proves_done = direction == "incoming" and actual_size > 0
+            if status in ("completed", "received") or path_proves_done:
                 base = dict(r)
-                total = max(int(base.get("total_bytes") or 0), actual_size)
+                total = max(int(base.get("total_bytes") or 0), actual_size if path_proves_done else 0)
                 if total > 0:
                     base.update({
                         "total_bytes": total,
                         "transferred_bytes": total,
                         "pct": 100.0,
                         "eta": "0:00",
-                        "status": "received" if str(base.get("direction") or "") == "incoming" else "completed",
+                        "status": "received" if direction == "incoming" else "completed",
                     })
                 return base
 
@@ -300,6 +320,9 @@ class TransferStore:
             "transferred_bytes": transferred,
             "pct": pct,
             "avg_mbps": max(float(r.get("avg_mbps") or 0.0) for r in rows),
+            "current_mbps": max(float(r.get("current_mbps") or 0.0) for r in rows),
+            "peak_mbps": max(float(r.get("peak_mbps") or 0.0) for r in rows),
+            "elapsed_sec": max(float(r.get("elapsed_sec") or 0.0) for r in rows),
             "eta": rows[0].get("eta") or "",
             "status": status,
         })

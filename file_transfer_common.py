@@ -34,6 +34,11 @@ DISCOVERY_RESPONSE_MAGIC = "RUDP_RECEIVER_V1"
 DEFAULT_DISCOVERY_PORT = 9998
 TRANSFER_DECISION_MAGIC = "RUDP_TRANSFER_DECISION_V1"
 TRANSFER_REQUEST_LOG_PREFIX = "TRANSFER_REQUEST_JSON:"
+TRANSFER_STARTED_LOG_PREFIX = "TRANSFER_STARTED_JSON:"
+TRANSFER_PROGRESS_LOG_PREFIX = "TRANSFER_PROGRESS_JSON:"
+TRANSFER_SAVED_LOG_PREFIX = "TRANSFER_SAVED_JSON:"
+TRANSFER_COMPLETE_LOG_PREFIX = "TRANSFER_COMPLETE_JSON:"
+TRANSFER_FAILED_LOG_PREFIX = "TRANSFER_FAILED_JSON:"
 USER_ERROR_LOG_PREFIX = "USER_ERROR_JSON:"
 USER_STATUS_LOG_PREFIX = "USER_STATUS_JSON:"
 CHAT_MESSAGE_LOG_PREFIX = "CHAT_MESSAGE_JSON:"
@@ -286,6 +291,36 @@ def build_user_status(code: str, message: str = "", **extra) -> str:
     obj = {"code": str(code or "status"), "message": str(message or ""), "ts": time.time()}
     obj.update(extra)
     return USER_STATUS_LOG_PREFIX + json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _build_transfer_event(prefix: str, event_type: str, **fields) -> str:
+    obj = {
+        "type": str(event_type or "TRANSFER_EVENT"),
+        "version": 1,
+        "timestamp": time.time(),
+    }
+    obj.update(fields)
+    return prefix + json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def build_transfer_started_log(**fields) -> str:
+    return _build_transfer_event(TRANSFER_STARTED_LOG_PREFIX, "TRANSFER_STARTED", **fields)
+
+
+def build_transfer_progress_log(**fields) -> str:
+    return _build_transfer_event(TRANSFER_PROGRESS_LOG_PREFIX, "TRANSFER_PROGRESS", **fields)
+
+
+def build_transfer_saved_log(**fields) -> str:
+    return _build_transfer_event(TRANSFER_SAVED_LOG_PREFIX, "TRANSFER_SAVED", **fields)
+
+
+def build_transfer_complete_log(**fields) -> str:
+    return _build_transfer_event(TRANSFER_COMPLETE_LOG_PREFIX, "TRANSFER_COMPLETE", **fields)
+
+
+def build_transfer_failed_log(**fields) -> str:
+    return _build_transfer_event(TRANSFER_FAILED_LOG_PREFIX, "TRANSFER_FAILED", **fields)
 
 
 def sha256_file(path: str, block_size: int = 1024 * 1024) -> str:

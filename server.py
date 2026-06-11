@@ -46,6 +46,11 @@ from file_transfer_common import (
     build_transfer_decision,
     build_transfer_request_log,
     build_transfer_request_obj,
+    build_transfer_started_log,
+    build_transfer_progress_log,
+    build_transfer_saved_log,
+    build_transfer_complete_log,
+    build_transfer_failed_log,
     build_user_error,
     output_conflict_info,
     parse_chat_message,
@@ -128,6 +133,45 @@ def load_or_create_server_identity_key(path: str, logger=None):
     return key, pub, created
 
 
+def _effective_max_unacked_pkts(args) -> int:
+    try:
+        return max(0, int(getattr(args, "max_unacked_pkts", 1152) or 0))
+    except Exception:
+        return 1152
+
+
+def _derived_sockbuf_bytes(args, attr: str = "sock_rcvbuf") -> int:
+    try:
+        explicit = int(getattr(args, attr, 0) or 0)
+    except Exception:
+        explicit = 0
+    if explicit > 0:
+        return explicit
+    max_unacked = _effective_max_unacked_pkts(args)
+    return max(16 * 1024 * 1024, int(max_unacked) * 32 * 1024)
+
+
+def _derived_reorder_buffer_pkts(args) -> int:
+    try:
+        explicit = int(getattr(args, "reorder_buffer_pkts", 0) or 0)
+    except Exception:
+        explicit = 0
+    if explicit > 0:
+        return explicit
+    return max(2048, _effective_max_unacked_pkts(args) * 2)
+
+
+def _derived_app_queue_max_items(args) -> int:
+    try:
+        explicit = int(getattr(args, "app_queue_max_items", 0) or 0)
+    except Exception:
+        explicit = 0
+    if explicit > 0:
+        return explicit
+    return max(4096, _effective_max_unacked_pkts(args) * 4)
+
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Receive files through the RUDP protocol.")
     p.add_argument("--bind", default="0.0.0.0", help="Bind address; usually keep 0.0.0.0")
@@ -138,14 +182,17 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--approval-dir", default="", help="Directory used for GUI approval files")
     p.add_argument("--approval-timeout", type=float, default=300.0, help="Seconds to wait for GUI approval")
     p.add_argument("--allow-peer-ip", default="", help="Only accept sender from this IPv4 address")
-    p.add_argument("--sock-rcvbuf", type=int, default=8 * 1024 * 1024)
-    p.add_argument("--sock-sndbuf", type=int, default=8 * 1024 * 1024)
+    p.add_argument("--sock-rcvbuf", type=int, default=0, help="UDP receive buffer bytes; 0 derives from max_unacked_pkts")
+    p.add_argument("--sock-sndbuf", type=int, default=0, help="UDP send buffer bytes; 0 derives from max_unacked_pkts")
     p.add_argument("--handshake-timeout", type=float, default=5.0)
     p.add_argument("--final-ack-wait-timeout", type=float, default=75.0)
     p.add_argument("--idle-timeout", type=float, default=60.0)
     p.add_argument("--complete-ack-timeout", type=float, default=60.0)
     p.add_argument("--stats-interval", type=float, default=1.0)
-    p.add_argument("--app-queue-max-items", type=int, default=65536)
+    p.add_argument("--progress-json-interval", type=float, default=0.2)
+    p.add_argument("--max-unacked-pkts", type=int, default=1152, help="Reference sender max in-flight packets; receiver buffers derive from this")
+    p.add_argument("--reorder-buffer-pkts", type=int, default=0, help="Receiver reordering/replay floor; 0 derives from max_unacked_pkts")
+    p.add_argument("--app-queue-max-items", type=int, default=0, help="Application queue limit; 0 derives from max_unacked_pkts")
     p.add_argument("--server-id-key-file", default="./rudp_receiver_ed25519.key", help="Receiver Ed25519 identity key")
     p.add_argument("--show-ips", action="store_true", help="Print local IP candidates at startup")
     p.add_argument("--discovery-port", type=int, default=DEFAULT_DISCOVERY_PORT, help="UDP broadcast discovery port")
@@ -170,10 +217,21 @@ class RUDPFileReceiver:
             os.environ.setdefault("RUDP_VERBOSE_PROTOCOL", "0")
         self.logger = setup_logger("RUDP-Receiver")
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(args.sock_rcvbuf))
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(args.sock_sndbuf))
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _derived_sockbuf_bytes(args, "sock_rcvbuf"))
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _derived_sockbuf_bytes(args, "sock_sndbuf"))
         self.sock.settimeout(0.5)
-        self.sock.bind((str(args.bind), int(args.port)))
+        try:
+            self.sock.bind((str(args.bind), int(args.port)))
+        except OSError as exc:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.logger.error(
+                f"Bind failed on {(str(args.bind), int(args.port))}: {exc}. "
+                "The receiver port is already in use. Stop the existing receiver process or choose another port."
+            )
+            raise
         self.running = True
         self.lock = threading.RLock()
         self.sessions: Dict[int, ReliableUDPSession] = {}
@@ -188,7 +246,13 @@ class RUDPFileReceiver:
     def start(self) -> None:
         if self.args.show_ips:
             print_local_ip_candidates()
-        self.logger.info(f"Listening on {self.sock.getsockname()}, save_dir={Path(self.args.save_dir).resolve()}")
+        self.logger.info(
+            f"Listening on {self.sock.getsockname()}, save_dir={Path(self.args.save_dir).resolve()}, "
+            f"sock_rcvbuf={_derived_sockbuf_bytes(self.args, 'sock_rcvbuf')}, "
+            f"sock_sndbuf={_derived_sockbuf_bytes(self.args, 'sock_sndbuf')}, "
+            f"reorder_buffer_pkts={_derived_reorder_buffer_pkts(self.args)}, "
+            f"app_queue_max_items={_derived_app_queue_max_items(self.args)}"
+        )
         if not bool(getattr(self.args, "disable_discovery", False)):
             threading.Thread(target=self._discovery_listener, daemon=True).start()
         threading.Thread(target=self._cleanup_loop, daemon=True).start()
@@ -354,8 +418,20 @@ class RUDPFileReceiver:
                         sess.configure_app_delivery(
                             len_only=False,
                             small_payload_threshold=0,
-                            queue_max_items=int(self.args.app_queue_max_items),
+                            queue_max_items=_derived_app_queue_max_items(self.args),
                         )
+                        try:
+                            rb = _derived_reorder_buffer_pkts(self.args)
+                            sess._adaptive_ooo_window_floor_pkts = int(rb)
+                            sess._adaptive_ooo_window_pkts = int(rb)
+                            sess._adaptive_replay_margin_floor_pkts = max(
+                                int(getattr(sess, "_adaptive_replay_margin_floor_pkts", 8) or 8),
+                                int(rb),
+                            )
+                            sess.configure_reorder_tolerance(128)
+                            sess._sync_adaptive_reorder(desired_ooo=int(rb), reason="receiver_config")
+                        except Exception as exc:
+                            self.logger.warning(f"receiver reorder config failed: {exc}")
                         sess.start_threads(start_receiver=False)
                         self.sessions[cid] = sess
                         self.session_created_ts[cid] = time.time()
@@ -575,6 +651,9 @@ class RUDPFileReceiver:
         start_ts = time.time()
         last_report_ts = start_ts
         last_report_bytes = 0
+        last_json_ts = start_ts
+        last_json_bytes = 0
+        peak_mbps = 0.0
         last_meta_update_ts = start_ts
         last_meta_update_bytes = 0
         exit_reason = "unknown"
@@ -809,6 +888,19 @@ class RUDPFileReceiver:
                         f"Session {cid}: transfer accepted; receiving {meta['name']} from {peer_addr}, "
                         f"size={expected_total} bytes -> {out_path}, policy={policy}, resume_offset={resume_offset}"
                     )
+                    self.logger.info(build_transfer_started_log(
+                        conn_id=cid,
+                        chat_message_id=str((meta or {}).get("chat_message_id") or ""),
+                        file_name=str((meta or {}).get("name") or ""),
+                        direction="incoming",
+                        peer=f"{peer_addr[0]}:{peer_addr[1]}",
+                        total_bytes=int(expected_total or 0),
+                        save_path=str(out_path or ""),
+                        payload_size=int((meta or {}).get("payload_size") or 0),
+                        sock_sndbuf=int(_derived_sockbuf_bytes(self.args, "sock_sndbuf")),
+                        sock_rcvbuf=int(_derived_sockbuf_bytes(self.args, "sock_rcvbuf")),
+                        status="started",
+                    ))
                     continue
 
                 if data == EOF_PAYLOAD:
@@ -837,6 +929,37 @@ class RUDPFileReceiver:
                         last_meta_update_ts = now
                     except Exception as exc:
                         self.logger.warning(f"Session {cid}: failed to update resume meta: {exc}")
+
+                json_due = (now - last_json_ts) >= float(getattr(self.args, "progress_json_interval", 0.2) or 0.2)
+                if json_due:
+                    elapsed = max(now - start_ts, 1e-6)
+                    j_interval = max(now - last_json_ts, 1e-6)
+                    j_delta = max(0, int(bytes_recv) - int(last_json_bytes))
+                    current_mbps = (j_delta * 8.0) / j_interval / 1e6
+                    avg_mbps = (bytes_recv * 8.0) / elapsed / 1e6
+                    peak_mbps = max(float(peak_mbps or 0.0), current_mbps)
+                    pct = (bytes_recv * 100.0 / expected_total) if expected_total else 0.0
+                    remaining_bytes = max(int(expected_total or 0) - int(bytes_recv), 0)
+                    rate_bps = (j_delta / j_interval) if j_delta > 0 else ((bytes_recv / elapsed) if bytes_recv > 0 else 0.0)
+                    eta_text = _format_duration(remaining_bytes / rate_bps) if rate_bps > 0 else "unknown"
+                    self.logger.info(build_transfer_progress_log(
+                        conn_id=cid,
+                        chat_message_id=str((meta or {}).get("chat_message_id") or ""),
+                        file_name=str((meta or {}).get("name") or ""),
+                        direction="incoming",
+                        peer=f"{peer_addr[0]}:{peer_addr[1]}",
+                        transferred_bytes=int(bytes_recv),
+                        total_bytes=int(expected_total or 0),
+                        pct=round(float(pct), 3),
+                        current_mbps=round(float(current_mbps), 3),
+                        avg_mbps=round(float(avg_mbps), 3),
+                        peak_mbps=round(float(peak_mbps), 3),
+                        elapsed_sec=round(float(elapsed), 3),
+                        eta=eta_text,
+                        status="transferring",
+                    ))
+                    last_json_ts = now
+                    last_json_bytes = int(bytes_recv)
 
                 if now - last_report_ts >= float(self.args.stats_interval):
                     elapsed = max(now - start_ts, 1e-6)
@@ -886,10 +1009,45 @@ class RUDPFileReceiver:
                     else:
                         exit_reason = "complete"
                         elapsed = max(time.time() - start_ts, 1e-6)
+                        final_avg = (bytes_recv * 8.0 / elapsed / 1e6)
+                        self.logger.info(build_transfer_saved_log(
+                            conn_id=cid,
+                            chat_message_id=str((meta or {}).get("chat_message_id") or ""),
+                            file_name=str((meta or {}).get("name") or ""),
+                            direction="incoming",
+                            peer=f"{peer_addr[0]}:{peer_addr[1]}",
+                            save_path=str(out_path or ""),
+                            transferred_bytes=int(bytes_recv),
+                            total_bytes=int(expected_total or bytes_recv),
+                            pct=100.0,
+                            current_mbps=0.0,
+                            avg_mbps=round(float(final_avg), 3),
+                            peak_mbps=round(float(peak_mbps), 3),
+                            elapsed_sec=round(float(elapsed), 3),
+                            eta="0:00",
+                            sha256=str(received_sha),
+                            status="received",
+                        ))
+                        self.logger.info(build_transfer_complete_log(
+                            conn_id=cid,
+                            chat_message_id=str((meta or {}).get("chat_message_id") or ""),
+                            file_name=str((meta or {}).get("name") or ""),
+                            direction="incoming",
+                            peer=f"{peer_addr[0]}:{peer_addr[1]}",
+                            transferred_bytes=int(bytes_recv),
+                            total_bytes=int(expected_total or bytes_recv),
+                            pct=100.0,
+                            current_mbps=0.0,
+                            avg_mbps=round(float(final_avg), 3),
+                            peak_mbps=round(float(peak_mbps), 3),
+                            elapsed_sec=round(float(elapsed), 3),
+                            eta="0:00",
+                            status="received",
+                        ))
                         self.logger.info(
                             f"Session {cid}: saved {out_path}, bytes={bytes_recv}, "
                             f"sha256={received_sha}, elapsed={elapsed:.3f}s, "
-                            f"avg={(bytes_recv * 8.0 / elapsed / 1e6):.2f} Mbps"
+                            f"avg={final_avg:.2f} Mbps"
                         )
 
         except Exception as exc:
@@ -917,6 +1075,22 @@ class RUDPFileReceiver:
                         self.logger.info(f"Session {cid}: kept partial file for resume: {part_path}, bytes={bytes_recv}")
                 except Exception as exc:
                     self.logger.warning(f"Session {cid}: failed to preserve resume meta: {exc}")
+            if exit_reason != "complete":
+                try:
+                    self.logger.info(build_transfer_failed_log(
+                        conn_id=cid,
+                        chat_message_id=str((meta or {}).get("chat_message_id") or "") if meta else "",
+                        file_name=str((meta or {}).get("name") or "") if meta else "",
+                        direction="incoming",
+                        peer=f"{peer_addr[0]}:{peer_addr[1]}",
+                        transferred_bytes=int(bytes_recv or 0),
+                        total_bytes=int(expected_total or 0),
+                        pct=(float(bytes_recv) * 100.0 / float(expected_total)) if expected_total else 0.0,
+                        error=str(exit_reason or "failed"),
+                        status="failed",
+                    ))
+                except Exception:
+                    pass
             self.logger.info(f"Session {cid}: end reason={exit_reason}, bytes_recv={bytes_recv}")
             # A short linger keeps the receiver alive for duplicate EOF/COMPLETE_ACK traffic.
             if exit_reason == "complete":

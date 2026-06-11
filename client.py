@@ -42,6 +42,10 @@ from file_transfer_common import (
     build_file_header,
     build_user_error,
     build_user_status,
+    build_transfer_started_log,
+    build_transfer_progress_log,
+    build_transfer_complete_log,
+    build_transfer_failed_log,
     parse_chat_ack,
     parse_contact_response,
     parse_transfer_decision,
@@ -170,6 +174,27 @@ def _format_duration(seconds: float) -> str:
     return f"{m:d}:{sec:02d}"
 
 
+def _effective_max_unacked_pkts(args) -> int:
+    try:
+        return max(0, int(getattr(args, "max_unacked_pkts", 1152) or 0))
+    except Exception:
+        return 1152
+
+
+def _effective_sockbuf_bytes(args, attr: str = "sock_rcvbuf") -> int:
+    try:
+        explicit = int(getattr(args, attr, 0) or 0)
+    except Exception:
+        explicit = 0
+    if explicit > 0:
+        return explicit
+    max_unacked = _effective_max_unacked_pkts(args)
+    # Link socket buffer to max_unacked_pkts. 32 KiB per allowed in-flight DATA
+    # packet gives 36 MiB at max_unacked_pkts=1152, with a 16 MiB floor.
+    return max(16 * 1024 * 1024, int(max_unacked) * 32 * 1024)
+
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="AgoraLink sender: send files or encrypted chat messages through the RUDP protocol.")
     p.add_argument("--server-ip", required=True, help="Receiver IP or hostname")
@@ -195,9 +220,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--contact-message", default="", help="Optional contact request message")
     p.add_argument("--bind-ip", default="0.0.0.0", help="Local bind IP; usually keep 0.0.0.0")
     p.add_argument("--bind-port", type=int, default=0, help="Local bind port; 0 means auto")
-    p.add_argument("--payload-size", type=int, default=1300, help="Application payload bytes per DATA packet")
-    p.add_argument("--sock-rcvbuf", type=int, default=8 * 1024 * 1024)
-    p.add_argument("--sock-sndbuf", type=int, default=8 * 1024 * 1024)
+    p.add_argument("--payload-size", type=int, default=1400, help="Application payload bytes per DATA packet")
+    p.add_argument("--file-read-chunk-mb", type=int, default=4, help="Single-thread file read chunk size in MiB")
+    p.add_argument("--sock-rcvbuf", type=int, default=0, help="UDP receive buffer bytes; 0 derives from max_unacked_pkts")
+    p.add_argument("--sock-sndbuf", type=int, default=0, help="UDP send buffer bytes; 0 derives from max_unacked_pkts")
     p.add_argument("--handshake-timeout", type=float, default=3.0)
     p.add_argument("--handshake-max-retries", type=int, default=100)
     p.add_argument("--handshake-tail-timeout", type=float, default=60.0)
@@ -206,11 +232,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--request-timeout", type=float, default=300.0, help="Seconds to wait for receiver approval after sending metadata")
     p.add_argument("--no-request-confirmation", action="store_true", help="Do not wait for receiver approval before sending file body")
     p.add_argument("--stats-interval", type=float, default=1.0)
+    p.add_argument("--progress-json-interval", type=float, default=0.2)
     p.add_argument("--no-progress-timeout", type=float, default=120.0, help="Fail if sender sees no effective transfer progress for this many seconds")
     p.add_argument("--server-pin-file", default="./rudp_receiver_ed25519.pin", help="TOFU receiver public-key pin file")
     p.add_argument("--require-existing-server-pin", action="store_true")
     p.add_argument("--disable-cc", action="store_true", help="Disable CUBIC congestion control")
-    p.add_argument("--max-unacked-pkts", type=int, default=0, help="Optional hard cap for outstanding DATA packets")
+    p.add_argument("--max-unacked-pkts", type=int, default=1152, help="Hard cap for outstanding DATA packets")
+    p.add_argument("--lan-pacing-burst-pkts", type=int, default=32, help="LAN bulk pacing burst budget in DATA packets")
+    p.add_argument("--lan-pacing-interval-ms", type=float, default=5.0, help="LAN bulk pacing burst interval in milliseconds")
+    p.add_argument("--reorder-tolerance-pkts", type=int, default=128, help="Fast retransmit reorder tolerance in packets")
     p.add_argument("--send-rate-mbps", type=float, default=0.0, help="Optional sender-side rate limit")
     p.add_argument("--initial-rtt-ms", type=float, default=0.0)
     p.add_argument("--min-data-rto-sec", type=float, default=0.2)
@@ -305,8 +335,8 @@ def run_contact_request_client(args: argparse.Namespace) -> int:
     session = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(args.sock_rcvbuf))
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(args.sock_sndbuf))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _effective_sockbuf_bytes(args, "sock_rcvbuf"))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _effective_sockbuf_bytes(args, "sock_sndbuf"))
         sock.bind((str(args.bind_ip), int(args.bind_port)))
         conn_id = secrets.randbits(64)
         validator = make_server_identity_validator(str(args.server_pin_file), logger, require_existing_pin=bool(args.require_existing_server_pin))
@@ -384,8 +414,8 @@ def run_chat_client(args: argparse.Namespace, messages: List[str]) -> int:
     session = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(args.sock_rcvbuf))
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(args.sock_sndbuf))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _effective_sockbuf_bytes(args, "sock_rcvbuf"))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _effective_sockbuf_bytes(args, "sock_sndbuf"))
         sock.bind((str(args.bind_ip), int(args.bind_port)))
         logger.info(f"Local socket: {sock.getsockname()}")
         logger.info(f"Chat receiver: {(args.server_ip, args.server_port)}")
@@ -405,7 +435,13 @@ def run_chat_client(args: argparse.Namespace, messages: List[str]) -> int:
         )
         session.configure_app_delivery(len_only=False, small_payload_threshold=0)
         session.recovery_pacing_enabled = True
-        session.send_max_unacked_pkts = max(0, int(args.max_unacked_pkts or 0))
+        session.send_max_unacked_pkts = _effective_max_unacked_pkts(args)
+        session.configure_lan_bulk_pacing(
+            burst_pkts=int(getattr(args, "lan_pacing_burst_pkts", 32) or 32),
+            interval_ms=float(getattr(args, "lan_pacing_interval_ms", 5.0) or 5.0),
+            payload_size=int(getattr(args, "payload_size", 1400) or 1400),
+        )
+        session.configure_reorder_tolerance(int(getattr(args, "reorder_tolerance_pkts", 128) or 128))
         min_data_rto = max(0.05, float(args.min_data_rto_sec or 0.2))
         max_data_rto = max(min_data_rto, float(args.max_data_rto_sec or 4.0))
         session.min_data_rto = min_data_rto
@@ -516,8 +552,8 @@ def run_chat_read_client(args: argparse.Namespace, message_ids: List[str]) -> in
     session = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(args.sock_rcvbuf))
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(args.sock_sndbuf))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _effective_sockbuf_bytes(args, "sock_rcvbuf"))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _effective_sockbuf_bytes(args, "sock_sndbuf"))
         sock.bind((str(args.bind_ip), int(args.bind_port)))
         conn_id = secrets.randbits(64)
         validator = make_server_identity_validator(
@@ -638,10 +674,61 @@ def run_client(args: argparse.Namespace) -> int:
     pkts_sent = 0
     last_report_ts = start_ts
     last_report_bytes = 0
+    last_json_ts = start_ts
+    last_json_bytes = 0
+    peak_mbps = 0.0
     last_effective_progress_ts = start_ts
     last_unacked_snapshot = -1
+    last_lan_stats_ts = start_ts
+    last_lan_sent_pkts = 0
+    last_lan_acked_pkts = 0.0
+    last_lan_retx_pkts = 0
+    last_lan_wire_bytes_sent = 0
+    last_lan_bulk_sent_pkts = 0
+    last_lan_bulk_blocked_pacing = 0
+    last_lan_bulk_blocked_cwnd = 0
+    last_lan_bulk_blocked_unacked = 0
+    last_lan_ack_deleted_pkts = 0
+    last_lan_ack_scan_pkts = 0
+    last_lan_blocked_cc = 0
+    last_lan_blocked_unacked = 0
+    summary_lan_samples = 0
+    summary_sent_pps_sum = 0.0
+    summary_payload_mbps_sum = 0.0
+    summary_wire_mbps_sum = 0.0
+    summary_rtt_ms_sum = 0.0
+    summary_rtt_ms_max = 0.0
+    summary_retrans_total = 0
+    summary_bulk_blocked_unacked_total = 0
+    summary_bulk_sent_total = 0
+    summary_bulk_budget_sum = 0.0
+    summary_bulk_budget_max = 0
+    summary_wifi_guard_entries = 0
 
-    def note_effective_progress(unacked_count: Optional[int] = None) -> None:
+    lan_base_burst = max(1, int(getattr(args, "lan_pacing_burst_pkts", 32) or 32))
+    lan_guard_burst = max(1, min(lan_base_burst, max(1, lan_base_burst // 2)))
+    lan_current_burst = lan_base_burst
+    wifi_guard_active = False
+    wifi_guard_bad_streak = 0
+    wifi_guard_good_streak = 0
+
+    def _set_lan_burst(burst_pkts: int, reason: str = "") -> None:
+        nonlocal lan_current_burst
+        burst_pkts = max(1, int(burst_pkts or 1))
+        if burst_pkts == int(lan_current_burst):
+            return
+        lan_current_burst = burst_pkts
+        try:
+            session.configure_lan_bulk_pacing(
+                burst_pkts=int(burst_pkts),
+                interval_ms=float(getattr(args, "lan_pacing_interval_ms", 5.0) or 5.0),
+                payload_size=int(payload_size),
+            )
+            logger.info(f"WIFI_GUARD burst={int(burst_pkts)}, reason={reason}")
+        except Exception as exc:
+            logger.info(f"WIFI_GUARD update_failed: {exc}")
+
+    def note_effective_progress(unacked_count: Optional[int] = None, now_ts: Optional[float] = None) -> None:
         nonlocal last_effective_progress_ts, last_unacked_snapshot
         try:
             uc = int(session.get_unacked_count() if unacked_count is None and session is not None else unacked_count)
@@ -649,21 +736,22 @@ def run_client(args: argparse.Namespace) -> int:
             uc = -1
         if uc != last_unacked_snapshot:
             last_unacked_snapshot = uc
-            last_effective_progress_ts = time.time()
+            last_effective_progress_ts = float(now_ts if now_ts is not None else time.time())
 
-    def check_no_progress(stage: str) -> None:
+    def check_no_progress(stage: str, now_ts: Optional[float] = None) -> None:
         timeout = max(0.0, float(getattr(args, "no_progress_timeout", 120.0) or 0.0))
         if timeout <= 0:
             return
-        if time.time() - last_effective_progress_ts > timeout:
+        now_val = float(now_ts if now_ts is not None else time.time())
+        if now_val - last_effective_progress_ts > timeout:
             if session is not None:
                 session.abort("network_no_progress")
             raise TimeoutError(f"network_no_progress:{stage}")
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(args.sock_rcvbuf))
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(args.sock_sndbuf))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _effective_sockbuf_bytes(args, "sock_rcvbuf"))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _effective_sockbuf_bytes(args, "sock_sndbuf"))
         sock.bind((str(args.bind_ip), int(args.bind_port)))
         logger.info(f"Local socket: {sock.getsockname()}")
         logger.info(f"Receiver: {(args.server_ip, args.server_port)}")
@@ -684,7 +772,13 @@ def run_client(args: argparse.Namespace) -> int:
         )
         session.configure_app_delivery(len_only=False, small_payload_threshold=0)
         session.recovery_pacing_enabled = True
-        session.send_max_unacked_pkts = max(0, int(args.max_unacked_pkts or 0))
+        session.send_max_unacked_pkts = _effective_max_unacked_pkts(args)
+        session.configure_lan_bulk_pacing(
+            burst_pkts=int(getattr(args, "lan_pacing_burst_pkts", 32) or 32),
+            interval_ms=float(getattr(args, "lan_pacing_interval_ms", 5.0) or 5.0),
+            payload_size=int(getattr(args, "payload_size", 1400) or 1400),
+        )
+        session.configure_reorder_tolerance(int(getattr(args, "reorder_tolerance_pkts", 128) or 128))
 
         min_data_rto = max(0.05, float(args.min_data_rto_sec or 0.2))
         max_data_rto = max(min_data_rto, float(args.max_data_rto_sec or 4.0))
@@ -714,6 +808,18 @@ def run_client(args: argparse.Namespace) -> int:
         session.start_threads(start_receiver=True)
         _wait_for_handshake(session, args, logger, validator=validator)
         note_effective_progress()
+        logger.info(build_transfer_started_log(
+            conn_id=int(getattr(session, "conn_id", 0) or 0),
+            chat_message_id=str(getattr(args, "chat_message_id", "") or ""),
+            file_name=input_file.name,
+            direction="outgoing",
+            peer=f"{args.server_ip}:{args.server_port}",
+            total_bytes=int(total_bytes),
+            payload_size=int(payload_size),
+            sock_sndbuf=int(_effective_sockbuf_bytes(args, "sock_sndbuf")),
+            sock_rcvbuf=int(_effective_sockbuf_bytes(args, "sock_rcvbuf")),
+            status="started",
+        ))
 
         def send_payload(seq: int, payload: bytes) -> None:
             if session.has_fatal_error():
@@ -724,26 +830,150 @@ def run_client(args: argparse.Namespace) -> int:
             session.send_app_data(seq, payload)
 
         def report(force: bool = False) -> None:
-            nonlocal last_report_ts, last_report_bytes
+            nonlocal last_report_ts, last_report_bytes, last_json_ts, last_json_bytes, peak_mbps, last_lan_stats_ts, last_lan_sent_pkts, last_lan_acked_pkts, last_lan_retx_pkts, last_lan_wire_bytes_sent, last_lan_bulk_sent_pkts, last_lan_bulk_blocked_pacing, last_lan_bulk_blocked_cwnd, last_lan_bulk_blocked_unacked, last_lan_ack_deleted_pkts, last_lan_ack_scan_pkts, last_lan_blocked_cc, last_lan_blocked_unacked, summary_lan_samples, summary_sent_pps_sum, summary_payload_mbps_sum, summary_wire_mbps_sum, summary_rtt_ms_sum, summary_rtt_ms_max, summary_retrans_total, summary_bulk_blocked_unacked_total, summary_bulk_sent_total, summary_bulk_budget_sum, summary_bulk_budget_max, summary_wifi_guard_entries, wifi_guard_active, wifi_guard_bad_streak, wifi_guard_good_streak
             now = time.time()
-            if not force and (now - last_report_ts) < float(args.stats_interval):
-                return
             elapsed = max(now - start_ts, 1e-6)
+            pct = (bytes_sent * 100.0 / total_bytes) if total_bytes > 0 else 100.0
+            remaining_bytes = max(int(total_bytes) - int(bytes_sent), 0)
+            unacked_count = session.get_unacked_count()
+            note_effective_progress(unacked_count, now)
+
+            json_due = force or (now - last_json_ts) >= float(getattr(args, "progress_json_interval", 0.2) or 0.2)
+            if json_due:
+                j_interval = max(now - last_json_ts, 1e-6)
+                j_delta = max(0, int(bytes_sent) - int(last_json_bytes))
+                current_mbps = (j_delta * 8.0) / j_interval / 1e6
+                avg_mbps = (bytes_sent * 8.0) / elapsed / 1e6
+                peak_mbps = max(float(peak_mbps or 0.0), current_mbps)
+                rate_bps = (j_delta / j_interval) if j_delta > 0 else ((bytes_sent / elapsed) if bytes_sent > 0 else 0.0)
+                eta_text = _format_duration(remaining_bytes / rate_bps) if rate_bps > 0 else "unknown"
+                logger.info(build_transfer_progress_log(
+                    conn_id=int(getattr(session, "conn_id", 0) or 0),
+                    chat_message_id=str(getattr(args, "chat_message_id", "") or ""),
+                    file_name=input_file.name,
+                    direction="outgoing",
+                    peer=f"{args.server_ip}:{args.server_port}",
+                    transferred_bytes=int(bytes_sent),
+                    total_bytes=int(total_bytes),
+                    pct=round(float(pct), 3),
+                    current_mbps=round(float(current_mbps), 3),
+                    avg_mbps=round(float(avg_mbps), 3),
+                    peak_mbps=round(float(peak_mbps), 3),
+                    elapsed_sec=round(float(elapsed), 3),
+                    eta=eta_text,
+                    status="transferring" if pct < 100.0 else "completed",
+                    unacked=int(unacked_count),
+                ))
+                last_json_ts = now
+                last_json_bytes = int(bytes_sent)
+
+            text_due = force or (now - last_report_ts) >= float(args.stats_interval)
+            if not text_due:
+                return
             interval = max(now - last_report_ts, 1e-6)
             avg_mbps = (bytes_sent * 8.0) / elapsed / 1e6
             int_mbps = ((bytes_sent - last_report_bytes) * 8.0) / interval / 1e6
-            pct = (bytes_sent * 100.0 / total_bytes) if total_bytes > 0 else 100.0
-            remaining_bytes = max(int(total_bytes) - int(bytes_sent), 0)
             interval_bytes = int(bytes_sent) - int(last_report_bytes)
             rate_bps = (interval_bytes / interval) if interval_bytes > 0 else ((bytes_sent / elapsed) if bytes_sent > 0 else 0.0)
             eta_text = _format_duration(remaining_bytes / rate_bps) if rate_bps > 0 else "unknown"
-            unacked_count = session.get_unacked_count()
-            note_effective_progress(unacked_count)
             logger.info(
                 f"Progress: {bytes_sent}/{total_bytes} bytes ({pct:.2f}%), "
                 f"pkts={pkts_sent}, avg={avg_mbps:.2f} Mbps, interval={int_mbps:.2f} Mbps, "
                 f"eta={eta_text}, unacked={unacked_count}"
             )
+            try:
+                snap = session.get_experiment_snapshot() if session is not None else {}
+                lan_interval = max(now - float(last_lan_stats_ts or start_ts), 1e-6)
+                sent_pkts_total = int(snap.get("data_packets_sent_original") or pkts_sent or 0)
+                acked_pkts_total = float(snap.get("total_app_bytes_acked") or 0.0) / max(float(payload_size), 1.0)
+                retx_total = int(snap.get("data_packets_retx_total") or 0)
+                wire_bytes_total = int(snap.get("total_wire_bytes_sent") or snap.get("data_wire_bytes_sent_total") or 0)
+                bulk_sent_total = int(snap.get("bulk_sent_pkts") or 0)
+                bulk_blocked_pacing_total = int(snap.get("bulk_blocked_pacing") or 0)
+                bulk_blocked_cwnd_total = int(snap.get("bulk_blocked_cwnd") or 0)
+                bulk_blocked_unacked_total = int(snap.get("bulk_blocked_unacked") or 0)
+                ack_deleted_total = int(snap.get("ack_deleted_pkts") or 0)
+                ack_scan_total = int(snap.get("ack_scan_pkts") or 0)
+                blocked_cc_total = int(snap.get("send_blocked_by_cc_count") or 0)
+                blocked_unacked_total = int(snap.get("send_blocked_by_unacked_count") or 0)
+                sent_pps = max(0.0, float(sent_pkts_total - int(last_lan_sent_pkts))) / lan_interval
+                ack_pps = max(0.0, float(acked_pkts_total - float(last_lan_acked_pkts))) / lan_interval
+                retrans = max(0, int(retx_total - int(last_lan_retx_pkts)))
+                wire_mbps = max(0.0, float(wire_bytes_total - int(last_lan_wire_bytes_sent)) * 8.0 / lan_interval / 1e6)
+                payload_mbps = max(0.0, float(sent_pps) * float(payload_size) * 8.0 / 1e6)
+                bulk_sent_delta = max(0, int(bulk_sent_total - int(last_lan_bulk_sent_pkts)))
+                bulk_blocked_pacing = max(0, int(bulk_blocked_pacing_total - int(last_lan_bulk_blocked_pacing)))
+                bulk_blocked_cwnd = max(0, int(bulk_blocked_cwnd_total - int(last_lan_bulk_blocked_cwnd)))
+                bulk_blocked_unacked = max(0, int(bulk_blocked_unacked_total - int(last_lan_bulk_blocked_unacked)))
+                ack_deleted_delta = max(0, int(ack_deleted_total - int(last_lan_ack_deleted_pkts)))
+                ack_scan_delta = max(0, int(ack_scan_total - int(last_lan_ack_scan_pkts)))
+                blocked_cc = max(0, int(blocked_cc_total - int(last_lan_blocked_cc)))
+                blocked_unacked = max(0, int(blocked_unacked_total - int(last_lan_blocked_unacked)))
+                cwnd = snap.get("cwnd")
+                cwnd_pkts = (float(cwnd) / max(float(payload_size), 1.0)) if cwnd is not None else 0.0
+                rtt_s = snap.get("srtt") or snap.get("ack1_srtt_s") or 0.0
+                rtt_ms = float(rtt_s or 0.0) * 1000.0
+                bulk_budget_now = int(snap.get("bulk_budget_pkts") or 0)
+
+                if sent_pkts_total > int(last_lan_sent_pkts):
+                    summary_lan_samples += 1
+                    summary_sent_pps_sum += float(sent_pps)
+                    summary_payload_mbps_sum += float(payload_mbps)
+                    summary_wire_mbps_sum += float(wire_mbps)
+                    summary_rtt_ms_sum += float(rtt_ms)
+                    summary_rtt_ms_max = max(float(summary_rtt_ms_max), float(rtt_ms))
+                    summary_retrans_total += int(retrans)
+                    summary_bulk_blocked_unacked_total += int(bulk_blocked_unacked)
+                    summary_bulk_sent_total += int(bulk_sent_delta)
+                    summary_bulk_budget_sum += float(bulk_budget_now)
+                    summary_bulk_budget_max = max(int(summary_bulk_budget_max), int(bulk_budget_now))
+
+                # Wi-Fi jitter guard: avoid keeping large bursts when the path
+                # shows queue inflation or a sudden retransmission spike.
+                jitter_bad = bool(rtt_ms >= 500.0 or retrans >= 32)
+                jitter_good = bool(rtt_ms > 0.0 and rtt_ms <= 250.0 and retrans <= 2)
+                if jitter_bad:
+                    wifi_guard_bad_streak += 1
+                    wifi_guard_good_streak = 0
+                elif jitter_good:
+                    wifi_guard_good_streak += 1
+                    wifi_guard_bad_streak = 0
+                else:
+                    wifi_guard_good_streak = 0
+
+                if (not wifi_guard_active) and (wifi_guard_bad_streak >= 2 or retrans >= 32):
+                    wifi_guard_active = True
+                    summary_wifi_guard_entries += 1
+                    _set_lan_burst(lan_guard_burst, reason=f"rtt_ms={rtt_ms:.1f}, retrans={retrans}")
+                elif wifi_guard_active and wifi_guard_good_streak >= 6:
+                    wifi_guard_active = False
+                    _set_lan_burst(lan_base_burst, reason=f"stable_rtt_ms={rtt_ms:.1f}, retrans={retrans}")
+
+                logger.info(
+                    f"LAN_STATS payload_size={int(payload_size)}, payload_mbps={payload_mbps:.2f}, wire_mbps={wire_mbps:.2f}, "
+                    f"unacked={int(snap.get('unacked_pkts') or unacked_count or 0)}, inflight_bytes={int(snap.get('inflight_bytes') or 0)}, "
+                    f"cwnd_pkts={cwnd_pkts:.1f}, sent_pps={sent_pps:.1f}, ack_pps={ack_pps:.1f}, "
+                    f"retrans={retrans}, rtt={rtt_ms:.2f}ms, wifi_guard={int(bool(wifi_guard_active))}, lan_burst={int(lan_current_burst)}, "
+                    f"bulk_budget={int(bulk_budget_now)}, bulk_sent={bulk_sent_delta}, "
+                    f"bulk_blocked_pacing={bulk_blocked_pacing}, bulk_blocked_cwnd={bulk_blocked_cwnd}, bulk_blocked_unacked={bulk_blocked_unacked}, "
+                    f"ack_deleted={ack_deleted_delta}, ack_scan={ack_scan_delta}, inflight_repairs={int(snap.get('inflight_repair_count') or 0)}, "
+                    f"blocked_cc={blocked_cc}, blocked_unacked={blocked_unacked}"
+                )
+                last_lan_stats_ts = now
+                last_lan_sent_pkts = sent_pkts_total
+                last_lan_acked_pkts = acked_pkts_total
+                last_lan_retx_pkts = retx_total
+                last_lan_wire_bytes_sent = wire_bytes_total
+                last_lan_bulk_sent_pkts = bulk_sent_total
+                last_lan_bulk_blocked_pacing = bulk_blocked_pacing_total
+                last_lan_bulk_blocked_cwnd = bulk_blocked_cwnd_total
+                last_lan_bulk_blocked_unacked = bulk_blocked_unacked_total
+                last_lan_ack_deleted_pkts = ack_deleted_total
+                last_lan_ack_scan_pkts = ack_scan_total
+                last_lan_blocked_cc = blocked_cc_total
+                last_lan_blocked_unacked = blocked_unacked_total
+            except Exception as exc:
+                logger.info(f"LAN_STATS unavailable: {exc}")
             last_report_ts = now
             last_report_bytes = bytes_sent
 
@@ -774,20 +1004,77 @@ def run_client(args: argparse.Namespace) -> int:
         report(force=True)
 
         seq = SEQ_FIRST_BODY
+        read_chunk_bytes = max(int(payload_size), int(getattr(args, "file_read_chunk_mb", 4) or 4) * 1024 * 1024)
+        logger.info(f"Sender batch read enabled: read_chunk={read_chunk_bytes // (1024 * 1024)} MiB, payload={payload_size} bytes")
+        pending_tail = b""
+        loop_cached_now = time.time()
+        last_loop_check_ts = loop_cached_now
+        bulk_batch = []
+        bulk_batch_bytes = 0
+        bulk_batch_limit = 64
+
+        def flush_bulk_batch(force: bool = False) -> None:
+            nonlocal seq, bytes_sent, pkts_sent, bulk_batch, bulk_batch_bytes, loop_cached_now, last_loop_check_ts, last_effective_progress_ts
+            if not bulk_batch:
+                return
+            if (not force) and len(bulk_batch) < bulk_batch_limit:
+                return
+            if session.has_fatal_error():
+                raise RuntimeError(session.get_fatal_error() or "fatal protocol error")
+            if byte_pacer is not None:
+                try:
+                    byte_pacer.wait(sum(data_packet_wire_size(len(x)) for x in bulk_batch))
+                except Exception:
+                    # Fall back to per-batch best-effort pacing if a custom pacer rejects large waits.
+                    for x in bulk_batch:
+                        byte_pacer.wait(data_packet_wire_size(len(x)))
+            sent_n = int(session.bulk_send_app_data(seq, bulk_batch, priority="bulk"))
+            if sent_n != len(bulk_batch):
+                raise RuntimeError(f"bulk_send short send: {sent_n}/{len(bulk_batch)}")
+            seq += sent_n
+            bytes_sent += int(bulk_batch_bytes)
+            pkts_sent += sent_n
+            bulk_batch = []
+            bulk_batch_bytes = 0
+            if (pkts_sent & 31) == 0:
+                loop_cached_now = time.time()
+            if force or (pkts_sent & 63) == 0 or (loop_cached_now - last_loop_check_ts) >= 0.010:
+                last_effective_progress_ts = loop_cached_now
+                report(force=False)
+                check_no_progress("transferring", now_ts=loop_cached_now)
+                last_loop_check_ts = loop_cached_now
+
         with open(input_file, "rb") as f:
             if resume_offset > 0:
                 f.seek(resume_offset)
             while True:
-                chunk = f.read(payload_size)
-                if not chunk:
+                read_chunk = f.read(read_chunk_bytes)
+                if not read_chunk:
                     break
-                send_payload(seq, chunk)
-                bytes_sent += len(chunk)
-                pkts_sent += 1
-                seq += 1
-                last_effective_progress_ts = time.time()
-                report(force=False)
-                check_no_progress("transferring")
+
+                if pending_tail:
+                    send_block = pending_tail + read_chunk
+                    pending_tail = b""
+                else:
+                    send_block = read_chunk
+
+                full_len = (len(send_block) // int(payload_size)) * int(payload_size)
+                offset = 0
+                while offset < full_len:
+                    chunk = send_block[offset:offset + int(payload_size)]
+                    bulk_batch.append(chunk)
+                    bulk_batch_bytes += len(chunk)
+                    offset += len(chunk)
+                    if len(bulk_batch) >= bulk_batch_limit:
+                        flush_bulk_batch(force=True)
+
+                if full_len < len(send_block):
+                    pending_tail = send_block[full_len:]
+
+        if pending_tail:
+            bulk_batch.append(pending_tail)
+            bulk_batch_bytes += len(pending_tail)
+        flush_bulk_batch(force=True)
 
         if seq != seq_eof:
             raise AssertionError(f"seq mismatch: seq={seq}, expected={seq_eof}")
@@ -838,7 +1125,49 @@ def run_client(args: argparse.Namespace) -> int:
             raise RuntimeError(f"receiver COMPLETE mismatch: {complete_info}")
 
         elapsed = max(time.time() - start_ts, 1e-6)
-        logger.info(f"Transfer complete: {bytes_sent} bytes in {elapsed:.3f}s, avg={((max(0, bytes_sent - resume_offset)) * 8.0 / elapsed / 1e6):.2f} Mbps")
+        final_avg = ((max(0, bytes_sent - resume_offset)) * 8.0 / elapsed / 1e6)
+        try:
+            final_snap = session.get_experiment_snapshot() if session is not None else {}
+        except Exception:
+            final_snap = {}
+        sample_n = max(1, int(summary_lan_samples or 0))
+        summary_avg_sent_pps = float(summary_sent_pps_sum) / float(sample_n)
+        summary_avg_payload_mbps = float(summary_payload_mbps_sum) / float(sample_n)
+        summary_avg_wire_mbps = float(summary_wire_mbps_sum) / float(sample_n)
+        summary_avg_rtt_ms = float(summary_rtt_ms_sum) / float(sample_n)
+        summary_avg_bulk_budget = float(summary_bulk_budget_sum) / float(sample_n)
+        final_unacked = int(final_snap.get("unacked_pkts") or 0)
+        final_inflight_repairs = int(final_snap.get("inflight_repair_count") or 0)
+        final_retrans_total = int(final_snap.get("data_packets_retx_total") or summary_retrans_total or 0)
+        final_bulk_blocked_unacked_total = int(final_snap.get("bulk_blocked_unacked") or summary_bulk_blocked_unacked_total or 0)
+        logger.info(
+            "SUMMARY_STATS "
+            f"avg_mbps={final_avg:.3f}, peak_mbps={float(peak_mbps or 0.0):.3f}, elapsed_sec={elapsed:.3f}, "
+            f"samples={int(summary_lan_samples)}, avg_sent_pps={summary_avg_sent_pps:.1f}, "
+            f"avg_payload_mbps={summary_avg_payload_mbps:.2f}, avg_wire_mbps={summary_avg_wire_mbps:.2f}, "
+            f"avg_rtt_ms={summary_avg_rtt_ms:.2f}, max_rtt_ms={float(summary_rtt_ms_max):.2f}, "
+            f"retrans_total={int(final_retrans_total)}, bulk_blocked_unacked_total={int(final_bulk_blocked_unacked_total)}, "
+            f"bulk_sent_total={int(summary_bulk_sent_total)}, avg_bulk_budget={summary_avg_bulk_budget:.1f}, "
+            f"max_bulk_budget={int(summary_bulk_budget_max)}, wifi_guard_entries={int(summary_wifi_guard_entries)}, "
+            f"final_lan_burst={int(lan_current_burst)}, final_unacked={final_unacked}, inflight_repairs={final_inflight_repairs}"
+        )
+        logger.info(build_transfer_complete_log(
+            conn_id=int(getattr(session, "conn_id", 0) or 0),
+            chat_message_id=str(getattr(args, "chat_message_id", "") or ""),
+            file_name=input_file.name,
+            direction="outgoing",
+            peer=f"{args.server_ip}:{args.server_port}",
+            transferred_bytes=int(bytes_sent),
+            total_bytes=int(total_bytes),
+            pct=100.0,
+            current_mbps=0.0,
+            avg_mbps=round(float(final_avg), 3),
+            peak_mbps=round(float(peak_mbps), 3),
+            elapsed_sec=round(float(elapsed), 3),
+            eta="0:00",
+            status="completed",
+        ))
+        logger.info(f"Transfer complete: {bytes_sent} bytes in {elapsed:.3f}s, avg={final_avg:.2f} Mbps")
         return 0
 
     finally:

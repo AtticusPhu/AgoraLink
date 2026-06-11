@@ -49,6 +49,23 @@ def user_data_dir() -> Path:
     return path
 
 
+def debug_log_dir() -> Path:
+    path = user_data_dir() / "debug"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def append_worker_debug_log(role: str, line: str) -> None:
+    try:
+        path = debug_log_dir() / f"{str(role or 'worker')}_worker.log"
+        with path.open("a", encoding="utf-8", errors="replace") as f:
+            f.write(str(line or ""))
+            if line and not str(line).endswith("\n"):
+                f.write("\n")
+    except Exception:
+        pass
+
+
 def receiver_pin_file(ip: str, port: int) -> Path:
     """Return the per-receiver TOFU pin path used by the sender role.
 
@@ -166,13 +183,22 @@ def run_worker(argv: List[str]) -> int:
         import server
         parser = server.build_argparser()
         args = parser.parse_args(worker_args)
-        receiver = server.RUDPFileReceiver(args)
+        receiver = None
+        logger = server.setup_logger("RUDP-Receiver")
         try:
+            receiver = server.RUDPFileReceiver(args)
             receiver.start()
         except KeyboardInterrupt:
             return 130
+        except OSError as exc:
+            logger.error(f"Fatal: receiver_start_failed: {exc}")
+            return 2
+        except Exception as exc:
+            logger.error(f"Fatal: receiver_start_failed: {exc}")
+            return 2
         finally:
-            receiver.stop()
+            if receiver is not None:
+                receiver.stop()
         return 0
     print(f"unknown worker role: {role}", file=sys.stderr)
     return 2
@@ -214,6 +240,11 @@ from file_transfer_common import (
     CONTACT_RESPONSE_LOG_PREFIX,
     DEFAULT_DISCOVERY_PORT,
     TRANSFER_REQUEST_LOG_PREFIX,
+    TRANSFER_STARTED_LOG_PREFIX,
+    TRANSFER_PROGRESS_LOG_PREFIX,
+    TRANSFER_SAVED_LOG_PREFIX,
+    TRANSFER_COMPLETE_LOG_PREFIX,
+    TRANSFER_FAILED_LOG_PREFIX,
     USER_ERROR_LOG_PREFIX,
     USER_STATUS_LOG_PREFIX,
     discover_receivers,
@@ -862,6 +893,7 @@ class WorkerProcess:
         assert self.proc is not None
         try:
             for line in self.proc.stdout or []:
+                append_worker_debug_log(self.role, line)
                 self.log_callback(line)
                 if self.progress_callback is not None:
                     self._try_progress(line)
@@ -905,23 +937,46 @@ class WorkerProcess:
         assert self.proc is not None
         try:
             self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3.0)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
         except Exception:
             pass
 
 
 class LogBox(BoxLayout):
+    MAX_LINES = 1000
+
     def __init__(self, **kwargs):
         super().__init__(orientation="vertical", **kwargs)
         self.text = make_input(readonly=True, multiline=True, size_hint_y=1, background_color=THEME["log_bg"], foreground_color=THEME["log_text"], cursor_color=THEME["log_text"])
+        self._lines: List[str] = []
         self.add_widget(self.text)
 
     def append(self, s: str) -> None:
+        raw = str(s or "")
+        if not raw:
+            return
         def _append(_dt):
-            self.text.text += s
-            self.text.cursor = (0, len(self.text.text.splitlines()))
+            try:
+                parts = raw.splitlines()
+                if raw.endswith("\n"):
+                    parts.append("")
+                self._lines.extend(parts)
+                if len(self._lines) > self.MAX_LINES:
+                    self._lines = self._lines[-self.MAX_LINES:]
+                self.text.text = "\n".join(self._lines)
+                self.text.cursor = (0, len(self._lines))
+            except Exception:
+                pass
         Clock.schedule_once(_append, 0)
 
     def clear(self) -> None:
+        self._lines = []
         self.text.text = ""
 
 
@@ -1028,6 +1083,8 @@ class ChatMessageBox(BoxLayout):
         if not mine:
             return "", THEME["muted_text"]
         s = str(summary or "").lower()
+        if "transferring" in s or "sending_file" in s or "receiving_file" in s or "queued_file" in s:
+            return "", THEME["muted_text"]
         if "failed" in s:
             return "!", THEME["danger"]
         m_read = re.search(r"read\s+(\d+)/(\d+)", s)
@@ -1091,6 +1148,9 @@ class ChatMessageBox(BoxLayout):
             pct = float(row.get("pct") or ((sent * 100.0 / total) if total else 0.0))
             state = str(row.get("status") or "")
             avg = row.get("avg_mbps")
+            current = row.get("current_mbps")
+            peak = row.get("peak_mbps")
+            elapsed = row.get("elapsed_sec")
             eta = str(row.get("eta") or "")
         else:
             sent = int(prog.get("sent") or 0)
@@ -1098,6 +1158,9 @@ class ChatMessageBox(BoxLayout):
             pct = float(prog.get("pct") or ((sent * 100.0 / total) if total else 0.0))
             state = str(prog.get("state") or "")
             avg = prog.get("avg")
+            current = prog.get("current")
+            peak = prog.get("peak")
+            elapsed = prog.get("elapsed")
             eta = str(prog.get("eta") or "")
 
         # If the received file exists and is playable/openable, the visual card
@@ -1116,12 +1179,27 @@ class ChatMessageBox(BoxLayout):
 
         failed = "failed" in str(summary or "").lower() or "失败" in state or "failed" in state.lower()
         complete = pct >= 99.9 or state in ("completed", "received", self._cu("completed"), self._cu("received")) or "read" in str(summary or "").lower()
-        rate_part = f"  {float(avg):.2f} Mbps" if avg not in (None, "", 0) else ""
-        eta_part = f"  ETA {eta}" if eta and eta != "unknown" else ""
+        def _mbps(v) -> str:
+            try:
+                return f"{float(v):.1f}"
+            except Exception:
+                return "0.0"
+        current_part = f"Cur {_mbps(current)} Mbps" if current not in (None, "", 0) else ""
+        avg_part = f"Avg {_mbps(avg)} Mbps" if avg not in (None, "", 0) else ""
+        peak_part = f"Peak {_mbps(peak)} Mbps" if peak not in (None, "", 0) else ""
+        elapsed_part = ""
+        try:
+            if elapsed not in (None, "", 0):
+                elapsed_part = f"{float(elapsed):.1f}s"
+        except Exception:
+            elapsed_part = ""
+        eta_part = f"ETA {eta}" if eta and eta != "unknown" else ""
+        metric_line = " · ".join([x for x in (current_part, avg_part, peak_part, elapsed_part, eta_part) if x])
         if total > 0:
-            detail = f"{format_file_size(sent)} / {format_file_size(total)}{rate_part}{eta_part}" if sent > 0 and not complete else format_file_size(total)
+            size_line = f"{format_file_size(sent)} / {format_file_size(total)}" if sent > 0 and not complete else format_file_size(total)
+            detail = f"{size_line}  {metric_line}" if metric_line else size_line
         else:
-            detail = self._cu("unknown_size")
+            detail = metric_line or self._cu("unknown_size")
         return max(0.0, min(100.0, pct)), bool(failed), bool(complete), detail
 
 
@@ -1192,7 +1270,8 @@ class ChatMessageBox(BoxLayout):
                 btn = make_button("secondary", text=self._cu("open_folder") if file_path else self._cu("waiting_saved"), size_hint_y=None, height=dp(28), on_release=lambda *_p, path=file_path: open_file_location(path))
                 btn.disabled = not bool(file_path)
                 bubble.add_widget(btn)
-            self._add_footer(bubble, mine=mine, timestamp=timestamp, summary=summary)
+            footer_summary = summary if (complete or failed) else "transferring"
+            self._add_footer(bubble, mine=mine, timestamp=timestamp, summary=footer_summary)
         else:
             # Label wrapping must be width-only. If height is included in text_size,
             # Kivy can clip long text and wrap too aggressively.
@@ -1256,6 +1335,11 @@ class RUDPTransferRoot(BoxLayout):
         self.live_message_cache: Dict[str, List[Dict[str, object]]] = {}
         self.debug_protocol_lines: List[str] = []
         self.debug_runtime_lines: List[str] = []
+        self.last_transfer_state: Dict[str, Dict[str, object]] = {}
+        self._transfer_store_write_bytes: Dict[str, int] = {}
+        self._transfer_refresh_scheduled = False
+        self._last_transfer_card_refresh_ts = 0.0
+        self._last_transfer_progress_line = ""
         # Deduplicate the receiver's two log lines for one chat frame:
         #   CHAT_MESSAGE_JSON:{...}
         #   Chat from sender: text
@@ -1268,7 +1352,7 @@ class RUDPTransferRoot(BoxLayout):
         self.refresh_local_ips()
         Clock.schedule_interval(self.poll_approval_requests, 0.5)
         Clock.schedule_interval(self.poll_contact_requests, 0.5)
-        Clock.schedule_interval(lambda _dt: self._auto_refresh_current_chat(), 0.35)
+        Clock.schedule_interval(lambda _dt: self._auto_refresh_current_chat(), 0.5)
         Clock.schedule_once(lambda _dt: self.show_startup_unlock_popup(), 0.2)
 
     def t(self, key: str, **kwargs) -> str:
@@ -1337,7 +1421,7 @@ class RUDPTransferRoot(BoxLayout):
         self.receiver_spinner = style_spinner(Spinner(text="", values=[], font_name=UI_FONT))
         self.receiver_spinner.bind(text=self.on_receiver_selected)
         self.file_input = make_input(text="", multiline=False)
-        self.payload_input = make_input(text="1300", multiline=False, input_filter="int")
+        self.payload_input = make_input(text="1400", multiline=False, input_filter="int")
         self.complete_timeout_input = make_input(text="180", multiline=False, input_filter="float")
         self.request_timeout_input = make_input(text="300", multiline=False, input_filter="float")
         self.manual_hint = make_label(size_hint_y=None, height=dp(30), halign="left", valign="middle", shorten=True)
@@ -2231,14 +2315,14 @@ class RUDPTransferRoot(BoxLayout):
                     "SELECT COUNT(*) AS n, COALESCE(MAX(created_at),0) AS t, COALESCE(MAX(delivered_at),0) AS d, COALESCE(MAX(read_at),0) AS r FROM messages WHERE group_id=?",
                     (self.current_group_id,),
                 ).fetchone()
-                return ("group", self.current_group_id, int(row["n"] or 0), float(row["t"] or 0), float(row["d"] or 0), float(row["r"] or 0), json.dumps(self.file_message_progress, sort_keys=True), self._transfer_store_tick())
+                return ("group", self.current_group_id, int(row["n"] or 0), float(row["t"] or 0), float(row["d"] or 0), float(row["r"] or 0))
             if self.current_chat_mode == "direct" and self.current_peer_id:
                 conv = self.message_service.create_direct_conversation(self.current_peer_id)
                 row = store.db.conn.execute(
                     "SELECT COUNT(*) AS n, COALESCE(MAX(created_at),0) AS t, COALESCE(MAX(delivered_at),0) AS d, COALESCE(MAX(read_at),0) AS r FROM messages WHERE conversation_id=?",
                     (conv,),
                 ).fetchone()
-                return ("direct", conv, int(row["n"] or 0), float(row["t"] or 0), float(row["d"] or 0), float(row["r"] or 0), json.dumps(self.file_message_progress, sort_keys=True), self._transfer_store_tick())
+                return ("direct", conv, int(row["n"] or 0), float(row["t"] or 0), float(row["d"] or 0), float(row["r"] or 0))
         except Exception:
             return None
         return None
@@ -2926,7 +3010,8 @@ class RUDPTransferRoot(BoxLayout):
         log.append(
             "调试日志入口\n\n"
             "B 端接收日志查看方式：设置 / 调试 -> 本窗口下方日志。\n"
-            "重点搜索：CHAT_MESSAGE_JSON、TRANSFER_REQUEST_JSON、Session saved、end reason=complete。\n\n"
+            "重点搜索：CHAT_MESSAGE_JSON、TRANSFER_REQUEST_JSON、Session saved、end reason=complete、LAN_STATS。\n"
+            "性能测试：发送端日志搜索 LAN_STATS，重点看 payload_size / payload_mbps / wire_mbps / unacked / inflight_bytes / cwnd_pkts / sent_pps / ack_pps / retrans / rtt / bulk_budget / bulk_sent / bulk_blocked_* / ack_deleted / ack_scan / blocked_cc / blocked_unacked。若设置窗口日志为空，可查看本机 AppData\\Local\\AgoraLink\\debug\\sender_worker.log。\n\n"
             "=== 协议日志 / Protocol ===\n"
             + protocol_text[-12000:] +
             "\n\n=== 运行日志 / Runtime ===\n"
@@ -3686,46 +3771,114 @@ class RUDPTransferRoot(BoxLayout):
     def _run_file_sender_with_progress(self, *, args: List[str], message_id: str, peer_id: str, total_size: int = 0) -> bool:
         cmd = ([sys.executable] + args) if FROZEN else ([sys.executable, str(Path(__file__).resolve())] + args)
         mid = str(message_id or "")
-        if mid:
-            self.file_message_progress[mid] = {"sent": 0, "total": int(total_size or 0), "pct": 0.0, "state": self.cu("sending_to", peer=peer_id)}
-            if self.file_transfer_service is not None:
-                self.file_transfer_service.update_progress(chat_message_id=mid, direction="outgoing", peer_id=peer_id, transferred_bytes=0, total_bytes=int(total_size or 0), pct=0.0, status="transferring")
-
-            Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
         try:
-            proc = subprocess.Popen(cmd, cwd=str(APP_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+            if mid:
+                self.file_message_progress[mid] = {
+                    "sent": 0,
+                    "total": int(total_size or 0),
+                    "pct": 0.0,
+                    "state": self.cu("sending_to", peer=peer_id),
+                }
+                # Do not write SQLite here from the sender worker thread. The outgoing
+                # task was already created before transfer start; progress persistence is
+                # handled by TRANSFER_*_JSON on the UI thread.
+                self._schedule_transfer_card_refresh(force=True)
+
+            try:
+                self.sender_log_box.append(f"Starting file transfer worker: message_id={mid}, peer={peer_id}, size={int(total_size or 0)}\n")
+            except Exception:
+                pass
+
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(APP_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
             assert proc.stdout is not None
             for line in proc.stdout:
-                try:
-                    self.sender_log_box.append(line)
-                except Exception:
-                    pass
+                is_progress = self._is_transfer_progress_line(line)
+                if not is_progress:
+                    try:
+                        self.sender_log_box.append(line)
+                    except Exception:
+                        pass
+                self._append_debug_line(line, protocol=any(marker in str(line or "") for marker in (
+                    TRANSFER_STARTED_LOG_PREFIX,
+                    TRANSFER_PROGRESS_LOG_PREFIX,
+                    TRANSFER_SAVED_LOG_PREFIX,
+                    TRANSFER_COMPLETE_LOG_PREFIX,
+                    TRANSFER_FAILED_LOG_PREFIX,
+                    USER_ERROR_LOG_PREFIX,
+                    "LAN_STATS ",
+                )))
+                tev = self._parse_transfer_event_line(line)
+                if tev and mid:
+                    try:
+                        Clock.schedule_once(lambda _dt, data=tev: self._handle_transfer_event_ui(data, source="sender"), 0)
+                    except Exception:
+                        pass
+                    continue
                 m = PROGRESS_RE.search(line)
                 if m and mid:
                     sent = int(m.group("sent"))
                     total = int(m.group("total") or total_size or 0)
                     pct = float(m.group("pct") or ((sent * 100.0 / total) if total else 0.0))
-                    self.file_message_progress[mid] = {"sent": sent, "total": total, "pct": pct, "avg": float(m.group("avg") or 0.0), "eta": m.group("eta") or "", "state": self.cu("sending_to", peer=peer_id)}
-                    if self.file_transfer_service is not None:
-                        self.file_transfer_service.update_progress(chat_message_id=mid, direction="outgoing", peer_id=peer_id, transferred_bytes=sent, total_bytes=total, pct=pct, avg_mbps=float(m.group("avg") or 0.0), eta=m.group("eta") or "", status="transferring")
+                    self.file_message_progress[mid] = {
+                        "sent": sent,
+                        "total": total,
+                        "pct": pct,
+                        "avg": float(m.group("avg") or 0.0),
+                        "eta": m.group("eta") or "",
+                        "state": self.cu("sending_to", peer=peer_id),
+                    }
+                    self._schedule_transfer_card_refresh(force=False)
 
-                    Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
             rc = proc.wait(timeout=5)
             if mid:
                 final_total = int(total_size or self.file_message_progress.get(mid, {}).get("total") or 0)
-                self.file_message_progress[mid] = {"sent": final_total, "total": final_total, "pct": 100.0 if rc == 0 else float(self.file_message_progress.get(mid, {}).get("pct") or 0.0), "avg": self.file_message_progress.get(mid, {}).get("avg", 0.0), "eta": "0:00" if rc == 0 else self.file_message_progress.get(mid, {}).get("eta", ""), "state": self.cu("completed") if rc == 0 else self.cu("failed")}
+                self.file_message_progress[mid] = {
+                    "sent": final_total if rc == 0 else int(self.file_message_progress.get(mid, {}).get("sent") or 0),
+                    "total": final_total,
+                    "pct": 100.0 if rc == 0 else float(self.file_message_progress.get(mid, {}).get("pct") or 0.0),
+                    "avg": self.file_message_progress.get(mid, {}).get("avg", 0.0),
+                    "eta": "0:00" if rc == 0 else self.file_message_progress.get(mid, {}).get("eta", ""),
+                    "state": self.cu("completed") if rc == 0 else self.cu("failed"),
+                }
                 if self.file_transfer_service is not None:
-                    self.file_transfer_service.update_progress(chat_message_id=mid, direction="outgoing", peer_id=peer_id, transferred_bytes=final_total if rc == 0 else int(self.file_message_progress.get(mid, {}).get("sent") or 0), total_bytes=final_total, pct=100.0 if rc == 0 else float(self.file_message_progress.get(mid, {}).get("pct") or 0.0), avg_mbps=float(self.file_message_progress.get(mid, {}).get("avg") or 0.0), eta="0:00" if rc == 0 else str(self.file_message_progress.get(mid, {}).get("eta") or ""), status="completed" if rc == 0 else "failed", error="" if rc == 0 else "file_send_failed")
-
-                Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+                    try:
+                        self.file_transfer_service.update_progress(
+                            chat_message_id=mid,
+                            direction="outgoing",
+                            peer_id=peer_id,
+                            transferred_bytes=final_total if rc == 0 else int(self.file_message_progress.get(mid, {}).get("sent") or 0),
+                            total_bytes=final_total,
+                            pct=100.0 if rc == 0 else float(self.file_message_progress.get(mid, {}).get("pct") or 0.0),
+                            avg_mbps=float(self.file_message_progress.get(mid, {}).get("avg") or 0.0),
+                            eta="0:00" if rc == 0 else str(self.file_message_progress.get(mid, {}).get("eta") or ""),
+                            status="completed" if rc == 0 else "failed",
+                            error="" if rc == 0 else "file_send_failed",
+                        )
+                    except Exception as exc:
+                        self._append_debug_line(f"final transfer_store update failed: {exc}", protocol=True)
+                self._schedule_transfer_card_refresh(force=True)
             return int(rc or 0) == 0
         except Exception as exc:
+            try:
+                self.sender_log_box.append(f"File transfer worker failed before/while running: {exc}\n")
+                self._append_debug_line(f"File transfer worker failed: {exc}", protocol=True)
+            except Exception:
+                pass
             if mid:
                 old = self.file_message_progress.get(mid, {})
-                old.update({'state': f'{self.cu("failed")}: {exc}'})
+                old.update({"state": f'{self.cu("failed")}: {exc}'})
                 self.file_message_progress[mid] = old
-                Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+                self._schedule_transfer_card_refresh(force=True)
             return False
+
 
     def send_file_to_current_chat(self) -> None:
         if self.current_chat_mode not in ("direct", "group"):
@@ -3864,6 +4017,16 @@ class RUDPTransferRoot(BoxLayout):
                     "--file", path,
                     "--server-pin-file", pin_file,
                     "--request-timeout", "300",
+                    "--complete-timeout", "180",
+                    "--final-ack-timeout", "180",
+                    "--no-progress-timeout", "120",
+                    "--stats-interval", "1",
+                    "--payload-size", "1400",
+                    "--file-read-chunk-mb", "4",
+                    "--max-unacked-pkts", "1152",
+                    "--lan-pacing-burst-pkts", "32",
+                    "--lan-pacing-interval-ms", "5",
+                    "--reorder-tolerance-pkts", "128",
                     "--chat-message-id", chat_message_id,
                     "--chat-conversation-id", chat_conversation_id,
                     "--chat-group-id", chat_group_id,
@@ -3951,7 +4114,7 @@ class RUDPTransferRoot(BoxLayout):
             "--server-ip", ip,
             "--server-port", str(port_num),
             "--file", file_path,
-            "--payload-size", self.payload_input.text.strip() or "1300",
+            "--payload-size", self.payload_input.text.strip() or "1400",
             "--complete-timeout", self.complete_timeout_input.text.strip() or "180",
             "--final-ack-timeout", self.complete_timeout_input.text.strip() or "180",
             "--request-timeout", self.request_timeout_input.text.strip() or "300",
@@ -4023,6 +4186,7 @@ class RUDPTransferRoot(BoxLayout):
             "--approval-dir", str(approval_dir),
             "--approval-timeout", approval_timeout_text,
             "--idle-timeout", idle_timeout_text,
+            "--max-unacked-pkts", "1152",
         ]
         if self.chat_store is not None:
             args += ["--chat-db", self.chat_db_path, "--chat-password", self.chat_password, "--chat-local-peer-id", self.chat_local_peer_id, "--chat-local-nickname", self.chat_nickname, "--contact-approval-dir", str(self.contact_approval_dir)]
@@ -4102,12 +4266,19 @@ class RUDPTransferRoot(BoxLayout):
         return False
 
     def sender_log(self, text: str) -> None:
+        is_progress = self._is_transfer_progress_line(text)
         self._append_debug_line(text, protocol=any(marker in str(text or "") for marker in (
             CHAT_MESSAGE_LOG_PREFIX, CHAT_ACK_LOG_PREFIX, CHAT_READ_LOG_PREFIX,
             CONTACT_REQUEST_LOG_PREFIX, CONTACT_RESPONSE_LOG_PREFIX, TRANSFER_REQUEST_LOG_PREFIX,
-            USER_ERROR_LOG_PREFIX, USER_STATUS_LOG_PREFIX,
+            TRANSFER_STARTED_LOG_PREFIX, TRANSFER_PROGRESS_LOG_PREFIX,
+            TRANSFER_SAVED_LOG_PREFIX, TRANSFER_COMPLETE_LOG_PREFIX, TRANSFER_FAILED_LOG_PREFIX,
+            USER_ERROR_LOG_PREFIX, USER_STATUS_LOG_PREFIX, "LAN_STATS ", "SUMMARY_STATS ", "WIFI_GUARD ",
         )))
-        self.sender_log_box.append(text)
+        tev = self._parse_transfer_event_line(text)
+        if tev:
+            Clock.schedule_once(lambda _dt, data=tev: self._handle_transfer_event_ui(data, source="sender"), 0)
+        if not is_progress:
+            self.sender_log_box.append(text)
         self._try_parse_user_event(text, "sender")
         if CONTACT_RESPONSE_LOG_PREFIX in text:
             try:
@@ -4116,6 +4287,7 @@ class RUDPTransferRoot(BoxLayout):
                 self._handle_contact_response(obj)
             except Exception as exc:
                 self.sender_log_box.append(f"Failed to parse contact response: {exc}\n")
+
 
     def poll_approval_requests(self, _dt=None) -> bool:
         try:
@@ -4397,9 +4569,11 @@ class RUDPTransferRoot(BoxLayout):
             except Exception:
                 pass
 
-    def _handle_receiver_complete_ui(self) -> None:
+    def _handle_receiver_complete_ui(self, message_id: str = "") -> None:
         try:
             mids = set()
+            if message_id:
+                mids.add(str(message_id))
             if self.current_receiving_file_message_id:
                 mids.add(str(self.current_receiving_file_message_id))
             for _conn, _mid in list(self.receiving_file_message_by_conn.items()):
@@ -4490,9 +4664,14 @@ class RUDPTransferRoot(BoxLayout):
             s = str(line or "").rstrip("\n")
             if not s:
                 return
+            # TRANSFER_PROGRESS_JSON is high-frequency during large transfers.
+            # Keep only the latest copy in memory; do not append it to LogBox/debug lists.
+            if TRANSFER_PROGRESS_LOG_PREFIX in s:
+                self._last_transfer_progress_line = s
+                return
             self.debug_runtime_lines.append(s)
-            if len(self.debug_runtime_lines) > 600:
-                self.debug_runtime_lines = self.debug_runtime_lines[-600:]
+            if len(self.debug_runtime_lines) > 1000:
+                self.debug_runtime_lines = self.debug_runtime_lines[-1000:]
             if protocol or any(marker in s for marker in (
                 CHAT_MESSAGE_LOG_PREFIX,
                 CHAT_ACK_LOG_PREFIX,
@@ -4500,14 +4679,20 @@ class RUDPTransferRoot(BoxLayout):
                 CONTACT_REQUEST_LOG_PREFIX,
                 CONTACT_RESPONSE_LOG_PREFIX,
                 TRANSFER_REQUEST_LOG_PREFIX,
+                TRANSFER_STARTED_LOG_PREFIX,
+                TRANSFER_SAVED_LOG_PREFIX,
+                TRANSFER_COMPLETE_LOG_PREFIX,
+                TRANSFER_FAILED_LOG_PREFIX,
                 USER_ERROR_LOG_PREFIX,
                 USER_STATUS_LOG_PREFIX,
+                "LAN_STATS ",
             )):
                 self.debug_protocol_lines.append(s)
-                if len(self.debug_protocol_lines) > 600:
-                    self.debug_protocol_lines = self.debug_protocol_lines[-600:]
+                if len(self.debug_protocol_lines) > 1000:
+                    self.debug_protocol_lines = self.debug_protocol_lines[-1000:]
         except Exception:
             pass
+
 
     def _live_cache_key_for_message(self, obj: Dict[str, object]) -> str:
         group_id = str(obj.get("group_id") or "")
@@ -4575,13 +4760,184 @@ class RUDPTransferRoot(BoxLayout):
         except Exception:
             return []
 
+    def _is_transfer_progress_line(self, text: str) -> bool:
+        return TRANSFER_PROGRESS_LOG_PREFIX in str(text or "")
+
+    def _transfer_key_for_event(self, mid: str, direction: str, peer_id: str) -> str:
+        return f"{str(mid or '')}:{str(direction or '')}:{str(peer_id or '')}"
+
+    def _should_persist_transfer_event(self, *, mid: str, direction: str, peer_id: str, transferred: int, status: str) -> bool:
+        if not mid:
+            return False
+        if status in ("received", "completed", "failed", "saved"):
+            return True
+        key = self._transfer_key_for_event(mid, direction, peer_id)
+        last = int(self._transfer_store_write_bytes.get(key, 0) or 0)
+        if int(transferred or 0) - last >= 16 * 1024 * 1024:
+            self._transfer_store_write_bytes[key] = int(transferred or 0)
+            return True
+        return False
+
+    def _schedule_transfer_card_refresh(self, *, force: bool = False) -> None:
+        def _refresh(_dt):
+            try:
+                self._transfer_refresh_scheduled = False
+                self._last_transfer_card_refresh_ts = time.time()
+                self._force_chat_refresh()
+            except Exception:
+                pass
+
+        if force:
+            # This method is often called from worker threads. All Kivy widget
+            # and canvas updates must be marshalled back to the main thread.
+            self._transfer_refresh_scheduled = False
+            Clock.schedule_once(_refresh, 0)
+            return
+
+        if self._transfer_refresh_scheduled:
+            return
+        now = time.time()
+        delay = max(0.0, 0.5 - (now - float(self._last_transfer_card_refresh_ts or 0.0)))
+        self._transfer_refresh_scheduled = True
+        Clock.schedule_once(_refresh, delay)
+
+    def _parse_transfer_event_line(self, text: str) -> Dict[str, object]:
+        raw = str(text or "")
+        for prefix in (
+            TRANSFER_STARTED_LOG_PREFIX,
+            TRANSFER_PROGRESS_LOG_PREFIX,
+            TRANSFER_SAVED_LOG_PREFIX,
+            TRANSFER_COMPLETE_LOG_PREFIX,
+            TRANSFER_FAILED_LOG_PREFIX,
+        ):
+            if prefix in raw:
+                try:
+                    return json.loads(raw.split(prefix, 1)[1].strip())
+                except Exception:
+                    return {}
+        return {}
+
+    def _handle_transfer_event_ui(self, obj: Dict[str, object], *, source: str = "") -> bool:
+        if not isinstance(obj, dict) or not obj:
+            return False
+        typ = str(obj.get("type") or "")
+        if not typ.startswith("TRANSFER_"):
+            return False
+
+        mid = str(obj.get("chat_message_id") or "")
+        conn = int(obj.get("conn_id") or 0)
+        if conn and mid:
+            self.receiving_file_message_by_conn[conn] = mid
+            if source == "receiver":
+                self.current_receiving_file_message_id = mid
+
+        direction = str(obj.get("direction") or ("incoming" if source == "receiver" else "outgoing"))
+        peer_id = str(obj.get("peer_id") or "")
+        transferred = int(obj.get("transferred_bytes") or obj.get("bytes_recv") or obj.get("bytes_sent") or 0)
+        total = int(obj.get("total_bytes") or obj.get("size") or 0)
+        pct = float(obj.get("pct") or ((transferred * 100.0 / total) if total else 0.0))
+        current = float(obj.get("current_mbps") or obj.get("interval_mbps") or 0.0)
+        avg = float(obj.get("avg_mbps") or 0.0)
+        peak = float(obj.get("peak_mbps") or current or 0.0)
+        elapsed = float(obj.get("elapsed_sec") or 0.0)
+        eta = str(obj.get("eta") or "")
+        status = str(obj.get("status") or "").strip().lower() or "transferring"
+        if typ == "TRANSFER_STARTED":
+            status = "started"
+        elif typ == "TRANSFER_SAVED":
+            status = "received"
+        elif typ == "TRANSFER_COMPLETE":
+            status = "received" if direction == "incoming" else "completed"
+        elif typ == "TRANSFER_FAILED":
+            status = "failed"
+
+        if not mid:
+            return True
+
+        state_map = {
+            "started": self.cu("pending"),
+            "transferring": self.cu("receiving") if direction == "incoming" else self.cu("sending"),
+            "received": self.cu("received"),
+            "completed": self.cu("completed"),
+            "failed": self.cu("failed"),
+        }
+        latest = {
+            "sent": transferred,
+            "total": total,
+            "pct": pct,
+            "avg": avg,
+            "current": current,
+            "peak": peak,
+            "elapsed": elapsed,
+            "eta": eta,
+            "state": state_map.get(status, status),
+            "status": status,
+        }
+        self.file_message_progress[mid] = latest
+        self.last_transfer_state[mid] = dict(obj)
+        if len(self.last_transfer_state) > 200:
+            # Keep only recent states to prevent unbounded memory growth.
+            for k in list(self.last_transfer_state.keys())[:-200]:
+                self.last_transfer_state.pop(k, None)
+
+        persist = self._should_persist_transfer_event(
+            mid=mid,
+            direction=direction,
+            peer_id=peer_id,
+            transferred=transferred,
+            status=status,
+        )
+        if persist and self.file_transfer_service is not None:
+            try:
+                self.file_transfer_service.update_progress(
+                    chat_message_id=mid,
+                    direction=direction,
+                    peer_id=peer_id,
+                    transferred_bytes=transferred,
+                    total_bytes=total,
+                    pct=pct,
+                    avg_mbps=avg,
+                    current_mbps=current,
+                    peak_mbps=peak,
+                    elapsed_sec=elapsed,
+                    eta=eta,
+                    status=status,
+                    error=str(obj.get("error") or ""),
+                )
+            except Exception as exc:
+                self._append_debug_line(f"transfer_store update failed: {exc}", protocol=True)
+
+        saved_path = str(obj.get("save_path") or obj.get("local_path") or "")
+        if saved_path and self.message_service is not None and status in ("received", "completed"):
+            try:
+                self.message_service.bind_file_path(mid, saved_path)
+                if self.file_transfer_service is not None:
+                    self.file_transfer_service.bind_saved_path(mid, saved_path)
+            except Exception as exc:
+                self._append_debug_line(f"transfer saved-path bind failed: {exc}", protocol=True)
+
+        if status in ("received", "completed", "failed"):
+            self._schedule_transfer_card_refresh(force=True)
+            self._schedule_force_chat_refresh(0.5)
+        else:
+            self._schedule_transfer_card_refresh(force=False)
+        return True
+
+
     def receiver_log(self, text: str) -> None:
+        is_progress = self._is_transfer_progress_line(text)
         self._append_debug_line(text, protocol=any(marker in str(text or "") for marker in (
             CHAT_MESSAGE_LOG_PREFIX, CHAT_ACK_LOG_PREFIX, CHAT_READ_LOG_PREFIX,
             CONTACT_REQUEST_LOG_PREFIX, CONTACT_RESPONSE_LOG_PREFIX, TRANSFER_REQUEST_LOG_PREFIX,
-            USER_ERROR_LOG_PREFIX, USER_STATUS_LOG_PREFIX,
+            TRANSFER_STARTED_LOG_PREFIX, TRANSFER_PROGRESS_LOG_PREFIX,
+            TRANSFER_SAVED_LOG_PREFIX, TRANSFER_COMPLETE_LOG_PREFIX, TRANSFER_FAILED_LOG_PREFIX,
+            USER_ERROR_LOG_PREFIX, USER_STATUS_LOG_PREFIX, "SUMMARY_STATS ", "WIFI_GUARD ",
         )))
-        self.receiver_log_box.append(text)
+        tev = self._parse_transfer_event_line(text)
+        if tev:
+            Clock.schedule_once(lambda _dt, data=tev: self._handle_transfer_event_ui(data, source="receiver"), 0)
+        if not is_progress:
+            self.receiver_log_box.append(text)
         self._try_parse_user_event(text, "receiver")
         if CONTACT_REQUEST_LOG_PREFIX in text:
             try:
@@ -4614,7 +4970,7 @@ class RUDPTransferRoot(BoxLayout):
         # live_* message. If CHAT_MESSAGE_JSON is absent, keep it as a diagnostic
         # problem instead of inventing a UI message.
         m_recv = RECEIVE_PROGRESS_RE.search(text)
-        if m_recv:
+        if m_recv and not is_progress:
             try:
                 conn = int(m_recv.group("conn") or 0)
                 mid = str(self.receiving_file_message_by_conn.get(conn) or self.current_receiving_file_message_id or "")
@@ -4622,48 +4978,34 @@ class RUDPTransferRoot(BoxLayout):
                     sent = int(m_recv.group("sent"))
                     total = int(m_recv.group("total") or 0)
                     pct = float(m_recv.group("pct") or ((sent * 100.0 / total) if total else 0.0))
-                    self.file_message_progress[mid] = {
-                        "sent": sent, "total": total, "pct": pct,
-                        "avg": float(m_recv.group("avg") or 0.0),
-                        "eta": m_recv.group("eta") or "",
-                        "state": self.cu("receiving"),
-                    }
-                    if self.file_transfer_service is not None:
-                        self.file_transfer_service.update_progress(
-                            chat_message_id=mid,
-                            direction="incoming",
-                            transferred_bytes=sent,
-                            total_bytes=total,
-                            pct=pct,
-                            avg_mbps=float(m_recv.group("avg") or 0.0),
-                            eta=m_recv.group("eta") or "",
-                            status="transferring",
-                        )
-                    self._schedule_force_chat_refresh(0.0)
+                    self.file_message_progress[mid] = {"sent": sent, "total": total, "pct": pct, "avg": float(m_recv.group("avg") or 0.0), "eta": m_recv.group("eta") or "", "state": self.cu("receiving")}
+                    self._schedule_transfer_card_refresh(force=False)
             except Exception:
                 pass
         m_saved = RECEIVED_SAVE_RE.search(text)
-        if m_saved:
+        if m_saved and self.message_service is not None:
             try:
                 conn = int(m_saved.group("conn") or 0)
                 saved_path = str(m_saved.group("path") or "").strip()
-                Clock.schedule_once(lambda _dt, c=conn, p=saved_path: self._handle_receiver_saved_file_ui(c, p), 0)
+                if saved_path:
+                    mid = str(self.receiving_file_message_by_conn.get(conn) or self.current_receiving_file_message_id or "")
+                    if mid:
+                        self.message_service.bind_file_path(mid, saved_path)
+                    else:
+                        mid = self.message_service.bind_latest_incoming_file_path(file_name=os.path.basename(saved_path), saved_path=saved_path)
+                    if mid:
+                        total = os.path.getsize(saved_path) if os.path.exists(saved_path) else int(self.file_message_progress.get(mid, {}).get("total") or 0)
+                        self.file_message_progress[mid] = {"sent": total, "total": total, "pct": 100.0, "avg": self.file_message_progress.get(mid, {}).get("avg", 0.0), "eta": "0:00", "state": self.cu("received")}
+                        if self.file_transfer_service is not None:
+                            self.file_transfer_service.bind_saved_path(mid, saved_path)
+                    self.receiving_file_message_by_conn.pop(conn, None)
+                    if self.current_receiving_file_message_id == mid:
+                        self.current_receiving_file_message_id = ""
+                    self._schedule_transfer_card_refresh(force=True)
             except Exception:
                 pass
-
-        if "end reason=complete" in text:
-            Clock.schedule_once(lambda _dt: self._handle_receiver_complete_ui(), 0)
-            self.receiver_log_box.append(self.t("receive_transfer_finished") + "\n")
-        elif "end reason=idle_timeout" in text:
-            self.receiver_log_box.append(self.t("receive_idle_timeout_msg") + "\n")
-        marker = TRANSFER_REQUEST_LOG_PREFIX
-        if marker in text:
-            payload = text.split(marker, 1)[1].strip()
-            try:
-                req = json.loads(payload)
-            except Exception:
-                return
-            Clock.schedule_once(lambda _dt, data=req: self._handle_transfer_request_ui(data), 0)
+        if "end reason=complete" in text and self.current_receiving_file_message_id:
+            Clock.schedule_once(lambda _dt, mid=self.current_receiving_file_message_id: self._handle_receiver_complete_ui(mid), 0)
 
 
     def show_transfer_request(self, req: Dict[str, object]) -> None:

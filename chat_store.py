@@ -16,7 +16,7 @@ from file_transfer_common import is_unspecified_ip, normalize_peer_endpoint_ip
 from typing import Dict, List, Optional, Tuple
 
 from chat_db import ChatDatabase, make_id, now_ts
-from chat_crypto import decrypt_json_body
+from chat_crypto import decrypt_json_body, encrypt_json_body
 
 
 class ChatStore:
@@ -478,27 +478,65 @@ class ChatStore:
         self.db.conn.commit()
         return status
 
+    def _decrypt_message_body_from_row(self, row) -> Dict[str, object]:
+        obj = dict(row)
+        aad = self.db._aad_fields(
+            obj["message_id"],
+            obj.get("conversation_id"),
+            obj.get("group_id"),
+            obj["sender_peer_id"],
+            obj.get("receiver_peer_id"),
+            obj["created_at"],
+        )
+        body = decrypt_json_body(self.db.storage_key, obj["encrypted_body"], obj["body_nonce"], aad)
+        return body if isinstance(body, dict) else {}
+
+    def _update_message_body_text_from_row(self, row, text: str) -> None:
+        obj = dict(row)
+        aad = self.db._aad_fields(
+            obj["message_id"],
+            obj.get("conversation_id"),
+            obj.get("group_id"),
+            obj["sender_peer_id"],
+            obj.get("receiver_peer_id"),
+            obj["created_at"],
+        )
+        body = self._decrypt_message_body_from_row(row)
+        if not isinstance(body, dict):
+            body = {}
+        body["body_type"] = str(obj.get("body_type") or body.get("body_type") or "text")
+        body["text"] = str(text or "")
+        body.setdefault("format", "plain")
+        encrypted_body, nonce, alg = encrypt_json_body(self.db.storage_key, body, aad)
+        self.db.conn.execute(
+            "UPDATE messages SET encrypted_body=?, body_nonce=?, body_alg=? WHERE message_id=?",
+            (encrypted_body, nonce, alg, obj["message_id"]),
+        )
+
     def bind_message_file_path(self, message_id: str, saved_path: str) -> str:
         mid = str(message_id or "").strip()
         if not mid or not saved_path:
             return ""
         row = self.db.conn.execute(
-            "SELECT message_id, text FROM messages WHERE message_id=? AND body_type='file'",
+            "SELECT * FROM messages WHERE message_id=? AND body_type='file'",
             (mid,),
         ).fetchone()
         if row is None:
             return ""
-        raw = str(row["text"] or "")
+        body = self._decrypt_message_body_from_row(row)
+        raw = str(body.get("text") or "")
         try:
             obj = json.loads(raw)
+            if not isinstance(obj, dict):
+                obj = {}
         except Exception:
             obj = {"name": os.path.basename(str(saved_path))}
         obj["path"] = str(saved_path)
         if not obj.get("name"):
             obj["name"] = os.path.basename(str(saved_path))
-        self.db.conn.execute(
-            "UPDATE messages SET text=? WHERE message_id=?",
-            (json.dumps(obj, ensure_ascii=False, separators=(",", ":")), mid),
+        self._update_message_body_text_from_row(
+            row,
+            json.dumps(obj, ensure_ascii=False, separators=(",", ":")),
         )
         self.db.conn.commit()
         return mid
@@ -508,20 +546,26 @@ class ChatStore:
         if not target_name or not saved_path:
             return ""
         rows = self.db.conn.execute(
-            "SELECT message_id, text FROM messages WHERE direction='incoming' AND body_type='file' ORDER BY created_at DESC LIMIT 100"
+            "SELECT * FROM messages WHERE direction='incoming' AND body_type='file' ORDER BY created_at DESC LIMIT 100"
         ).fetchall()
         for row in rows:
             mid = str(row["message_id"] or "")
-            raw = str(row["text"] or "")
+            body = self._decrypt_message_body_from_row(row)
+            raw = str(body.get("text") or "")
             try:
                 obj = json.loads(raw)
+                if not isinstance(obj, dict):
+                    continue
             except Exception:
                 continue
             existing_name = os.path.basename(str(obj.get("name") or obj.get("path") or "")).strip()
             if existing_name != target_name:
                 continue
             obj["path"] = str(saved_path)
-            self.db.conn.execute("UPDATE messages SET text=? WHERE message_id=?", (json.dumps(obj, ensure_ascii=False, separators=(",", ":")), mid))
+            self._update_message_body_text_from_row(
+                row,
+                json.dumps(obj, ensure_ascii=False, separators=(",", ":")),
+            )
             self.db.conn.commit()
             return mid
         return ""

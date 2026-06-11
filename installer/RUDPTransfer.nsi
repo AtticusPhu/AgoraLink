@@ -1,13 +1,13 @@
 !include "MUI2.nsh"
 
 !define ROOT ".."
-!define APP_NAME "AgoraLink"
-!define APP_PUBLISHER "AgoraLink"
-!define APP_EXE "AgoraLink.exe"
+!define APP_NAME "RUDPTransfer"
+!define APP_PUBLISHER "RUDPTransfer"
+!define APP_EXE "RUDPTransfer.exe"
 !define APP_VERSION "1.0.0"
 
 Name "${APP_NAME}"
-OutFile "${ROOT}\dist\AgoraLink_Setup.exe"
+OutFile "${ROOT}\dist\RUDPTransfer_Setup.exe"
 InstallDir "$LOCALAPPDATA\Programs\${APP_NAME}"
 InstallDirRegKey HKCU "Software\${APP_NAME}" "InstallDir"
 RequestExecutionLevel user
@@ -29,7 +29,7 @@ RequestExecutionLevel user
 
 Section "Install" SEC01
     SetOutPath "$INSTDIR"
-    File /r "${ROOT}\dist\AgoraLink\*.*"
+    File /r "${ROOT}\dist\RUDPTransfer\*.*"
 
     CreateDirectory "$SMPROGRAMS\${APP_NAME}"
     CreateShortcut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
@@ -58,4 +58,3 @@ Section "Uninstall"
     DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"
     DeleteRegKey HKCU "Software\${APP_NAME}"
 SectionEnd
-

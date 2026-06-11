@@ -65,6 +65,48 @@ class _DualTokenBucketPacer:
             sleep_s = max(sleep_b, sleep_p, 0.0)
             time.sleep(min(sleep_s, 0.01))
 
+    def wait_budget(self, packet_bytes: int, max_packets: int, byte_rate: float, byte_burst: float, pkt_rate: float, pkt_burst: float) -> int:
+        """Wait until at least one packet can be sent, then consume and return
+        a conservative burst budget. Used by LAN file bulk send so pacing is
+        checked once per burst instead of once per DATA packet.
+        """
+        max_packets = max(1, int(max_packets or 1))
+        need_b = max(1.0, float(packet_bytes or 1))
+        while True:
+            with self._lock:
+                now = time.time()
+                elapsed = max(0.0, now - self._ts)
+                self._ts = now
+
+                if byte_rate > 0:
+                    cap_b = max(need_b, float(byte_burst or 0.0))
+                    self._byte_tokens = min(cap_b, self._byte_tokens + elapsed * float(byte_rate))
+                else:
+                    self._byte_tokens = float(max_packets) * need_b
+
+                if pkt_rate > 0:
+                    cap_p = max(1.0, float(pkt_burst or 0.0))
+                    self._pkt_tokens = min(cap_p, self._pkt_tokens + elapsed * float(pkt_rate))
+                else:
+                    self._pkt_tokens = float(max_packets)
+
+                budget_b = int(self._byte_tokens // need_b) if need_b > 0 else max_packets
+                budget_p = int(self._pkt_tokens)
+                n = min(max_packets, max(0, budget_b), max(0, budget_p))
+                if n >= 1:
+                    self._byte_tokens = max(0.0, self._byte_tokens - float(n) * need_b)
+                    self._pkt_tokens = max(0.0, self._pkt_tokens - float(n))
+                    return int(n)
+
+                sleep_b = 0.0
+                if byte_rate > 0 and budget_b < 1:
+                    sleep_b = (need_b - self._byte_tokens) / float(byte_rate)
+                sleep_p = 0.0
+                if pkt_rate > 0 and budget_p < 1:
+                    sleep_p = (1.0 - self._pkt_tokens) / float(pkt_rate)
+
+            time.sleep(min(max(sleep_b, sleep_p, 0.0), 0.01))
+
 CTRL_SEQ_BIT = 1 << 63
 CTRL_DIR_BIT = 1 << 62  # split ctrl seq space by direction
 CTRL_SEQ_COUNTER_MASK = CTRL_DIR_BIT - 1
@@ -190,6 +232,16 @@ class ReliableUDPSession:
 
  
         self.send_max_unacked_pkts = 0
+        self._inflight_wire_bytes = 0
+        self._inflight_last_verify_ts = 0.0
+        self._inflight_repair_count = 0
+        self._bulk_budget_last = 0
+        self._bulk_sent_pkts_total = 0
+        self._bulk_blocked_pacing_count = 0
+        self._bulk_blocked_cwnd_count = 0
+        self._bulk_blocked_unacked_count = 0
+        self._ack_deleted_pkts_total = 0
+        self._ack_scan_pkts_total = 0
 
         # 统计口径：
         # Backward-compatible data-plane counters. _total_wire_bytes_sent / acked are kept
@@ -299,6 +351,16 @@ class ReliableUDPSession:
         self._app_pacing_burst_bytes = float(2 * MSS)
         self._app_last_pacing_bps = None
         self._pacing_stats_lock = threading.Lock()
+        self._lan_pacing_pkt_rate = 0.0
+        self._lan_pacing_pkt_burst = 0.0
+        self._lan_pacing_byte_rate = 0.0
+        self._lan_pacing_byte_burst = 0.0
+        self._send_blocked_by_cc_count = 0
+        self._send_blocked_by_unacked_count = 0
+        self.ack1_every_data_packets = 32
+        self.ack1_max_delay_s = 0.010
+        self._ack1_data_since_send = 0
+        self._fast_retx_reorder_tolerance_pkts = 0
         # Application DATA scheduling lanes.  Control/chat frames are allowed to
         # use a very small cwnd reserve and skip application pacing so ACK/READ
         # and chat messages are not trapped behind large FILE_BODY streams.
@@ -1561,7 +1623,12 @@ class ReliableUDPSession:
         if seq <= 0 or seq >= CTRL_SEQ_BIT:
             raise ValueError("DATA seq must be in (0, 1<<63)")
 
-        app_payload = bytes(payload or b"")
+        if isinstance(payload, bytes):
+            app_payload = payload
+        elif payload is None:
+            app_payload = b""
+        else:
+            app_payload = bytes(payload)
         if len(app_payload) > MAX_DATA_APP_PAYLOAD:
             raise ValueError(
                 f"DATA app payload too large: {len(app_payload)} > {MAX_DATA_APP_PAYLOAD} "
@@ -1589,6 +1656,7 @@ class ReliableUDPSession:
             self.data_packets_sent_total += 1
             self.data_wire_bytes_sent_original += wire_size
             self.data_wire_bytes_sent_total += wire_size
+            self._inflight_wire_bytes = max(0, int(getattr(self, "_inflight_wire_bytes", 0) or 0)) + int(wire_size)
             self._recompute_wire_totals_locked()
             self.unacked[seq] = {
                 # "ts" is the data-recovery timer reference.
@@ -1810,6 +1878,18 @@ class ReliableUDPSession:
             "total_wire_bytes_sent": total_wire_bytes_sent,
             "total_wire_bytes_acked": total_wire_bytes_acked,
             "unacked_pkts": unacked_pkts,
+            "inflight_bytes": int(self._verify_inflight_counter(force=False)),
+            "inflight_pkts": float(self._get_inflight_wire_bytes()) / max(float(MSS), 1.0),
+            "inflight_repair_count": int(getattr(self, "_inflight_repair_count", 0) or 0),
+            "bulk_budget_pkts": int(getattr(self, "_bulk_budget_last", 0) or 0),
+            "bulk_sent_pkts": int(getattr(self, "_bulk_sent_pkts_total", 0) or 0),
+            "bulk_blocked_pacing": int(getattr(self, "_bulk_blocked_pacing_count", 0) or 0),
+            "bulk_blocked_cwnd": int(getattr(self, "_bulk_blocked_cwnd_count", 0) or 0),
+            "bulk_blocked_unacked": int(getattr(self, "_bulk_blocked_unacked_count", 0) or 0),
+            "ack_deleted_pkts": int(getattr(self, "_ack_deleted_pkts_total", 0) or 0),
+            "ack_scan_pkts": int(getattr(self, "_ack_scan_pkts_total", 0) or 0),
+            "send_blocked_by_cc_count": int(getattr(self, "_send_blocked_by_cc_count", 0) or 0),
+            "send_blocked_by_unacked_count": int(getattr(self, "_send_blocked_by_unacked_count", 0) or 0),
             "app_pacing_enabled": bool(self.app_pacing_enabled),
             "app_pacing_rate_bps": app_pacing_rate_bps,
             "recovery_pacing_enabled": recovery_pacing_enabled,
@@ -2004,8 +2084,10 @@ class ReliableUDPSession:
 
         # 让阈值随着观测乱序与 BDP 轻度上升，但不会无限放大。
         bdp_component = int(math.ceil(max(0.0, min(float(ooo), 32.0)) * 0.25))
-        threshold = max(3, gap_ref, bdp_component)
-        return int(min(64, threshold))
+        tolerance = int(getattr(self, "_fast_retx_reorder_tolerance_pkts", 0) or 0)
+        threshold = max(3, gap_ref, bdp_component, tolerance)
+        cap = max(64, tolerance)
+        return int(min(cap, threshold))
 
     def _fast_retx_missing_reports_required(self) -> int:
         """Return how many consecutive ACK1 missing reports are required before fast retransmit.
@@ -2066,8 +2148,29 @@ class ReliableUDPSession:
                     continue
             return int(total)
 
+    def _get_inflight_wire_bytes(self) -> int:
+        with self.lock:
+            return max(0, int(getattr(self, "_inflight_wire_bytes", 0) or 0))
+
+    def _verify_inflight_counter(self, force: bool = False) -> int:
+        now = time.time()
+        if (not force) and (now - float(getattr(self, "_inflight_last_verify_ts", 0.0) or 0.0)) < 1.0:
+            return self._get_inflight_wire_bytes()
+        actual = self._snapshot_true_inflight_bytes()
+        with self.lock:
+            current = max(0, int(getattr(self, "_inflight_wire_bytes", 0) or 0))
+            if abs(int(actual) - int(current)) > int(MSS):
+                self._inflight_wire_bytes = int(actual)
+                self._inflight_repair_count += 1
+                try:
+                    self.logger.warning(f"inflight counter repaired: counter={current}, actual={actual}")
+                except Exception:
+                    pass
+            self._inflight_last_verify_ts = now
+            return max(0, int(getattr(self, "_inflight_wire_bytes", 0) or 0))
+
     def _sync_cc_inflight_bytes(self) -> int:
-        inflight = self._snapshot_true_inflight_bytes()
+        inflight = self._verify_inflight_counter(force=False)
 
         with self._cc_lock:
             cc = self.cc
@@ -2100,13 +2203,15 @@ class ReliableUDPSession:
             cap = int(getattr(self, "send_max_unacked_pkts", 0) or 0)
             reserve = int(getattr(self, "_app_control_reserve_pkts", 0) or 0) if priority == "control" else 0
             if cap > 0 and len(self.unacked) >= cap + reserve:
+                self._send_blocked_by_unacked_count += 1
                 return False
 
-        self._sync_cc_inflight_bytes()
         if self.cc_can_send(int(packet_size)):
             return True
 
         if priority != "control":
+            with self.lock:
+                self._send_blocked_by_cc_count += 1
             return False
 
         # Small reserve for urgent control frames.  Avoid unbounded bypass: only
@@ -2115,7 +2220,7 @@ class ReliableUDPSession:
         try:
             if int(packet_size) > int(2 * MSS):
                 return False
-            inflight = self._snapshot_true_inflight_bytes()
+            inflight = self._get_inflight_wire_bytes()
             with self._cc_lock:
                 cc = self.cc
                 if cc is None:
@@ -2135,7 +2240,12 @@ class ReliableUDPSession:
         return "bulk"
 
     def _classify_app_payload_priority(self, payload: bytes) -> str:
-        data = bytes(payload or b"")
+        if isinstance(payload, bytes):
+            data = payload
+        elif payload is None:
+            data = b""
+        else:
+            data = bytes(payload)
         if not data:
             return "control"
         if data == b"__RUDP_FILE_EOF__":
@@ -2158,6 +2268,40 @@ class ReliableUDPSession:
         except Exception:
             pass
         return "bulk"
+
+    def configure_lan_bulk_pacing(self, *, burst_pkts: int = 50, interval_ms: float = 5.0, payload_size: int = MSS) -> None:
+        """Configure coarse burst pacing for LAN bulk DATA.
+
+        This is an upper pacing budget only. Congestion window and hard unacked
+        cap are still checked by can_send()/wait_for_data_send().
+        """
+        try:
+            burst_pkts = max(1, int(burst_pkts))
+        except Exception:
+            burst_pkts = 50
+        try:
+            interval = max(0.001, float(interval_ms) / 1000.0)
+        except Exception:
+            interval = 0.005
+        try:
+            payload_size = max(1, int(payload_size or MSS))
+        except Exception:
+            payload_size = MSS
+        pkt_rate = float(burst_pkts) / float(interval)
+        byte_rate = float(burst_pkts * payload_size) / float(interval)
+        with self._pacing_stats_lock:
+            self._lan_pacing_pkt_rate = float(pkt_rate)
+            self._lan_pacing_pkt_burst = float(burst_pkts)
+            self._lan_pacing_byte_rate = float(byte_rate)
+            self._lan_pacing_byte_burst = float(burst_pkts * payload_size)
+
+    def configure_reorder_tolerance(self, pkts: int = 128) -> None:
+        try:
+            pkts = max(0, int(pkts))
+        except Exception:
+            pkts = 128
+        with self.lock:
+            self._fast_retx_reorder_tolerance_pkts = int(pkts)
 
     def _app_pacing_params(self):
         with self._cc_lock:
@@ -2196,8 +2340,20 @@ class ReliableUDPSession:
         byte_burst = max(float(self._app_pacing_burst_bytes), float(self._app_pacing_burst_pkts) * float(MSS))
         pkt_burst = max(1.0, float(self._app_pacing_burst_pkts))
         with self._pacing_stats_lock:
+            lan_pkt_rate = float(getattr(self, "_lan_pacing_pkt_rate", 0.0) or 0.0)
+            lan_pkt_burst = float(getattr(self, "_lan_pacing_pkt_burst", 0.0) or 0.0)
+            lan_byte_rate = float(getattr(self, "_lan_pacing_byte_rate", 0.0) or 0.0)
+            lan_byte_burst = float(getattr(self, "_lan_pacing_byte_burst", 0.0) or 0.0)
+            if lan_pkt_rate > 0.0:
+                pkt_rate = max(float(pkt_rate), lan_pkt_rate)
+            if lan_pkt_burst > 0.0:
+                pkt_burst = max(float(pkt_burst), lan_pkt_burst)
+            if lan_byte_rate > 0.0:
+                byte_rate = max(float(byte_rate), lan_byte_rate)
+            if lan_byte_burst > 0.0:
+                byte_burst = max(float(byte_burst), lan_byte_burst)
             self._app_last_pacing_bps = float(byte_rate)
-        return float(byte_rate), byte_burst, pkt_rate, pkt_burst
+        return float(byte_rate), float(byte_burst), float(pkt_rate), float(pkt_burst)
 
     def wait_for_data_send(self, packet_size: int, priority: str = "bulk") -> None:
         packet_size = max(0, int(packet_size or 0))
@@ -2232,7 +2388,12 @@ class ReliableUDPSession:
         raise RuntimeError("session stopped")
 
     def send_app_data(self, seq: int, payload: bytes, priority: str = "auto"):
-        app_payload = bytes(payload or b"")
+        if isinstance(payload, bytes):
+            app_payload = payload
+        elif payload is None:
+            app_payload = b""
+        else:
+            app_payload = bytes(payload)
         app_priority = self._classify_app_payload_priority(app_payload) if str(priority or "auto").lower() == "auto" else self._normalize_app_priority(priority)
         expected_wire_size = int(self.data_packet_wire_size(len(app_payload)))
         self.wait_for_data_send(expected_wire_size, priority=app_priority)
@@ -2244,8 +2405,108 @@ class ReliableUDPSession:
         self.cc_on_packet_sent(sent_wire_size)
 
     # ---------------- Congestion-control wrappers (thread-safe) ----------------
+    def _bulk_send_budget(self, packet_size: int, desired_pkts: int, priority: str = "bulk") -> int:
+        desired = max(1, int(desired_pkts or 1))
+        priority = self._normalize_app_priority(priority)
+        packet_size = max(1, int(packet_size or 1))
+
+        while self.running:
+            if self.has_fatal_error():
+                raise RuntimeError(self.get_fatal_error() or "fatal protocol error")
+
+            with self.lock:
+                cap = int(getattr(self, "send_max_unacked_pkts", 0) or 0)
+                if cap > 0:
+                    max_unacked_remaining = int(cap) - int(len(self.unacked))
+                    if max_unacked_remaining <= 0:
+                        self._bulk_blocked_unacked_count += 1
+                        self._send_blocked_by_unacked_count += 1
+                        max_unacked_remaining = 0
+                else:
+                    max_unacked_remaining = desired
+
+                inflight = max(0, int(getattr(self, "_inflight_wire_bytes", 0) or 0))
+
+            if max_unacked_remaining <= 0:
+                time.sleep(0.001)
+                continue
+
+            cwnd_remaining = desired
+            with self._cc_lock:
+                cc = self.cc
+                if cc is not None:
+                    cwnd = max(0, int(getattr(cc, "cwnd", 0) or 0))
+                    cwnd_remaining = int((cwnd - inflight) // packet_size)
+
+            if cwnd_remaining <= 0:
+                with self.lock:
+                    self._bulk_blocked_cwnd_count += 1
+                    self._send_blocked_by_cc_count += 1
+                time.sleep(0.001)
+                continue
+
+            window_budget = min(desired, max_unacked_remaining, max(1, int(cwnd_remaining)))
+
+            if self.app_pacing_enabled and priority != "control":
+                params = self._app_pacing_params()
+                if params is not None:
+                    byte_rate, byte_burst, pkt_rate, pkt_burst = params
+                    pacing_budget = self._app_send_pacer.wait_budget(packet_size, window_budget, byte_rate, byte_burst, pkt_rate, pkt_burst)
+                    if pacing_budget <= 0:
+                        with self.lock:
+                            self._bulk_blocked_pacing_count += 1
+                        continue
+                    budget = min(window_budget, int(pacing_budget))
+                else:
+                    budget = window_budget
+            else:
+                budget = window_budget
+
+            with self.lock:
+                self._bulk_budget_last = int(budget)
+            return max(1, int(budget))
+
+        raise RuntimeError("session stopped")
+
+    def bulk_send_app_data(self, start_seq: int, payloads, priority: str = "bulk") -> int:
+        """Send consecutive bulk DATA payloads using burst-level window/pacing checks.
+
+        This conservative fast path is for file body packets only. It keeps the
+        existing packet format and AES-GCM per-packet encryption, but avoids
+        running classification, can_send(), and pacing for every single packet.
+        """
+        if payloads is None:
+            return 0
+        payload_list = list(payloads)
+        if not payload_list:
+            return 0
+
+        app_priority = self._normalize_app_priority(priority)
+        idx = 0
+        total = len(payload_list)
+        sent = 0
+        while idx < total:
+            if self.has_fatal_error():
+                raise RuntimeError(self.get_fatal_error() or "fatal protocol error")
+
+            first = payload_list[idx]
+            first_len = len(first) if first is not None else 0
+            packet_size = int(self.data_packet_wire_size(first_len))
+            budget = self._bulk_send_budget(packet_size, total - idx, priority=app_priority)
+
+            n = min(int(budget), total - idx)
+            for off in range(n):
+                payload = payload_list[idx + off]
+                seq = int(start_seq) + idx + off
+                sent_wire_size = int(self.send_precise(seq, payload))
+                self.cc_on_packet_sent(sent_wire_size)
+                sent += 1
+            with self.lock:
+                self._bulk_sent_pkts_total += int(n)
+            idx += n
+        return int(sent)
+
     def cc_can_send(self, packet_size: int) -> bool:
-        self._sync_cc_inflight_bytes()
         with self._cc_lock:
             if self.cc is None:
                 return True
@@ -2256,21 +2517,18 @@ class ReliableUDPSession:
             if self.cc is None:
                 return
             self.cc.on_packet_sent(int(size))
-        self._sync_cc_inflight_bytes()
 
     def cc_on_ack_received(self, rtt_sample=None, bytes_acked=None) -> None:
         with self._cc_lock:
             if self.cc is None:
                 return
             self.cc.on_ack_received(rtt_sample=rtt_sample, bytes_acked=bytes_acked)
-        self._sync_cc_inflight_bytes()
 
     def cc_on_packet_lost(self) -> None:
         with self._cc_lock:
             if self.cc is None:
                 return
             self.cc.on_packet_lost()
-        self._sync_cc_inflight_bytes()
 
     def has_fatal_error(self) -> bool:
         return self._fatal_error_event.is_set()
@@ -2703,7 +2961,12 @@ class ReliableUDPSession:
             return int(time.monotonic() * 1_000_000.0)
 
     def _build_data_wire_payload(self, app_payload: bytes, tx_ts_us: int = None) -> bytes:
-        payload = bytes(app_payload or b"")
+        if isinstance(app_payload, bytes):
+            payload = app_payload
+        elif app_payload is None:
+            payload = b""
+        else:
+            payload = bytes(app_payload)
         if tx_ts_us is None:
             tx_ts_us = self._mono_now_us()
         tx_ts_us = max(0, int(tx_ts_us))
@@ -2712,7 +2975,8 @@ class ReliableUDPSession:
     def _parse_data_wire_payload(self, payload: bytes):
         if not isinstance(payload, (bytes, bytearray)):
             return None, None
-        payload = bytes(payload)
+        if not isinstance(payload, bytes):
+            payload = bytes(payload)
         if len(payload) < DATA_FRAME_HEADER_LEN:
             return None, None
         if payload[:2] != DATA_FRAME_TAG:
@@ -3087,6 +3351,7 @@ class ReliableUDPSession:
                 # Send now.
                 self.ack1_dirty = False
                 self.ack1_last_sent_ts = now
+                self._ack1_data_since_send = 0
                 # Track the last cumulative ack_base we've actually sent (used by _ack1_pending)
                 if ack_base is not None:
                     self.ack1_last_ack_base = int(ack_base)
@@ -3167,6 +3432,7 @@ class ReliableUDPSession:
                 if payload_to_send is not None:
                     self.ack1_last_sent_ts = now
                     self.ack1_dirty = False
+                    self._ack1_data_since_send = 0
                     # Update last_ack_base to reflect what we actually sent.
                     if ack_base is not None:
                         self.ack1_last_ack_base = int(ack_base)
@@ -3393,7 +3659,8 @@ class ReliableUDPSession:
         rtt_ref_meta = None
 
         with self.lock:
-            # dup-ACK tracking on ack_base (for optional fast retransmit on ack_base when no explicit missing info)
+            # dup-ACK tracking on ack_base (retained for diagnostics only; fast
+            # retransmit remains strictly missing-range driven below).
             if self._fr_last_ack_base == ack_base:
                 self._fr_dup_acks += 1
             else:
@@ -3401,27 +3668,41 @@ class ReliableUDPSession:
                 self._fr_dup_acks = 1
 
             to_delete = []
+            miss_idx = 0
+            miss_len = len(missing_ranges)
+            scanned = 0
+
+            # unacked is insertion-ordered by original DATA sequence in normal
+            # file sends. Break once we pass seen_max to avoid scanning the tail
+            # of a large outstanding map.
             for seq, meta in self.unacked.items():
+                seq_i = int(seq)
+                if seq_i > seen_max and seen_max >= ack_base:
+                    break
+                scanned += 1
                 acked_now = False
 
-                if seq < ack_base:
+                if seq_i < ack_base:
                     acked_now = True
-                elif seq == ack_base:
-                    acked_now = False   # 明确保护：ack_base 永远不能被 ACK state 直接确认
-                elif seq <= seen_max:
-                    # SNACK semantics: within [ack_base, seen_max], any seq NOT in missing_ranges is acked.
-                    if not self._seq_in_ranges(int(seq), missing_ranges):
-                        acked_now = True
-                else:
-                    continue
+                elif seq_i == ack_base:
+                    acked_now = False
+                elif seq_i <= seen_max:
+                    while miss_idx < miss_len and int(missing_ranges[miss_idx][1]) < seq_i:
+                        miss_idx += 1
+                    in_missing = (
+                        miss_idx < miss_len
+                        and int(missing_ranges[miss_idx][0]) <= seq_i <= int(missing_ranges[miss_idx][1])
+                    )
+                    acked_now = not in_missing
 
                 if not acked_now:
                     continue
 
-                to_delete.append(seq)
+                to_delete.append(seq_i)
                 app_bytes_acked += int(meta.get("app_size", meta.get("size", 0)))
-                wire_bytes_acked += int(meta.get("wire_size", len(meta.get("enc_data", b""))))
-                if (rtt_ref_seq is not None) and int(seq) == int(rtt_ref_seq):
+                wire_sz = int(meta.get("wire_size", len(meta.get("enc_data", b""))))
+                wire_bytes_acked += wire_sz
+                if (rtt_ref_seq is not None) and seq_i == int(rtt_ref_seq):
                     rtt_ref_meta = meta
                 if int(meta.get("retries", 0)) == 0 and int(meta.get("fast_cnt", 0)) == 0:
                     ts = meta.get("tx_ts", meta.get("ts", now))
@@ -3433,6 +3714,9 @@ class ReliableUDPSession:
             for seq in to_delete:
                 self.unacked.pop(seq, None)
 
+            self._inflight_wire_bytes = max(0, int(getattr(self, "_inflight_wire_bytes", 0) or 0) - int(wire_bytes_acked))
+            self._ack_deleted_pkts_total += int(len(to_delete))
+            self._ack_scan_pkts_total += int(scanned)
             self._total_bytes_acked += int(app_bytes_acked)
             self._total_wire_bytes_acked += int(wire_bytes_acked)
 
@@ -3485,14 +3769,9 @@ class ReliableUDPSession:
             dup_acks = int(self._fr_dup_acks)
             dup_thresh = int(self._fr_dup_thresh)
 
-        ack_base_maturity = max(0, int(seen_max - ack_base + 1)) if seen_max >= ack_base else 0
-        if (
-            (ack_base not in candidates)
-            and (not explicit_missing_candidates)
-            and (ack_base_maturity >= fr_gap_threshold)
-            and (dup_acks >= max(dup_thresh, fr_gap_threshold))
-        ):
-            candidates.insert(0, int(ack_base))
+        # Fast retransmit is strictly missing-range driven. Do not infer loss
+        # from duplicate ack_base alone; that path misfires under normal LAN
+        # burst reordering and suppresses fresh-data sending.
 
         uniq = []
         seen = set()
@@ -3650,21 +3929,28 @@ class ReliableUDPSession:
             if deliver_batch:
                 self._enqueue_ordered_ready_batch(deliver_batch)
 
-            # 事件驱动 ACK1：
-            # - gap/out-of-order：尽快发（帮助发送端更快进入恢复），但受 ack1_min_interval 节流
-            # - in-order：按 ack1_min_interval 节流
+            # Event-driven ACK1 policy:
+            # - gap/out-of-order/duplicate: immediate ACK1
+            # - EOF/COMPLETE boundary: immediate ACK1
+            # - normal in-order data: every N DATA packets or max-delay fallback
             is_gap = bool((not dup) and (observed_gap_depth > 0))
+            is_eof = bool(data == b"__RUDP_FILE_EOF__")
 
-            force_now = bool(dup)
-            if is_gap and (not force_now):
+            force_now = bool(dup or is_gap or is_eof)
+            send_ack = bool(force_now)
+            if not send_ack:
                 now = time.time()
-                min_int, _ack1_rto, _ack1_grace, _ack1_srtt, _ack1_rttvar = self._ack1_timing_params()
                 with self.lock:
+                    self._ack1_data_since_send += 1
+                    since = int(self._ack1_data_since_send)
                     last = float(self.ack1_last_sent_ts or 0.0)
-                if (last <= 0.0) or (min_int <= 0.0) or ((now - last) >= min_int):
-                    force_now = True
+                    every = max(1, int(getattr(self, "ack1_every_data_packets", 32) or 32))
+                    max_delay = max(0.001, float(getattr(self, "ack1_max_delay_s", 0.010) or 0.010))
+                if since >= every or last <= 0.0 or (now - last) >= max_delay:
+                    send_ack = True
 
-            self._send_ack1(force=force_now)
+            if send_ack:
+                self._send_ack1(force=force_now)
             return True
         # ---------------- 重传线程（发送端） ----------------
     def _cc_data_rto_base(self) -> float:
@@ -3717,7 +4003,16 @@ class ReliableUDPSession:
                     for seq, meta in list(self.unacked.items()):
                         # Retry exhaustion: drop + fail-fast (avoid permanent hang/leak).
                         if meta.get("retries", 0) >= self.max_retries:
-                            self.unacked.pop(seq, None)
+                            removed = self.unacked.pop(seq, None)
+                            if removed is not None:
+                                try:
+                                    self._inflight_wire_bytes = max(
+                                        0,
+                                        int(getattr(self, "_inflight_wire_bytes", 0) or 0)
+                                        - int(removed.get("wire_size", len(removed.get("enc_data", b"")))),
+                                    )
+                                except Exception:
+                                    self._inflight_wire_bytes = self._snapshot_true_inflight_bytes()
                             drop_now.append(seq)
                             self.dropped_data_seqs.append(seq)
                             self.dropped_data_count += 1
