@@ -176,9 +176,9 @@ def _format_duration(seconds: float) -> str:
 
 def _effective_max_unacked_pkts(args) -> int:
     try:
-        return max(0, int(getattr(args, "max_unacked_pkts", 1152) or 0))
+        return max(0, int(getattr(args, "max_unacked_pkts", 1024) or 0))
     except Exception:
-        return 1152
+        return 1024
 
 
 def _effective_sockbuf_bytes(args, attr: str = "sock_rcvbuf") -> int:
@@ -189,8 +189,15 @@ def _effective_sockbuf_bytes(args, attr: str = "sock_rcvbuf") -> int:
     if explicit > 0:
         return explicit
     max_unacked = _effective_max_unacked_pkts(args)
+    # For adaptive Wi-Fi mode, size socket buffers for the allowed upper bound,
+    # not only for the initial in-flight window.
+    try:
+        if not bool(getattr(args, "disable_adaptive_wifi", False)):
+            max_unacked = max(max_unacked, int(getattr(args, "adaptive_max_unacked_max", max_unacked) or max_unacked))
+    except Exception:
+        pass
     # Link socket buffer to max_unacked_pkts. 32 KiB per allowed in-flight DATA
-    # packet gives 36 MiB at max_unacked_pkts=1152, with a 16 MiB floor.
+    # packet gives 48 MiB at adaptive_max_unacked_max=1536, with a 16 MiB floor.
     return max(16 * 1024 * 1024, int(max_unacked) * 32 * 1024)
 
 
@@ -237,7 +244,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--server-pin-file", default="./rudp_receiver_ed25519.pin", help="TOFU receiver public-key pin file")
     p.add_argument("--require-existing-server-pin", action="store_true")
     p.add_argument("--disable-cc", action="store_true", help="Disable CUBIC congestion control")
-    p.add_argument("--max-unacked-pkts", type=int, default=1152, help="Hard cap for outstanding DATA packets")
+    p.add_argument("--max-unacked-pkts", type=int, default=1024, help="Initial hard cap for outstanding DATA packets")
+    p.add_argument("--disable-adaptive-wifi", action="store_true", help="Disable adaptive LAN window/burst tuning")
+    p.add_argument("--adaptive-max-unacked-min", type=int, default=960, help="Adaptive Wi-Fi minimum DATA in-flight cap")
+    p.add_argument("--adaptive-max-unacked-max", type=int, default=1536, help="Adaptive Wi-Fi maximum DATA in-flight cap")
+    p.add_argument("--adaptive-max-unacked-step", type=int, default=64, help="Adaptive Wi-Fi window increase step in packets")
+    p.add_argument("--adaptive-eval-interval-sec", type=float, default=5.0, help="Adaptive Wi-Fi control interval in seconds")
     p.add_argument("--lan-pacing-burst-pkts", type=int, default=32, help="LAN bulk pacing burst budget in DATA packets")
     p.add_argument("--lan-pacing-interval-ms", type=float, default=5.0, help="LAN bulk pacing burst interval in milliseconds")
     p.add_argument("--reorder-tolerance-pkts", type=int, default=128, help="Fast retransmit reorder tolerance in packets")
@@ -435,7 +447,7 @@ def run_chat_client(args: argparse.Namespace, messages: List[str]) -> int:
         )
         session.configure_app_delivery(len_only=False, small_payload_threshold=0)
         session.recovery_pacing_enabled = True
-        session.send_max_unacked_pkts = _effective_max_unacked_pkts(args)
+        session.send_max_unacked_pkts = int(adaptive_current_unacked)
         session.configure_lan_bulk_pacing(
             burst_pkts=int(getattr(args, "lan_pacing_burst_pkts", 32) or 32),
             interval_ms=float(getattr(args, "lan_pacing_interval_ms", 5.0) or 5.0),
@@ -712,7 +724,31 @@ def run_client(args: argparse.Namespace) -> int:
     wifi_guard_bad_streak = 0
     wifi_guard_good_streak = 0
 
-    def _set_lan_burst(burst_pkts: int, reason: str = "") -> None:
+    adaptive_enabled = not bool(getattr(args, "disable_adaptive_wifi", False))
+    adaptive_min_unacked = max(1, int(getattr(args, "adaptive_max_unacked_min", 960) or 960))
+    adaptive_max_unacked = max(adaptive_min_unacked, int(getattr(args, "adaptive_max_unacked_max", 1536) or 1536))
+    adaptive_step_unacked = max(1, int(getattr(args, "adaptive_max_unacked_step", 64) or 64))
+    adaptive_eval_interval = max(2.0, float(getattr(args, "adaptive_eval_interval_sec", 5.0) or 5.0))
+    adaptive_current_unacked = max(adaptive_min_unacked, min(adaptive_max_unacked, _effective_max_unacked_pkts(args)))
+    adaptive_state = "DISABLED" if not adaptive_enabled else "STABLE"
+    adaptive_last_eval_ts = start_ts
+    adaptive_samples = 0
+    adaptive_payload_mbps_sum = 0.0
+    adaptive_wire_mbps_sum = 0.0
+    adaptive_rtt_ms_sum = 0.0
+    adaptive_max_rtt_ms = 0.0
+    adaptive_retrans_sum = 0
+    adaptive_blocked_unacked_sum = 0
+    adaptive_prev_payload_mbps = 0.0
+    adaptive_good_windows = 0
+    adaptive_bad_windows = 0
+    adaptive_window_up_events = 0
+    adaptive_window_down_events = 0
+    adaptive_burst_up_events = 0
+    adaptive_burst_down_events = 0
+    adaptive_eval_events = 0
+
+    def _set_lan_burst(burst_pkts: int, reason: str = "", source: str = "WIFI_GUARD") -> None:
         nonlocal lan_current_burst
         burst_pkts = max(1, int(burst_pkts or 1))
         if burst_pkts == int(lan_current_burst):
@@ -724,9 +760,123 @@ def run_client(args: argparse.Namespace) -> int:
                 interval_ms=float(getattr(args, "lan_pacing_interval_ms", 5.0) or 5.0),
                 payload_size=int(payload_size),
             )
-            logger.info(f"WIFI_GUARD burst={int(burst_pkts)}, reason={reason}")
+            logger.info(f"{source} burst={int(burst_pkts)}, reason={reason}")
         except Exception as exc:
-            logger.info(f"WIFI_GUARD update_failed: {exc}")
+            logger.info(f"{source} update_failed: {exc}")
+
+    def _set_adaptive_unacked(new_cap: int, reason: str = "") -> None:
+        nonlocal adaptive_current_unacked
+        new_cap = max(adaptive_min_unacked, min(adaptive_max_unacked, int(new_cap or adaptive_current_unacked)))
+        if new_cap == int(adaptive_current_unacked):
+            return
+        old_cap = int(adaptive_current_unacked)
+        adaptive_current_unacked = int(new_cap)
+        try:
+            if session is not None:
+                session.send_max_unacked_pkts = int(new_cap)
+            logger.info(f"ADAPTIVE_WIFI_STATS action=window, old_max_unacked={old_cap}, max_unacked={int(new_cap)}, burst={int(lan_current_burst)}, state={adaptive_state}, reason={reason}")
+        except Exception as exc:
+            logger.info(f"ADAPTIVE_WIFI_STATS update_failed=window, error={exc}")
+
+    def _maybe_adapt_wifi(now_ts: float, payload_mbps: float, wire_mbps: float, rtt_ms: float, retrans: int, blocked_unacked: int, bulk_budget: int) -> None:
+        nonlocal adaptive_state, adaptive_last_eval_ts, adaptive_samples, adaptive_payload_mbps_sum, adaptive_wire_mbps_sum
+        nonlocal adaptive_rtt_ms_sum, adaptive_max_rtt_ms, adaptive_retrans_sum, adaptive_blocked_unacked_sum
+        nonlocal adaptive_prev_payload_mbps, adaptive_good_windows, adaptive_bad_windows, adaptive_eval_events
+        nonlocal adaptive_window_up_events, adaptive_window_down_events, adaptive_burst_up_events, adaptive_burst_down_events
+        nonlocal wifi_guard_active, summary_wifi_guard_entries
+        if not adaptive_enabled:
+            return
+        adaptive_samples += 1
+        adaptive_payload_mbps_sum += float(payload_mbps)
+        adaptive_wire_mbps_sum += float(wire_mbps)
+        adaptive_rtt_ms_sum += float(rtt_ms)
+        adaptive_max_rtt_ms = max(float(adaptive_max_rtt_ms), float(rtt_ms))
+        adaptive_retrans_sum += int(retrans)
+        adaptive_blocked_unacked_sum += int(blocked_unacked)
+        if float(now_ts) - float(adaptive_last_eval_ts) < float(adaptive_eval_interval):
+            return
+        if adaptive_samples <= 0:
+            adaptive_last_eval_ts = float(now_ts)
+            return
+
+        avg_payload = adaptive_payload_mbps_sum / max(1, adaptive_samples)
+        avg_wire = adaptive_wire_mbps_sum / max(1, adaptive_samples)
+        avg_rtt = adaptive_rtt_ms_sum / max(1, adaptive_samples)
+        max_rtt = float(adaptive_max_rtt_ms)
+        retrans_sum = int(adaptive_retrans_sum)
+        blocked_sum = int(adaptive_blocked_unacked_sum)
+        prev_payload = float(adaptive_prev_payload_mbps or 0.0)
+        adaptive_eval_events += 1
+
+        throughput_drop = bool(prev_payload > 1.0 and avg_payload < prev_payload * 0.82)
+        severe_bad = bool(max_rtt >= 800.0 or retrans_sum >= 160)
+        bad = bool(max_rtt >= 700.0 or avg_rtt >= 320.0 or retrans_sum >= 96 or (throughput_drop and retrans_sum >= 32))
+        good = bool(avg_rtt <= 240.0 and max_rtt <= 520.0 and retrans_sum <= 24 and avg_payload >= max(prev_payload * 0.95, 1.0))
+        headroom = bool(blocked_sum >= max(300, adaptive_samples * 40))
+
+        action = "hold"
+        reason = f"avg_payload={avg_payload:.2f}, avg_rtt={avg_rtt:.1f}, max_rtt={max_rtt:.1f}, retrans={retrans_sum}, blocked_unacked={blocked_sum}, prev_payload={prev_payload:.2f}"
+
+        if bad:
+            adaptive_bad_windows += 1
+            adaptive_good_windows = 0
+            adaptive_state = "GUARD"
+            if int(lan_current_burst) > int(lan_guard_burst):
+                # First reaction: reduce burst only. Do not shrink the in-flight
+                # window unless the path is still bad while already guarded.
+                adaptive_burst_down_events += 1
+                _set_lan_burst(lan_guard_burst, reason=reason, source="ADAPTIVE_WIFI_STATS")
+                wifi_guard_active = True
+                summary_wifi_guard_entries += 1
+                action = "burst_down"
+            elif severe_bad or adaptive_bad_windows >= 2:
+                target = max(adaptive_min_unacked, int(adaptive_current_unacked) - int(adaptive_step_unacked))
+                if target < int(adaptive_current_unacked):
+                    adaptive_window_down_events += 1
+                    _set_adaptive_unacked(target, reason=reason)
+                    action = "window_down"
+                    adaptive_bad_windows = 0
+        elif good:
+            adaptive_good_windows += 1
+            adaptive_bad_windows = 0
+            if int(lan_current_burst) < int(lan_base_burst) and adaptive_good_windows >= 2:
+                adaptive_burst_up_events += 1
+                _set_lan_burst(lan_base_burst, reason=reason, source="ADAPTIVE_WIFI_STATS")
+                wifi_guard_active = False
+                adaptive_state = "RECOVERY"
+                action = "burst_restore"
+                adaptive_good_windows = 0
+            elif headroom and adaptive_good_windows >= 2 and int(adaptive_current_unacked) < int(adaptive_max_unacked):
+                target = min(adaptive_max_unacked, int(adaptive_current_unacked) + int(adaptive_step_unacked))
+                adaptive_window_up_events += 1
+                adaptive_state = "PROBE_UP"
+                _set_adaptive_unacked(target, reason=reason)
+                action = "window_up"
+                adaptive_good_windows = 0
+            else:
+                adaptive_state = "STABLE"
+        else:
+            adaptive_good_windows = 0
+            adaptive_bad_windows = 0
+            adaptive_state = "STABLE"
+
+        logger.info(
+            "ADAPTIVE_WIFI_STATS "
+            f"action={action}, state={adaptive_state}, max_unacked={int(adaptive_current_unacked)}, burst={int(lan_current_burst)}, "
+            f"avg_payload_mbps={avg_payload:.2f}, avg_wire_mbps={avg_wire:.2f}, avg_rtt_ms={avg_rtt:.1f}, "
+            f"max_rtt_ms={max_rtt:.1f}, retrans={retrans_sum}, blocked_unacked={blocked_sum}, "
+            f"bulk_budget={int(bulk_budget)}, good_windows={int(adaptive_good_windows)}, bad_windows={int(adaptive_bad_windows)}"
+        )
+
+        adaptive_prev_payload_mbps = float(avg_payload)
+        adaptive_last_eval_ts = float(now_ts)
+        adaptive_samples = 0
+        adaptive_payload_mbps_sum = 0.0
+        adaptive_wire_mbps_sum = 0.0
+        adaptive_rtt_ms_sum = 0.0
+        adaptive_max_rtt_ms = 0.0
+        adaptive_retrans_sum = 0
+        adaptive_blocked_unacked_sum = 0
 
     def note_effective_progress(unacked_count: Optional[int] = None, now_ts: Optional[float] = None) -> None:
         nonlocal last_effective_progress_ts, last_unacked_snapshot
@@ -772,13 +922,19 @@ def run_client(args: argparse.Namespace) -> int:
         )
         session.configure_app_delivery(len_only=False, small_payload_threshold=0)
         session.recovery_pacing_enabled = True
-        session.send_max_unacked_pkts = _effective_max_unacked_pkts(args)
+        session.send_max_unacked_pkts = int(adaptive_current_unacked)
         session.configure_lan_bulk_pacing(
             burst_pkts=int(getattr(args, "lan_pacing_burst_pkts", 32) or 32),
             interval_ms=float(getattr(args, "lan_pacing_interval_ms", 5.0) or 5.0),
             payload_size=int(getattr(args, "payload_size", 1400) or 1400),
         )
         session.configure_reorder_tolerance(int(getattr(args, "reorder_tolerance_pkts", 128) or 128))
+        logger.info(
+            f"ADAPTIVE_WIFI_STATS action=init, enabled={int(bool(adaptive_enabled))}, "
+            f"state={adaptive_state}, max_unacked={int(adaptive_current_unacked)}, "
+            f"min_unacked={int(adaptive_min_unacked)}, max_unacked_limit={int(adaptive_max_unacked)}, "
+            f"burst={int(lan_current_burst)}, burst_min={int(lan_guard_burst)}, eval_interval={float(adaptive_eval_interval):.1f}s"
+        )
 
         min_data_rto = max(0.05, float(args.min_data_rto_sec or 0.2))
         max_data_rto = max(min_data_rto, float(args.max_data_rto_sec or 4.0))
@@ -830,7 +986,7 @@ def run_client(args: argparse.Namespace) -> int:
             session.send_app_data(seq, payload)
 
         def report(force: bool = False) -> None:
-            nonlocal last_report_ts, last_report_bytes, last_json_ts, last_json_bytes, peak_mbps, last_lan_stats_ts, last_lan_sent_pkts, last_lan_acked_pkts, last_lan_retx_pkts, last_lan_wire_bytes_sent, last_lan_bulk_sent_pkts, last_lan_bulk_blocked_pacing, last_lan_bulk_blocked_cwnd, last_lan_bulk_blocked_unacked, last_lan_ack_deleted_pkts, last_lan_ack_scan_pkts, last_lan_blocked_cc, last_lan_blocked_unacked, summary_lan_samples, summary_sent_pps_sum, summary_payload_mbps_sum, summary_wire_mbps_sum, summary_rtt_ms_sum, summary_rtt_ms_max, summary_retrans_total, summary_bulk_blocked_unacked_total, summary_bulk_sent_total, summary_bulk_budget_sum, summary_bulk_budget_max, summary_wifi_guard_entries, wifi_guard_active, wifi_guard_bad_streak, wifi_guard_good_streak
+            nonlocal last_report_ts, last_report_bytes, last_json_ts, last_json_bytes, peak_mbps, last_lan_stats_ts, last_lan_sent_pkts, last_lan_acked_pkts, last_lan_retx_pkts, last_lan_wire_bytes_sent, last_lan_bulk_sent_pkts, last_lan_bulk_blocked_pacing, last_lan_bulk_blocked_cwnd, last_lan_bulk_blocked_unacked, last_lan_ack_deleted_pkts, last_lan_ack_scan_pkts, last_lan_blocked_cc, last_lan_blocked_unacked, summary_lan_samples, summary_sent_pps_sum, summary_payload_mbps_sum, summary_wire_mbps_sum, summary_rtt_ms_sum, summary_rtt_ms_max, summary_retrans_total, summary_bulk_blocked_unacked_total, summary_bulk_sent_total, summary_bulk_budget_sum, summary_bulk_budget_max, summary_wifi_guard_entries, wifi_guard_active, wifi_guard_bad_streak, wifi_guard_good_streak, adaptive_state, adaptive_last_eval_ts, adaptive_samples, adaptive_payload_mbps_sum, adaptive_wire_mbps_sum, adaptive_rtt_ms_sum, adaptive_max_rtt_ms, adaptive_retrans_sum, adaptive_blocked_unacked_sum, adaptive_prev_payload_mbps, adaptive_good_windows, adaptive_bad_windows, adaptive_window_up_events, adaptive_window_down_events, adaptive_burst_up_events, adaptive_burst_down_events, adaptive_eval_events
             now = time.time()
             elapsed = max(now - start_ts, 1e-6)
             pct = (bytes_sent * 100.0 / total_bytes) if total_bytes > 0 else 100.0
@@ -929,31 +1085,38 @@ def run_client(args: argparse.Namespace) -> int:
                     summary_bulk_budget_max = max(int(summary_bulk_budget_max), int(bulk_budget_now))
 
                 # Wi-Fi jitter guard: avoid keeping large bursts when the path
-                # shows queue inflation or a sudden retransmission spike.
-                jitter_bad = bool(rtt_ms >= 500.0 or retrans >= 32)
-                jitter_good = bool(rtt_ms > 0.0 and rtt_ms <= 250.0 and retrans <= 2)
-                if jitter_bad:
-                    wifi_guard_bad_streak += 1
-                    wifi_guard_good_streak = 0
-                elif jitter_good:
-                    wifi_guard_good_streak += 1
-                    wifi_guard_bad_streak = 0
-                else:
-                    wifi_guard_good_streak = 0
+                # shows queue inflation or a sudden retransmission spike.  The
+                # final 2% of a transfer is intentionally frozen because ACK,
+                # unacked and retransmission samples are often tail-biased.
+                adaptive_tail_frozen = bool(total_bytes > 0 and pct >= 98.0)
+                if not adaptive_tail_frozen:
+                    jitter_bad = bool(rtt_ms >= 500.0 or retrans >= 32)
+                    jitter_good = bool(rtt_ms > 0.0 and rtt_ms <= 250.0 and retrans <= 2)
+                    if jitter_bad:
+                        wifi_guard_bad_streak += 1
+                        wifi_guard_good_streak = 0
+                    elif jitter_good:
+                        wifi_guard_good_streak += 1
+                        wifi_guard_bad_streak = 0
+                    else:
+                        wifi_guard_good_streak = 0
 
-                if (not wifi_guard_active) and (wifi_guard_bad_streak >= 2 or retrans >= 32):
-                    wifi_guard_active = True
-                    summary_wifi_guard_entries += 1
-                    _set_lan_burst(lan_guard_burst, reason=f"rtt_ms={rtt_ms:.1f}, retrans={retrans}")
-                elif wifi_guard_active and wifi_guard_good_streak >= 6:
-                    wifi_guard_active = False
-                    _set_lan_burst(lan_base_burst, reason=f"stable_rtt_ms={rtt_ms:.1f}, retrans={retrans}")
+                    if (not wifi_guard_active) and (wifi_guard_bad_streak >= 2 or retrans >= 32):
+                        wifi_guard_active = True
+                        summary_wifi_guard_entries += 1
+                        _set_lan_burst(lan_guard_burst, reason=f"rtt_ms={rtt_ms:.1f}, retrans={retrans}")
+                    elif wifi_guard_active and wifi_guard_good_streak >= 6:
+                        wifi_guard_active = False
+                        _set_lan_burst(lan_base_burst, reason=f"stable_rtt_ms={rtt_ms:.1f}, retrans={retrans}")
+
+                    _maybe_adapt_wifi(now, payload_mbps, wire_mbps, rtt_ms, retrans, bulk_blocked_unacked, bulk_budget_now)
 
                 logger.info(
                     f"LAN_STATS payload_size={int(payload_size)}, payload_mbps={payload_mbps:.2f}, wire_mbps={wire_mbps:.2f}, "
                     f"unacked={int(snap.get('unacked_pkts') or unacked_count or 0)}, inflight_bytes={int(snap.get('inflight_bytes') or 0)}, "
                     f"cwnd_pkts={cwnd_pkts:.1f}, sent_pps={sent_pps:.1f}, ack_pps={ack_pps:.1f}, "
                     f"retrans={retrans}, rtt={rtt_ms:.2f}ms, wifi_guard={int(bool(wifi_guard_active))}, lan_burst={int(lan_current_burst)}, "
+                    f"max_unacked={int(adaptive_current_unacked)}, adaptive_state={adaptive_state}, "
                     f"bulk_budget={int(bulk_budget_now)}, bulk_sent={bulk_sent_delta}, "
                     f"bulk_blocked_pacing={bulk_blocked_pacing}, bulk_blocked_cwnd={bulk_blocked_cwnd}, bulk_blocked_unacked={bulk_blocked_unacked}, "
                     f"ack_deleted={ack_deleted_delta}, ack_scan={ack_scan_delta}, inflight_repairs={int(snap.get('inflight_repair_count') or 0)}, "
@@ -1149,7 +1312,11 @@ def run_client(args: argparse.Namespace) -> int:
             f"retrans_total={int(final_retrans_total)}, bulk_blocked_unacked_total={int(final_bulk_blocked_unacked_total)}, "
             f"bulk_sent_total={int(summary_bulk_sent_total)}, avg_bulk_budget={summary_avg_bulk_budget:.1f}, "
             f"max_bulk_budget={int(summary_bulk_budget_max)}, wifi_guard_entries={int(summary_wifi_guard_entries)}, "
-            f"final_lan_burst={int(lan_current_burst)}, final_unacked={final_unacked}, inflight_repairs={final_inflight_repairs}"
+            f"adaptive_enabled={int(bool(adaptive_enabled))}, adaptive_evals={int(adaptive_eval_events)}, "
+            f"adaptive_window_up={int(adaptive_window_up_events)}, adaptive_window_down={int(adaptive_window_down_events)}, "
+            f"adaptive_burst_up={int(adaptive_burst_up_events)}, adaptive_burst_down={int(adaptive_burst_down_events)}, "
+            f"final_max_unacked={int(adaptive_current_unacked)}, final_lan_burst={int(lan_current_burst)}, "
+            f"adaptive_state={adaptive_state}, final_unacked={final_unacked}, inflight_repairs={final_inflight_repairs}"
         )
         logger.info(build_transfer_complete_log(
             conn_id=int(getattr(session, "conn_id", 0) or 0),

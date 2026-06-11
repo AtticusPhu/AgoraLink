@@ -7,7 +7,7 @@
 !define APP_VERSION "1.0.0"
 
 Name "${APP_NAME}"
-OutFile "${ROOT}\dist\AgoraLink_Setup.exe"
+OutFile "${ROOT}\dist\AgoraLink_Setup_v0.0.4.exe"
 InstallDir "$LOCALAPPDATA\Programs\${APP_NAME}"
 InstallDirRegKey HKCU "Software\${APP_NAME}" "InstallDir"
 RequestExecutionLevel user
@@ -58,4 +58,5 @@ Section "Uninstall"
     DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"
     DeleteRegKey HKCU "Software\${APP_NAME}"
 SectionEnd
+
 

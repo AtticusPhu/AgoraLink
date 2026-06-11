@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import re
 import secrets
 import subprocess
 import sys
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -66,6 +69,31 @@ def append_worker_debug_log(role: str, line: str) -> None:
         pass
 
 
+def gui_config_file() -> Path:
+    return user_data_dir() / "gui_settings.json"
+
+
+def load_gui_config() -> Dict[str, object]:
+    path = gui_config_file()
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_gui_config(data: Dict[str, object]) -> None:
+    try:
+        path = gui_config_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(dict(data or {}), ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def receiver_pin_file(ip: str, port: int) -> Path:
     """Return the per-receiver TOFU pin path used by the sender role.
 
@@ -94,6 +122,69 @@ def format_file_size(num_bytes: int) -> str:
 def is_image_file_for_preview(path_or_name: str) -> bool:
     ext = Path(str(path_or_name or "")).suffix.lower()
     return ext in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
+
+
+def thumbnail_cache_dir() -> Path:
+    path = user_data_dir() / "thumbnail_cache"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def thumbnail_cache_key(path: str) -> str:
+    try:
+        p = Path(path)
+        st = p.stat()
+        raw = f"{str(p.resolve())}|{int(st.st_size)}|{int(st.st_mtime_ns)}"
+    except Exception:
+        raw = str(path or "")
+    return hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:32]
+
+
+def cleanup_thumbnail_cache(max_bytes: int = 256 * 1024 * 1024, max_files: int = 5000) -> None:
+    """Best-effort cache trim for generated picker thumbnails."""
+    try:
+        cache = thumbnail_cache_dir()
+        files = [p for p in cache.glob("*.png") if p.is_file()]
+        if not files:
+            return
+        records = []
+        total = 0
+        for p in files:
+            try:
+                st = p.stat()
+                records.append((float(st.st_mtime), int(st.st_size), p))
+                total += int(st.st_size)
+            except Exception:
+                continue
+        records.sort(key=lambda x: x[0])
+        while records and (total > int(max_bytes) or len(records) > int(max_files)):
+            _mtime, size, p = records.pop(0)
+            try:
+                p.unlink(missing_ok=True)
+                total -= int(size)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def file_icon_text(path_or_name: str, is_dir: bool = False) -> str:
+    if is_dir:
+        return "DIR"
+    ext = Path(str(path_or_name or "")).suffix.lower().lstrip(".")
+    if not ext:
+        return "FILE"
+    mapping = {
+        "jpg": "IMG", "jpeg": "IMG", "png": "IMG", "bmp": "IMG", "gif": "IMG", "webp": "IMG",
+        "mp4": "VID", "mkv": "VID", "avi": "VID", "mov": "VID", "wmv": "VID",
+        "mp3": "AUD", "wav": "AUD", "flac": "AUD", "aac": "AUD",
+        "zip": "ZIP", "rar": "RAR", "7z": "7Z",
+        "pdf": "PDF",
+        "doc": "DOC", "docx": "DOC", "xls": "XLS", "xlsx": "XLS", "ppt": "PPT", "pptx": "PPT",
+        "py": "PY", "json": "JSON", "txt": "TXT", "md": "MD",
+        "exe": "EXE", "msi": "MSI",
+    }
+    return mapping.get(ext, ext[:4].upper())
 
 
 def file_type_badge(path_or_name: str) -> str:
@@ -215,7 +306,7 @@ from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.core.text import LabelBase, DEFAULT_FONT
 from kivy.metrics import dp
-from kivy.properties import StringProperty
+from kivy.properties import StringProperty, BooleanProperty, ObjectProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.checkbox import CheckBox
@@ -226,6 +317,9 @@ from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.progressbar import ProgressBar
+from kivy.uix.recycleview import RecycleView
+from kivy.uix.recycleboxlayout import RecycleBoxLayout
+from kivy.uix.recycleview.views import RecycleDataViewBehavior
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.tabbedpanel import TabbedPanel, TabbedPanelItem
@@ -476,6 +570,28 @@ CHAT_UI_TEXT = {
         "input_hint": "输入消息，按 Enter 发送",
         "send": "发送",
         "send_file": "发送文件",
+        "choose_file_or_folder": "选择发送内容",
+        "choose_files_multi": "选择文件",
+        "choose_folder_package": "选择文件夹",
+        "cancel": "取消",
+        "multi_file_send_mode": "已选择 {n} 个文件。请选择发送方式：",
+        "multi_folder_send_mode": "已选择 {n} 个文件夹。请选择发送方式：",
+        "send_separately": "分别发送",
+        "package_send": "合并发送",
+        "packaging_files": "正在打包 {n} 个项目...",
+        "package_created": "已生成打包文件：{name}",
+        "package_failed": "打包失败：{error}",
+        "mixed_picker_title": "选择文件或文件夹",
+        "mixed_picker_up": "上一级",
+        "mixed_picker_home": "主页",
+        "mixed_picker_refresh": "刷新",
+        "mixed_picker_clear": "清空选择",
+        "mixed_picker_send": "发送选中项",
+        "mixed_picker_selected": "已选择 {n} 个项目",
+        "mixed_picker_auto_package_on": "多选默认合并为 ZIP：开启",
+        "mixed_picker_auto_package_off": "多选默认合并为 ZIP：关闭",
+        "mixed_picker_open": "进入",
+        "multi_auto_package_setting": "多选后默认合并为 ZIP",
         "right_title": "群成员 / 设备信息",
         "shared_files": "共享文件",
         "new_group": "新建群",
@@ -549,6 +665,16 @@ CHAT_UI_TEXT = {
         "input_hint": "Type a message, press Enter to send",
         "send": "Send",
         "send_file": "File",
+        "choose_file_or_folder": "Choose content to send",
+        "choose_files_multi": "Choose files",
+        "choose_folder_package": "Choose folder (package automatically)",
+        "cancel": "Cancel",
+        "multi_file_send_mode": "{n} files selected. Choose how to send:",
+        "send_separately": "Send separately",
+        "package_send": "Merge and send",
+        "packaging_files": "Packaging {n} item(s)...",
+        "package_created": "Package created: {name}",
+        "package_failed": "Packaging failed: {error}",
         "right_title": "Members / Device Info",
         "shared_files": "Shared Files",
         "new_group": "New Group",
@@ -627,12 +753,17 @@ def find_cjk_font() -> Optional[str]:
             candidates.extend(sorted(bundled_font_dir.glob(pattern)))
     if IS_WINDOWS:
         win = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+        # Prefer UI-oriented CJK fonts. Emoji-like glyphs are deliberately not
+        # used in the custom picker, so a stable Chinese UI font is enough.
         candidates.extend([
             win / "msyh.ttc",       # Microsoft YaHei
             win / "msyh.ttf",
+            win / "msyhbd.ttc",
+            win / "Microsoft YaHei UI.ttf",
             win / "simhei.ttf",
             win / "simsun.ttc",
             win / "Deng.ttf",
+            win / "Dengb.ttf",
         ])
     elif sys.platform == "darwin":
         candidates.extend([
@@ -1034,6 +1165,136 @@ class CircularProgressButton(Button):
             pass
 
 
+
+class MixedPickerRow(RecycleDataViewBehavior, BoxLayout):
+    full_path = StringProperty("")
+    display_name = StringProperty("")
+    type_text = StringProperty("")
+    size_text = StringProperty("")
+    modified_text = StringProperty("")
+    attr_text = StringProperty("")
+    icon_text = StringProperty("")
+    thumb_source = StringProperty("")
+    selected = BooleanProperty(False)
+    is_dir = BooleanProperty(False)
+    is_previewable = BooleanProperty(False)
+    on_toggle = ObjectProperty(None, allownone=True)
+    on_open = ObjectProperty(None, allownone=True)
+    on_request_thumb = ObjectProperty(None, allownone=True)
+    on_preview = ObjectProperty(None, allownone=True)
+
+    def __init__(self, **kwargs):
+        super().__init__(orientation="horizontal", size_hint_y=None, height=dp(34), spacing=dp(4), padding=(0, dp(2), 0, dp(2)), **kwargs)
+        self._last_thumb_source = ""
+        self.select_btn = make_button("secondary", text="选择", size_hint_x=None, width=dp(52))
+        self.preview_box = FloatLayout(size_hint_x=None, width=dp(38))
+        self.preview_img = Image(source="", fit_mode="contain", allow_stretch=True, keep_ratio=True)
+        self.preview_label = make_label(text="", halign="center", valign="middle", font_size="10sp", bold=True, color=THEME["muted_text"])
+        bind_label_wrap(self.preview_label)
+        self.preview_box.add_widget(self.preview_img)
+        self.preview_box.add_widget(self.preview_label)
+        self.name_btn = make_button("secondary", text="", halign="left")
+        self.size_label = make_label(text="", size_hint_x=None, width=dp(92), halign="right", valign="middle", color=THEME["muted_text"])
+        self.type_label = make_label(text="", size_hint_x=None, width=dp(88), halign="left", valign="middle", color=THEME["muted_text"])
+        self.modified_label = make_label(text="", size_hint_x=None, width=dp(138), halign="left", valign="middle", color=THEME["muted_text"])
+        self.attr_label = make_label(text="", size_hint_x=None, width=dp(58), halign="left", valign="middle", color=THEME["muted_text"])
+        self.open_btn = make_button("secondary", text="进入", size_hint_x=None, width=dp(58))
+        self.preview_btn = make_button("secondary", text="预览", size_hint_x=None, width=dp(64))
+        for lab in (self.type_label, self.size_label, self.modified_label, self.attr_label):
+            bind_label_wrap(lab)
+        self.preview_box.bind(pos=lambda *_: self._layout_preview(), size=lambda *_: self._layout_preview())
+        self.select_btn.bind(on_release=lambda *_: self._toggle())
+        self.name_btn.bind(on_release=lambda *_: self._toggle())
+        self.open_btn.bind(on_release=lambda *_: self._open())
+        self.preview_btn.bind(on_release=lambda *_: self._preview())
+        self.add_widget(self.select_btn)
+        self.add_widget(self.preview_box)
+        self.add_widget(self.name_btn)
+        self.add_widget(self.size_label)
+        self.add_widget(self.type_label)
+        self.add_widget(self.modified_label)
+        self.add_widget(self.attr_label)
+        self.add_widget(self.open_btn)
+        self.add_widget(self.preview_btn)
+        self._sync()
+
+    def _layout_preview(self):
+        try:
+            self.preview_img.pos = self.preview_box.pos
+            self.preview_img.size = self.preview_box.size
+            self.preview_label.pos = self.preview_box.pos
+            self.preview_label.size = self.preview_box.size
+            self.preview_label.text_size = self.preview_box.size
+        except Exception:
+            pass
+
+    def refresh_view_attrs(self, rv, index, data):
+        ret = super().refresh_view_attrs(rv, index, data)
+        self._sync()
+        return ret
+
+    def _sync(self):
+        try:
+            self.select_btn.text = "已选" if self.selected else "选择"
+            style_button(self.select_btn, "primary" if self.selected else "secondary")
+            prefix = "" if self.display_name == ".." else ("[文件夹] " if self.is_dir else "")
+            self.name_btn.text = prefix + str(self.display_name or "")
+            self.type_label.text = str(self.type_text or ("文件夹" if self.is_dir else "文件"))
+            self.size_label.text = str(self.size_text or "")
+            self.modified_label.text = str(self.modified_text or "")
+            self.attr_label.text = str(self.attr_text or "")
+            self.open_btn.disabled = not bool(self.is_dir)
+            self.open_btn.opacity = 1.0 if self.is_dir else 0.25
+            self.preview_btn.disabled = not bool(self.is_previewable)
+            self.preview_btn.opacity = 1.0 if self.is_previewable else 0.25
+            self.name_btn.font_name = UI_FONT
+            self.select_btn.font_name = UI_FONT
+            self.open_btn.font_name = UI_FONT
+            self.preview_btn.font_name = UI_FONT
+            self.preview_label.font_name = UI_FONT
+            source = str(self.thumb_source or "")
+            if (not source) and (not self.is_dir) and str(self.icon_text or "").upper() == "IMG":
+                cb = self.on_request_thumb
+                if callable(cb):
+                    try:
+                        source = str(cb(str(self.full_path or "")) or "")
+                    except Exception:
+                        source = ""
+            if source and Path(source).exists():
+                if source != self._last_thumb_source:
+                    self.preview_img.source = source
+                    self.preview_img.reload()
+                    self._last_thumb_source = source
+                self.preview_img.opacity = 1.0
+                self.preview_label.opacity = 0.0
+                self.preview_label.text = ""
+            else:
+                if self._last_thumb_source:
+                    self.preview_img.source = ""
+                    self._last_thumb_source = ""
+                self.preview_img.opacity = 0.0
+                self.preview_label.opacity = 1.0
+                self.preview_label.text = str(self.icon_text or ("DIR" if self.is_dir else "FILE"))
+            self._layout_preview()
+        except Exception:
+            pass
+
+    def _toggle(self):
+        cb = self.on_toggle
+        if callable(cb):
+            cb(str(self.full_path or ""))
+
+    def _open(self):
+        cb = self.on_open
+        if callable(cb):
+            cb(str(self.full_path or ""))
+
+    def _preview(self):
+        cb = self.on_preview
+        if callable(cb):
+            cb(str(self.full_path or ""))
+
+
 class ChatMessageBox(BoxLayout):
     def __init__(self, root_owner=None, **kwargs):
         super().__init__(orientation="vertical", **kwargs)
@@ -1203,12 +1464,14 @@ class ChatMessageBox(BoxLayout):
         return max(0.0, min(100.0, pct)), bool(failed), bool(complete), detail
 
 
-    def add_message(self, *, mine: bool, sender: str, text: str, timestamp: str, summary: str = "", body_type: str = "text", file_path: str = "", message_id: str = "", progress_text: str = "", total_size: int = 0) -> None:
+    def add_message(self, *, mine: bool, sender: str, text: str, timestamp: str, summary: str = "", body_type: str = "text", file_path: str = "", message_id: str = "", progress_text: str = "", total_size: int = 0, show_sender: bool = False) -> None:
         is_file = body_type == "file"
         raw_text = str(text or "")
+        sender_text = str(sender or "").strip()
+        show_sender_label = bool(show_sender and sender_text and not mine)
         if is_file:
-            line_height = 132
-            bubble_width = 324
+            line_height = 158 if show_sender_label else 136
+            bubble_width = 430
         else:
             # Text bubble sizing:
             # - minimum must contain footer: time + double-check
@@ -1232,7 +1495,7 @@ class ChatMessageBox(BoxLayout):
             text_h = max(32, 22 * wrap_lines + 14)
             footer_h = 20
             retry_h = 31 if mine and "failed" in str(summary or "").lower() else 0
-            line_height = int(text_h + footer_h + retry_h + 52)
+            line_height = int(text_h + footer_h + retry_h + 52 + (22 if show_sender_label else 0))
         line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(line_height), padding=(0, dp(3), 0, dp(3)))
         if mine:
             spacer_left = BoxLayout(size_hint_x=1)
@@ -1242,6 +1505,10 @@ class ChatMessageBox(BoxLayout):
             spacer_right = BoxLayout(size_hint_x=1)
         bubble = BoxLayout(orientation="vertical", spacing=dp(7), padding=(dp(16), dp(15), dp(16), dp(13)), size_hint_x=None, width=dp(bubble_width))
         apply_bubble_background(bubble, "bubble_mine" if mine else "bubble_other", mine=mine, radius=16)
+        if show_sender_label:
+            sender_lab = make_label(text=shorten_middle(sender_text, 28), size_hint_y=None, height=dp(18), halign="left", valign="middle", color=THEME["muted_text"], bold=True)
+            sender_lab.text_size = (dp(max(1, bubble_width - 34)), None)
+            bubble.add_widget(sender_lab)
 
         if is_file:
             file_name = os.path.basename(file_path or text) or text or self._cu("file")
@@ -1249,15 +1516,15 @@ class ChatMessageBox(BoxLayout):
             content = BoxLayout(orientation="horizontal", spacing=dp(14), size_hint_y=None, height=dp(66), padding=(dp(2), 0, dp(2), 0))
             self._add_file_thumbnail(content, file_path, file_name)
             meta = BoxLayout(orientation="vertical", spacing=dp(5), padding=(dp(2), 0, dp(8), 0))
-            name_lab = make_label(text=shorten_middle(file_name, 18), size_hint_y=None, height=dp(24), halign="left", valign="middle", color=THEME["text"], bold=True)
+            name_lab = make_label(text=shorten_middle(file_name, 36), size_hint_y=None, height=dp(24), halign="left", valign="middle", color=THEME["text"], bold=True)
             name_lab.shorten = True
             name_lab.shorten_from = "right"
-            name_lab.text_size = (dp(170), None)
+            name_lab.text_size = (dp(270), None)
             meta.add_widget(name_lab)
-            status_lab = make_label(text=shorten_middle(detail_line, 24), size_hint_y=None, height=dp(30), halign="left", valign="middle", color=THEME["muted_text"])
+            status_lab = make_label(text=shorten_middle(detail_line, 42), size_hint_y=None, height=dp(30), halign="left", valign="middle", color=THEME["muted_text"])
             status_lab.shorten = True
             status_lab.shorten_from = "right"
-            status_lab.text_size = (dp(170), None)
+            status_lab.text_size = (dp(270), None)
             meta.add_widget(status_lab)
             content.add_widget(meta)
             owner = getattr(self, "root_owner", None)
@@ -1321,6 +1588,8 @@ class RUDPTransferRoot(BoxLayout):
         self.chat_password = ""
         self.chat_local_peer_id = os.environ.get("USERNAME") or "local"
         self.chat_nickname = os.environ.get("USERNAME") or "AgoraLinkUser"
+        self.gui_config = load_gui_config()
+        self.auto_package_multi_selection = bool(self.gui_config.get("auto_package_multi_selection", True))
         self.current_chat_mode = "group"
         self.current_group_id = ""
         self.current_peer_id = ""
@@ -1368,8 +1637,9 @@ class RUDPTransferRoot(BoxLayout):
         Window.minimum_height = 680
 
         top = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(44), spacing=dp(8))
-        self.title_label = make_label(font_size="20sp", bold=True, halign="left", valign="middle")
-        bind_label_wrap(self.title_label)
+        # Keep a blank flexible spacer; the old "AgoraLink 文件传输与聊天"
+        # title consumed horizontal/vertical attention after login.
+        self.title_label = make_label(text="", halign="left", valign="middle")
         top.add_widget(self.title_label)
         self.lang_btn = make_button("primary", size_hint_x=None, width=dp(90), on_release=lambda *_: self.toggle_lang())
         top.add_widget(self.lang_btn)
@@ -1609,11 +1879,13 @@ class RUDPTransferRoot(BoxLayout):
         self.chat_items_scroll.add_widget(self.chat_items_box)
         left.add_widget(self.chat_items_scroll)
 
+        # Legacy spinner/list widgets are kept for compatibility with older
+        # selection code, but are intentionally not added to the layout.  Adding
+        # the hidden spinner could leak internal values such as direct::peer::name
+        # above the Scan button on some Kivy builds.
         self.chat_list_box = LogBox(size_hint_y=None, height=0, opacity=0)
         self.chat_list_spinner = style_spinner(Spinner(text="", values=[], size_hint_y=None, height=0, font_name=UI_FONT))
-        self.chat_list_spinner.bind(text=lambda _i, value: self.on_chat_list_selected(value))
-        left.add_widget(self.chat_list_box)
-        left.add_widget(self.chat_list_spinner)
+        self.chat_list_spinner.disabled = True
 
         list_actions = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(6))
         self.scan_devices_btn = make_button("secondary", text=self.cu("scan_devices"), on_release=lambda *_: self.scan_devices_for_chat())
@@ -1623,10 +1895,12 @@ class RUDPTransferRoot(BoxLayout):
         left.add_widget(list_actions)
         root.add_widget(left)
 
-        center = BoxLayout(orientation="vertical", spacing=dp(10), padding=(dp(12), dp(12), dp(12), dp(12)))
+        center = BoxLayout(orientation="vertical", spacing=dp(8), padding=(dp(12), dp(10), dp(12), dp(12)))
         apply_card_background(center, "panel_bg", radius=22)
-        title_bar = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(8))
-        self.current_chat_title = make_button("secondary", text=self.cu("choose_chat"), size_hint_y=None, height=dp(34), halign="left", valign="middle", bold=True, on_release=lambda *_: self.toggle_detail_panel())
+        # The active chat is already highlighted in the left list, so the old
+        # center title bar ("一对一：xxx" / "群聊：xxx") is hidden to save space.
+        title_bar = BoxLayout(orientation="horizontal", size_hint_y=None, height=0, spacing=dp(8), opacity=0, disabled=True)
+        self.current_chat_title = make_button("secondary", text="", size_hint_y=None, height=0, halign="left", valign="middle", bold=True, disabled=True)
         self.current_chat_title.bind(size=lambda inst, _val: setattr(inst, "text_size", (inst.width - dp(16), None)))
         title_bar.add_widget(self.current_chat_title)
         self.online_state_btn = make_button("secondary", text="Online", size_hint_x=None, width=0, opacity=0, disabled=True, on_release=lambda *_: self.toggle_online_state())
@@ -1759,20 +2033,24 @@ class RUDPTransferRoot(BoxLayout):
             pass
 
     def _set_right_action_mode(self, mode: str) -> None:
-        is_direct = mode == "direct"
         is_group = mode == "group"
+        is_owner = bool(is_group and self._is_local_group_owner(getattr(self, "current_group_id", "")))
         if hasattr(self, "right_action1"):
-            self._set_widget_visible(self.right_action1, False)
+            self._set_widget_visible(self.right_action1, is_group)
         if hasattr(self, "right_action2"):
-            self._set_widget_visible(self.right_action2, is_direct or is_group)
+            self._set_widget_visible(self.right_action2, is_group)
         if hasattr(self, "right_member_scroll"):
-            self._set_widget_visible(self.right_member_scroll, is_group, height=210)
+            self._set_widget_visible(self.right_member_scroll, is_group, height=260)
+        if hasattr(self, "new_group_btn"):
+            self._set_button_visible(self.new_group_btn, False)
+        if hasattr(self, "add_member_main_btn"):
+            self._set_button_visible(self.add_member_main_btn, is_group)
         if hasattr(self, "remove_member_main_btn"):
-            self._set_button_visible(self.remove_member_main_btn, is_group)
+            self._set_button_visible(self.remove_member_main_btn, is_group and is_owner)
         if hasattr(self, "leave_group_main_btn"):
             self._set_button_visible(self.leave_group_main_btn, is_group)
         if hasattr(self, "delete_friend_main_btn"):
-            self._set_button_visible(self.delete_friend_main_btn, is_direct)
+            self._set_button_visible(self.delete_friend_main_btn, False)
 
     def set_chat_section(self, section: str) -> None:
         self.current_chat_section = str(section or "recent")
@@ -2243,17 +2521,17 @@ class RUDPTransferRoot(BoxLayout):
             self.current_chat_mode = "group"
             self.current_group_id = gid
             self.current_peer_id = ""
-            self.current_chat_title.text = self.cu("group_chat", title=title, gid=gid)
+            self.current_chat_title.text = ""
         elif text.startswith("direct::"):
             _tag, pid, name = text.split("::", 2)
             self.current_chat_mode = "direct"
             self.current_peer_id = pid
             self.current_group_id = ""
-            self.current_chat_title.text = self.cu("one_to_one", name=name)
+            self.current_chat_title.text = ""
         else:
             # Online device row. Do not auto-save contact.
             self.current_chat_mode = "device"
-            self.current_chat_title.text = self.cu("device_title")
+            self.current_chat_title.text = ""
         self.render_current_chat()
 
     def _transfer_store_tick(self) -> float:
@@ -2371,11 +2649,25 @@ class RUDPTransferRoot(BoxLayout):
         if not hasattr(self, "right_member_box"):
             return
         self.right_member_box.clear_widgets()
-        for m in members:
+        active = []
+        inactive = []
+        for m in members or []:
+            if str(m.get("member_state") or "active") == "active":
+                active.append(m)
+            else:
+                inactive.append(m)
+        for m in active + inactive:
             name = str(m.get("display_name") or m.get("nickname") or m.get("peer_id") or "").strip()
             if not name:
                 continue
-            btn = make_button("secondary", text=name, size_hint_y=None, height=dp(42), halign="center", valign="middle")
+            role = str(m.get("role") or "member")
+            state = str(m.get("member_state") or "active")
+            suffix = " 群主" if role == "owner" else ""
+            if state != "active":
+                suffix += f" {state}"
+            text = shorten_middle(name + suffix, 28)
+            btn = make_button("secondary", text=text, size_hint_y=None, height=dp(38), halign="left", valign="middle")
+            btn.bind(size=lambda inst, _val: setattr(inst, "text_size", (inst.width - dp(12), None)))
             btn.bind(on_release=lambda _btn, member=dict(m): self.show_group_member_detail(member))
             self.right_member_box.add_widget(btn)
 
@@ -2404,6 +2696,11 @@ class RUDPTransferRoot(BoxLayout):
         self._mark_current_chat_read_and_notify()
         try:
             if self.current_chat_mode == "group" and self.current_group_id:
+                members = self.group_service.members(self.current_group_id, include_inactive=True)
+                try:
+                    self._show_detail_panel()
+                except Exception:
+                    pass
                 file_cards = []
                 seen_message_ids = set()
                 last_date_key = ""
@@ -2445,7 +2742,8 @@ class RUDPTransferRoot(BoxLayout):
                         file_cards.append((text, file_path, total_size, ts))
                     sender_id = str(msg.get('sender_peer_id') or '')
                     compact = (sender_id == last_sender and (msg_created_ts - last_ts_for_grouping) <= 300 and body_type != 'file')
-                    self.main_messages_box.add_message(mine=mine_msg, sender=sender_id, text=text, timestamp=ts, summary=summary, body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size)
+                    sender_name = self._display_name_for_peer(sender_id, members)
+                    self.main_messages_box.add_message(mine=mine_msg, sender=sender_name, text=text, timestamp=ts, summary=summary, body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size, show_sender=True)
                     last_sender = sender_id
                     last_ts_for_grouping = msg_created_ts
                 for live in self._live_messages_for_current_chat(seen_message_ids):
@@ -2467,18 +2765,25 @@ class RUDPTransferRoot(BoxLayout):
                         except Exception:
                             pass
                     progress_text = self._file_progress_text(mid, total_size, "") if body_type == "file" else ""
-                    self.main_messages_box.add_message(mine=False, sender=str(live.get("sender_peer_id") or ""), text=text_live, timestamp=ts, summary="", body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size)
-                members = self.group_service.members(self.current_group_id, include_inactive=True)
+                    live_sender_id = str(live.get("sender_peer_id") or "")
+                    self.main_messages_box.add_message(mine=False, sender=self._display_name_for_peer(live_sender_id, members), text=text_live, timestamp=ts, summary="", body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size, show_sender=True)
+                active_count = sum(1 for m in members if str(m.get("member_state") or "active") == "active")
+                total_count = len(members)
                 if hasattr(self, "right_title"):
-                    self.right_title.text = self.cu("group_members_title")
+                    self.right_title.text = f"群成员（{active_count}/{total_count}）"
                 self._set_right_action_mode("group")
                 if hasattr(self, "right_member_scroll"):
                     self._set_widget_visible(self.right_member_scroll, True, height=210)
                 self._render_group_member_buttons(members)
-                self.right_info_box.text.text = self.cu("member_detail_hint")
+                role_text = "群主" if self._is_local_group_owner(self.current_group_id, members) else "成员"
+                self.right_info_box.text.text = f"群成员：{active_count}/{total_count}\n我的角色：{role_text}\n点击成员可查看详情。"
                 for name, path, size, tsf in reversed(file_cards[-8:]):
                     self._add_shared_file_entry(name, path, size, tsf)
             elif self.current_chat_mode == "direct" and self.current_peer_id:
+                try:
+                    self._hide_detail_panel()
+                except Exception:
+                    pass
                 conv = self.message_service.create_direct_conversation(self.current_peer_id)
                 file_cards = []
                 seen_message_ids = set()
@@ -2633,7 +2938,7 @@ class RUDPTransferRoot(BoxLayout):
         style_button(self.chat_tab_btn, "active" if self.current_page in ("chat", "agora_chat") else "secondary")
 
     def refresh_texts(self) -> None:
-        self.title_label.text = self.t("title")
+        self.title_label.text = ""
         self.lang_btn.text = self.t("toggle_lang")
         self.send_tab_btn.text = self.t("send_tab")
         self.recv_tab_btn.text = self.t("recv_tab")
@@ -2696,7 +3001,7 @@ class RUDPTransferRoot(BoxLayout):
             if hasattr(self, "add_contact_btn"):
                 self.add_contact_btn.text = self.cu("add_contact")
             if hasattr(self, "current_chat_title") and self.current_chat_mode not in ("group", "direct", "device"):
-                self.current_chat_title.text = self.cu("choose_chat")
+                self.current_chat_title.text = ""
             if hasattr(self, "main_message_input"):
                 self.main_message_input.hint_text = self.cu("input_hint")
             if hasattr(self, "main_send_btn"):
@@ -2985,6 +3290,13 @@ class RUDPTransferRoot(BoxLayout):
         self.chat_unlocked = True
         self.basic_mode = False
         self.receiver_name_input.text = nickname
+        try:
+            self.enter_chat_btn.disabled = True
+            self.enter_chat_btn.opacity = 0.0
+            self.enter_chat_btn.width = 0
+            self.enter_chat_btn.size_hint_x = None
+        except Exception:
+            pass
         self.show_page("agora_chat")
         self.refresh_chat_main()
         self.start_receiver(auto=True)
@@ -3004,6 +3316,12 @@ class RUDPTransferRoot(BoxLayout):
         theme_spinner = style_spinner(Spinner(text=getattr(self, "theme_mode", "跟随系统"), values=["跟随系统", "浅色", "深色"], font_name=UI_FONT))
         theme_line.add_widget(theme_spinner)
         content.add_widget(theme_line)
+        package_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(8))
+        package_line.add_widget(make_label(text=self.cu("multi_auto_package_setting"), size_hint_x=None, width=dp(220), color=THEME["muted_text"], halign="left", valign="middle"))
+        bind_label_wrap(package_line.children[0])
+        package_checkbox = CheckBox(active=bool(getattr(self, "auto_package_multi_selection", True)), size_hint_x=None, width=dp(42))
+        package_line.add_widget(package_checkbox)
+        content.add_widget(package_line)
         log = LogBox(size_hint_y=1)
         protocol_text = "\n".join(self.debug_protocol_lines[-160:]) or "暂无协议日志。"
         runtime_text = "\n".join(self.debug_runtime_lines[-120:]) or "暂无运行日志。"
@@ -3024,7 +3342,13 @@ class RUDPTransferRoot(BoxLayout):
         def _apply_theme(*_):
             self.theme_mode = theme_spinner.text
             self.apply_theme_mode(self.theme_mode)
-        buttons.add_widget(make_button("primary", text="应用主题", on_release=_apply_theme))
+            self.auto_package_multi_selection = bool(package_checkbox.active)
+            try:
+                self.gui_config["auto_package_multi_selection"] = bool(self.auto_package_multi_selection)
+                save_gui_config(self.gui_config)
+            except Exception:
+                pass
+        buttons.add_widget(make_button("primary", text="应用设置", on_release=_apply_theme))
         buttons.add_widget(make_button("secondary", text="打开防火墙脚本", on_release=lambda *_: self.allow_firewall()))
         buttons.add_widget(make_button("secondary", text="关闭", on_release=lambda *_: popup.dismiss()))
         content.add_widget(buttons)
@@ -3564,7 +3888,7 @@ class RUDPTransferRoot(BoxLayout):
             self.group_service.delete_group_data(gid)
             self.current_group_id = ""
             self.current_chat_mode = ""
-            self.current_chat_title.text = self.cu("choose_chat")
+            self.current_chat_title.text = ""
             self.refresh_chat_main()
             self.render_current_chat()
         self._confirm_action("退出群组", f"确认退出群组 {gid}？\n该群相关成员、消息、回执都会从本机删除。", _do)
@@ -3579,7 +3903,7 @@ class RUDPTransferRoot(BoxLayout):
             self.contact_service.delete_contact_local(pid)
             self.current_peer_id = ""
             self.current_chat_mode = ""
-            self.current_chat_title.text = self.cu("choose_chat")
+            self.current_chat_title.text = ""
             self.refresh_chat_main()
             self.render_current_chat()
         self._confirm_action("删除联系人", f"确认删除联系人 {pid}？\n该联系人、一对一聊天记录和相关回执都会从本机删除。", _do)
@@ -3884,9 +4208,815 @@ class RUDPTransferRoot(BoxLayout):
         if self.current_chat_mode not in ("direct", "group"):
             self.main_messages_box.append("请先选择聊天对象。\n")
             return
-        self._native_file_dialog(select_dir=False, callback=lambda path: self._send_file_path_to_current_chat(path))
+        self._mixed_file_folder_dialog(callback=self._handle_mixed_selected_paths)
 
-    def _send_file_path_to_current_chat(self, path: str) -> None:
+    def _common_picker_shortcuts(self) -> List[Tuple[str, str]]:
+        shortcuts: List[Tuple[str, str]] = []
+        home = Path.home()
+        candidates = [
+            ("主页", home),
+            ("桌面", home / "Desktop"),
+            ("下载", home / "Downloads"),
+            ("文档", home / "Documents"),
+            ("图片", home / "Pictures"),
+        ]
+        for label, p in candidates:
+            try:
+                if p.exists() and p.is_dir():
+                    shortcuts.append((label, str(p)))
+            except Exception:
+                pass
+        if IS_WINDOWS:
+            try:
+                import ctypes
+                mask = int(ctypes.windll.kernel32.GetLogicalDrives())
+                for i in range(26):
+                    if mask & (1 << i):
+                        drive = f"{chr(65 + i)}:\\"
+                        shortcuts.append((drive, drive))
+            except Exception:
+                pass
+        return shortcuts
+
+    def _mixed_file_folder_dialog(self, callback) -> None:
+        """Explorer-like picker using RecycleView.
+
+        It can select files and folders in one window.  The row renderer avoids
+        emoji glyphs so CJK file names render with the registered UI font.
+        """
+        state = {
+            "path": str(Path.home()),
+            "selected": set(),
+            "thumbs": {},
+            "thumb_pending": set(),
+            "refreshing": False,
+            "thumb_executor": ThreadPoolExecutor(max_workers=2),
+            "thumb_refresh_scheduled": False,
+            "sort_by": "name",
+            "sort_reverse": False,
+            "query": "",
+        }
+        content = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(8))
+
+        top = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(6))
+        btn_up = make_button("secondary", text="上一级", size_hint_x=None, width=dp(82))
+        btn_home = make_button("secondary", text="主页", size_hint_x=None, width=dp(70))
+        btn_refresh = make_button("secondary", text="刷新", size_hint_x=None, width=dp(70))
+        path_input = make_input(text=state["path"], multiline=False)
+        search_input = make_input(text="", hint_text="过滤当前目录", multiline=False, size_hint_x=None, width=dp(180))
+        top.add_widget(btn_up)
+        top.add_widget(btn_home)
+        top.add_widget(btn_refresh)
+        top.add_widget(path_input)
+        top.add_widget(search_input)
+        content.add_widget(top)
+
+        body = BoxLayout(orientation="horizontal", spacing=dp(8))
+        side = BoxLayout(orientation="vertical", size_hint_x=None, width=dp(126), spacing=dp(4))
+        file_area = BoxLayout(orientation="vertical", spacing=dp(4))
+
+        header = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(30), spacing=dp(4))
+        header.add_widget(make_label(text="", size_hint_x=None, width=dp(52)))
+        header.add_widget(make_label(text="图标", size_hint_x=None, width=dp(38), halign="center", valign="middle"))
+        btn_sort_name = make_button("secondary", text="名称", halign="center")
+        btn_sort_size = make_button("secondary", text="大小", size_hint_x=None, width=dp(92), halign="center")
+        btn_sort_type = make_button("secondary", text="类型", size_hint_x=None, width=dp(88), halign="center")
+        btn_sort_mtime = make_button("secondary", text="修改时间", size_hint_x=None, width=dp(138), halign="center")
+        header.add_widget(btn_sort_name)
+        header.add_widget(btn_sort_size)
+        header.add_widget(btn_sort_type)
+        header.add_widget(btn_sort_mtime)
+        header.add_widget(make_label(text="属性", size_hint_x=None, width=dp(58), halign="center", valign="middle"))
+        header.add_widget(make_label(text="", size_hint_x=None, width=dp(58)))
+        header.add_widget(make_label(text="预览", size_hint_x=None, width=dp(64), halign="center", valign="middle"))
+        for child in header.children:
+            try:
+                child.halign = "center"
+                child.valign = "middle"
+                child.text_size = (max(1, child.width - dp(8)), child.height)
+                child.bind(size=lambda inst, _val: setattr(inst, "text_size", (max(1, inst.width - dp(8)), inst.height)))
+                if hasattr(child, "padding"):
+                    child.padding = (0, 0)
+            except Exception:
+                pass
+        file_area.add_widget(header)
+
+        rv = RecycleView(size_hint=(1, 1))
+        layout = RecycleBoxLayout(
+            default_size=(None, dp(34)),
+            default_size_hint=(1, None),
+            size_hint_y=None,
+            orientation="vertical",
+            spacing=dp(2),
+        )
+        layout.bind(minimum_height=layout.setter("height"))
+        rv.add_widget(layout)
+        rv.viewclass = "MixedPickerRow"
+        file_area.add_widget(rv)
+
+        body.add_widget(side)
+        body.add_widget(file_area)
+        content.add_widget(body)
+
+        bottom = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(6))
+        selected_label = make_label(text=self.cu("mixed_picker_selected", n=0), halign="left", valign="middle")
+        bind_label_wrap(selected_label)
+        mode_label = make_label(
+            text=self.cu("mixed_picker_auto_package_on" if bool(getattr(self, "auto_package_multi_selection", True)) else "mixed_picker_auto_package_off"),
+            size_hint_x=None,
+            width=dp(270),
+            color=THEME["muted_text"],
+            halign="left",
+            valign="middle",
+        )
+        bind_label_wrap(mode_label)
+        btn_clear = make_button("secondary", text=self.cu("mixed_picker_clear"), size_hint_x=None, width=dp(100))
+        btn_send = make_button("primary", text=self.cu("mixed_picker_send"), size_hint_x=None, width=dp(120))
+        btn_cancel = make_button("secondary", text=self.cu("cancel"), size_hint_x=None, width=dp(80))
+        bottom.add_widget(selected_label)
+        bottom.add_widget(mode_label)
+        bottom.add_widget(btn_clear)
+        bottom.add_widget(btn_send)
+        bottom.add_widget(btn_cancel)
+        content.add_widget(bottom)
+
+        popup = style_popup(Popup(title=self.cu("mixed_picker_title"), content=content, size_hint=(0.90, 0.88)))
+
+        def _shutdown_thumb_executor(*_args):
+            try:
+                executor = state.get("thumb_executor")
+                if executor is not None:
+                    executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                try:
+                    executor.shutdown(wait=False)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        popup.bind(on_dismiss=_shutdown_thumb_executor)
+        try:
+            threading.Thread(target=cleanup_thumbnail_cache, daemon=True).start()
+        except Exception:
+            pass
+
+        def _selected_sorted() -> List[str]:
+            return sorted(list(state["selected"]), key=lambda s: (0 if os.path.isdir(s) else 1, os.path.basename(s).lower()))
+
+        def _update_selected_label() -> None:
+            selected_label.text = self.cu("mixed_picker_selected", n=len(state["selected"]))
+
+        def _toggle_path(path: str) -> None:
+            if not path:
+                return
+            try:
+                path = str(Path(path).resolve())
+            except Exception:
+                path = str(path)
+            selected = state["selected"]
+            if path in selected:
+                selected.remove(path)
+            else:
+                selected.add(path)
+            _update_selected_label()
+            _refresh()
+
+        def _enter_path(path: str) -> None:
+            try:
+                p = Path(path).expanduser().resolve()
+                if p.exists() and p.is_dir():
+                    state["path"] = str(p)
+                    path_input.text = str(p)
+                    _refresh()
+            except Exception as exc:
+                try:
+                    self.sender_log_box.append(f"open folder failed: {exc}\n")
+                except Exception:
+                    pass
+
+        def _thumbnail_path_for(file_path: str) -> str:
+            return str(thumbnail_cache_dir() / (thumbnail_cache_key(file_path) + ".png"))
+
+        def _preview_image(path: str) -> None:
+            try:
+                p = Path(str(path or "")).expanduser()
+                if not p.exists() or not p.is_file() or not is_image_file_for_preview(str(p)):
+                    return
+                box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+                img = Image(source=str(p), fit_mode="contain", allow_stretch=True, keep_ratio=True)
+                box.add_widget(img)
+                row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
+                row.add_widget(make_label(text=p.name, halign="left", valign="middle", shorten=True))
+                popup = style_popup(Popup(title="预览", content=box, size_hint=(0.82, 0.82)))
+                row.add_widget(make_button("secondary", text="关闭", size_hint_x=None, width=dp(90), on_release=lambda *_: popup.dismiss()))
+                box.add_widget(row)
+                apply_ui_font(box)
+                popup.open()
+            except Exception as exc:
+                try:
+                    self._append_debug_line(f"image preview failed: {exc}", protocol=False)
+                except Exception:
+                    pass
+
+        def _schedule_thumbnail_refresh() -> None:
+            if bool(state.get("thumb_refresh_scheduled", False)):
+                return
+            state["thumb_refresh_scheduled"] = True
+
+            def _do_refresh(_dt):
+                state["thumb_refresh_scheduled"] = False
+                try:
+                    _refresh()
+                except Exception:
+                    pass
+
+            Clock.schedule_once(_do_refresh, 0.20)
+
+        def _request_thumbnail(file_path: str) -> str:
+            """Cache-first thumbnail loader for visible rows.
+
+            This version no longer returns the original image as fallback because
+            decoding large originals in Kivy causes visible startup jank.  Rows
+            show the IMG badge until a small cached PNG is ready.
+            """
+            if not file_path or not is_image_file_for_preview(file_path):
+                return ""
+            cached = _thumbnail_path_for(file_path)
+            if os.path.exists(cached):
+                state["thumbs"][file_path] = cached
+                return cached
+            if file_path in state["thumb_pending"]:
+                return ""
+            state["thumb_pending"].add(file_path)
+
+            def _worker():
+                ok = False
+                err = ""
+                try:
+                    from PIL import Image as PILImage, ImageOps
+                    with PILImage.open(file_path) as img:
+                        try:
+                            img = ImageOps.exif_transpose(img)
+                        except Exception:
+                            pass
+                        # Keep the cache small and cheap to upload as a Kivy texture.
+                        img.thumbnail((128, 128))
+                        if img.mode not in ("RGB", "RGBA"):
+                            img = img.convert("RGBA")
+                        out = Path(cached)
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        tmp = out.with_suffix(".tmp.png")
+                        img.save(tmp, format="PNG")
+                        try:
+                            tmp.replace(out)
+                        except Exception:
+                            img.save(out, format="PNG")
+                            try:
+                                tmp.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                    ok = True
+                except Exception as exc:
+                    err = str(exc)
+                    ok = False
+
+                def _done(_dt):
+                    state["thumb_pending"].discard(file_path)
+                    if ok and os.path.exists(cached):
+                        state["thumbs"][file_path] = cached
+                        _schedule_thumbnail_refresh()
+                    elif err:
+                        try:
+                            self._append_debug_line(f"thumbnail cache build failed: {Path(file_path).name}: {err}", protocol=False)
+                        except Exception:
+                            pass
+
+                Clock.schedule_once(_done, 0)
+
+            try:
+                executor = state.get("thumb_executor")
+                if executor is not None:
+                    executor.submit(_worker)
+                else:
+                    threading.Thread(target=_worker, daemon=True).start()
+            except Exception:
+                threading.Thread(target=_worker, daemon=True).start()
+            return ""
+
+        def _file_row_dict(p: Path) -> Dict[str, object]:
+            try:
+                full = str(p.resolve())
+            except Exception:
+                full = str(p)
+            is_dir = p.is_dir()
+            try:
+                st = p.stat()
+                mtime = float(st.st_mtime)
+                modified_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+                size_num = int(st.st_size) if not is_dir else 0
+            except Exception:
+                mtime = 0.0
+                modified_text = ""
+                size_num = 0
+            if is_dir:
+                type_text = "文件夹"
+                size_text = ""
+                icon_text = "DIR"
+                thumb_source = ""
+                attr_text = "D"
+            else:
+                ext = p.suffix.lower().lstrip(".")
+                type_text = ext.upper() if ext else "文件"
+                icon_text = file_icon_text(str(p), is_dir=False)
+                size_text = format_file_size(size_num) if size_num >= 0 else ""
+                thumb_source = state["thumbs"].get(full, "")
+                attr_text = "A"
+            return {
+                "full_path": full,
+                "display_name": p.name,
+                "type_text": type_text,
+                "size_text": size_text,
+                "modified_text": modified_text,
+                "attr_text": attr_text,
+                "icon_text": icon_text,
+                "thumb_source": thumb_source,
+                "selected": full in state["selected"],
+                "is_dir": is_dir,
+                "is_previewable": (not is_dir and is_image_file_for_preview(full)),
+                "sort_name": p.name.lower(),
+                "sort_size": size_num,
+                "sort_type": type_text.lower(),
+                "sort_mtime": mtime,
+                "on_toggle": _toggle_path,
+                "on_open": _enter_path,
+                "on_request_thumb": _request_thumbnail,
+                "on_preview": _preview_image,
+            }
+
+        def _refresh(path: Optional[str] = None) -> None:
+            if path:
+                state["path"] = str(path)
+                path_input.text = str(path)
+            data: List[Dict[str, object]] = []
+            try:
+                cur = Path(str(state["path"] or str(Path.home()))).expanduser()
+                if not cur.exists() or not cur.is_dir():
+                    cur = Path.home()
+                cur = cur.resolve()
+                state["path"] = str(cur)
+                path_input.text = str(cur)
+                if cur.parent != cur:
+                    data.append({
+                        "full_path": str(cur.parent),
+                        "display_name": "..",
+                        "type_text": "上一级",
+                        "size_text": "",
+                        "modified_text": "",
+                        "attr_text": "D",
+                        "icon_text": "UP",
+                        "thumb_source": "",
+                        "selected": False,
+                        "is_dir": True,
+                        "is_previewable": False,
+                        "sort_name": "",
+                        "sort_size": 0,
+                        "sort_type": "上一级",
+                        "sort_mtime": 0.0,
+                        "on_toggle": _enter_path,
+                        "on_open": _enter_path,
+                        "on_request_thumb": None,
+                        "on_preview": None,
+                    })
+                entries: List[Path] = []
+                try:
+                    for child in cur.iterdir():
+                        try:
+                            if child.name.startswith("$") and IS_WINDOWS:
+                                continue
+                            if child.is_dir() or child.is_file():
+                                entries.append(child)
+                        except Exception:
+                            continue
+                    query = str(state.get("query") or "").strip().lower()
+                    if query:
+                        entries = [p for p in entries if query in p.name.lower()]
+                    sort_by = str(state.get("sort_by") or "name")
+                    reverse = bool(state.get("sort_reverse", False))
+                    def _sort_key(p: Path):
+                        try:
+                            is_dir0 = 0 if p.is_dir() else 1
+                            if sort_by == "size":
+                                return (is_dir0, p.stat().st_size if p.is_file() else 0, p.name.lower())
+                            if sort_by == "type":
+                                return (is_dir0, (p.suffix.lower().lstrip(".") if p.is_file() else "文件夹"), p.name.lower())
+                            if sort_by == "mtime":
+                                return (is_dir0, p.stat().st_mtime, p.name.lower())
+                            return (is_dir0, p.name.lower())
+                        except Exception:
+                            return (1, p.name.lower())
+                    entries.sort(key=_sort_key, reverse=reverse)
+                except Exception:
+                    entries = []
+                for child in entries[:4000]:
+                    data.append(_file_row_dict(child))
+            except Exception as exc:
+                data.append({
+                    "full_path": "",
+                    "display_name": f"无法读取目录: {exc}",
+                    "type_text": "错误",
+                    "size_text": "",
+                    "modified_text": "",
+                    "attr_text": "",
+                    "icon_text": "ERR",
+                    "thumb_source": "",
+                    "selected": False,
+                    "is_dir": False,
+                    "is_previewable": False,
+                    "sort_name": "",
+                    "sort_size": 0,
+                    "sort_type": "错误",
+                    "sort_mtime": 0.0,
+                    "on_toggle": None,
+                    "on_open": None,
+                    "on_request_thumb": None,
+                    "on_preview": None,
+                })
+            rv.data = data
+            _update_selected_label()
+
+        def _build_shortcuts() -> None:
+            side.clear_widgets()
+            for label, p in self._common_picker_shortcuts():
+                b = make_button("secondary", text=label, size_hint_y=None, height=dp(34))
+                b.bind(on_release=lambda _btn, pp=p: _enter_path(pp))
+                side.add_widget(b)
+            side.add_widget(make_label(text="", size_hint_y=1))
+
+        def _set_sort(key: str) -> None:
+            if str(state.get("sort_by") or "") == key:
+                state["sort_reverse"] = not bool(state.get("sort_reverse", False))
+            else:
+                state["sort_by"] = key
+                state["sort_reverse"] = False
+            _refresh()
+
+        def _filter_changed(_inst, value: str) -> None:
+            state["query"] = str(value or "")
+            _refresh()
+
+        def _send_selected(*_) -> None:
+            paths = _selected_sorted()
+            if not paths:
+                return
+            popup.dismiss()
+            callback(paths)
+
+        def _goto_input(*_) -> None:
+            _enter_path(path_input.text.strip())
+
+        path_input.bind(on_text_validate=_goto_input)
+        search_input.bind(text=_filter_changed)
+        btn_sort_name.bind(on_release=lambda *_: _set_sort("name"))
+        btn_sort_size.bind(on_release=lambda *_: _set_sort("size"))
+        btn_sort_type.bind(on_release=lambda *_: _set_sort("type"))
+        btn_sort_mtime.bind(on_release=lambda *_: _set_sort("mtime"))
+        btn_up.bind(on_release=lambda *_: _enter_path(str(Path(state["path"]).parent)))
+        btn_home.bind(on_release=lambda *_: _enter_path(str(Path.home())))
+        btn_refresh.bind(on_release=lambda *_: _refresh())
+        btn_clear.bind(on_release=lambda *_: (state["selected"].clear(), _update_selected_label(), _refresh()))
+        btn_send.bind(on_release=_send_selected)
+        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
+
+        _build_shortcuts()
+        _refresh()
+        popup.open()
+
+    def _handle_mixed_selected_paths(self, paths: List[str]) -> None:
+        items = []
+        seen = set()
+        for p in paths or []:
+            sp = str(p or "")
+            if not sp or not (os.path.isfile(sp) or os.path.isdir(sp)):
+                continue
+            key = os.path.normcase(os.path.abspath(sp))
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(sp)
+        if not items:
+            return
+        if len(items) == 1:
+            p = items[0]
+            if os.path.isdir(p):
+                self._package_paths_and_send([p], suggested_name=Path(p).name)
+            else:
+                self._send_file_path_to_current_chat(p)
+            return
+
+        if bool(getattr(self, "auto_package_multi_selection", True)):
+            self._package_paths_and_send(items)
+            return
+
+        for p in items:
+            if os.path.isdir(p):
+                self._package_paths_and_send([p], suggested_name=Path(p).name)
+            else:
+                self._send_file_path_to_current_chat(p)
+
+    def _native_multi_file_dialog(self, callback) -> None:
+        """Open a native multi-file picker, with a Kivy fallback."""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                root.attributes("-topmost", True)
+            except Exception:
+                pass
+            selected = filedialog.askopenfilenames(parent=root, title=self.cu("choose_files_multi"))
+            root.destroy()
+            paths = [str(p) for p in (selected or []) if p]
+            if paths:
+                callback(paths)
+            return
+        except Exception:
+            self.sender_log_box.append(self.t("native_dialog_failed") + "\n")
+            self._multi_file_popup(callback=callback)
+
+    def _multi_file_popup(self, callback) -> None:
+        chooser = FileChooserListView(path=str(Path.home()), multiselect=True)
+        popup = Popup(title=self.cu("choose_files_multi"), content=BoxLayout(orientation="vertical"), size_hint=(0.9, 0.9))
+        box = popup.content
+        box.add_widget(chooser)
+        row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8), padding=dp(8))
+        ok = Button(text="OK")
+        cancel = Button(text=self.cu("cancel"))
+        row.add_widget(ok)
+        row.add_widget(cancel)
+        box.add_widget(row)
+
+        def _ok(*_):
+            paths = [str(p) for p in (chooser.selection or []) if p and os.path.isfile(str(p))]
+            popup.dismiss()
+            if paths:
+                callback(paths)
+
+        ok.bind(on_release=_ok)
+        cancel.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+
+    def _native_multi_folder_dialog(self, callback) -> None:
+        """Open native Windows Explorer folder picker with multi-select.
+
+        Uses Windows IFileOpenDialog when pywin32 is available. Falls back to the
+        built-in Kivy folder chooser when COM is unavailable.
+        """
+        if IS_WINDOWS:
+            try:
+                import pythoncom
+                from win32com.shell import shell, shellcon
+
+                pythoncom.CoInitialize()
+                dialog = pythoncom.CoCreateInstance(
+                    shell.CLSID_FileOpenDialog,
+                    None,
+                    pythoncom.CLSCTX_INPROC_SERVER,
+                    shell.IID_IFileOpenDialog,
+                )
+                options = int(dialog.GetOptions())
+                options |= int(getattr(shellcon, "FOS_PICKFOLDERS", 0x20))
+                options |= int(getattr(shellcon, "FOS_FORCEFILESYSTEM", 0x40))
+                options |= int(getattr(shellcon, "FOS_ALLOWMULTISELECT", 0x200))
+                options |= int(getattr(shellcon, "FOS_PATHMUSTEXIST", 0x800))
+                dialog.SetOptions(options)
+                try:
+                    dialog.SetTitle(self.cu("choose_folder_package"))
+                except Exception:
+                    pass
+                try:
+                    dialog.Show(None)
+                except Exception:
+                    # User cancel or COM dialog failure. Do not show fallback on a
+                    # normal cancel because that feels like the dialog ignored the user.
+                    try:
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        pass
+                    return
+                results = dialog.GetResults()
+                count = int(results.GetCount())
+                paths = []
+                sigdn = int(getattr(shellcon, "SIGDN_FILESYSPATH", 0x80058000))
+                for i in range(count):
+                    try:
+                        item = results.GetItemAt(i)
+                        p = item.GetDisplayName(sigdn)
+                        if p:
+                            paths.append(str(p))
+                    except Exception:
+                        continue
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+                if paths:
+                    callback(paths)
+                return
+            except Exception as exc:
+                try:
+                    self.sender_log_box.append(self.t("native_dialog_failed") + f" ({exc})\n")
+                except Exception:
+                    pass
+        self._multi_folder_popup(callback=callback)
+
+    def _multi_folder_popup(self, callback) -> None:
+        chooser = FileChooserListView(path=str(Path.home()), dirselect=True, multiselect=True)
+        popup = Popup(title=self.cu("choose_folder_package"), content=BoxLayout(orientation="vertical"), size_hint=(0.9, 0.9))
+        box = popup.content
+        box.add_widget(chooser)
+        row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8), padding=dp(8))
+        ok = Button(text="OK")
+        cancel = Button(text=self.cu("cancel"))
+        row.add_widget(ok)
+        row.add_widget(cancel)
+        box.add_widget(row)
+
+        def _ok(*_):
+            paths = [str(p) for p in (chooser.selection or []) if p and os.path.isdir(str(p))]
+            popup.dismiss()
+            if paths:
+                callback(paths)
+
+        ok.bind(on_release=_ok)
+        cancel.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+
+    def _handle_selected_folder_paths(self, paths: List[str]) -> None:
+        folders = []
+        seen = set()
+        for p in paths or []:
+            sp = str(p or "")
+            if not sp or not os.path.isdir(sp):
+                continue
+            key = os.path.normcase(os.path.abspath(sp))
+            if key in seen:
+                continue
+            seen.add(key)
+            folders.append(sp)
+        if not folders:
+            return
+        if len(folders) == 1:
+            self._package_paths_and_send(folders, suggested_name=Path(folders[0]).name)
+            return
+
+        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
+        content.add_widget(make_label(text=self.cu("multi_folder_send_mode", n=len(folders)), size_hint_y=None, height=dp(46), halign="left", valign="middle"))
+        btn_sep = make_button("secondary", text=self.cu("send_separately"), size_hint_y=None, height=dp(44))
+        btn_zip = make_button("primary", text=self.cu("package_send"), size_hint_y=None, height=dp(44))
+        btn_cancel = make_button("secondary", text=self.cu("cancel"), size_hint_y=None, height=dp(40))
+        content.add_widget(btn_zip)
+        content.add_widget(btn_sep)
+        content.add_widget(btn_cancel)
+        popup = Popup(title=self.cu("send_file"), content=content, size_hint=(None, None), size=(dp(460), dp(270)))
+
+        def _send_zip(*_):
+            popup.dismiss()
+            self._package_paths_and_send(folders)
+
+        def _send_sep(*_):
+            popup.dismiss()
+            for p in folders:
+                self._package_paths_and_send([p], suggested_name=Path(p).name)
+
+        btn_zip.bind(on_release=_send_zip)
+        btn_sep.bind(on_release=_send_sep)
+        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+
+    def _handle_selected_file_paths(self, paths: List[str]) -> None:
+        files = []
+        seen = set()
+        for p in paths or []:
+            sp = str(p or "")
+            if not sp or not os.path.isfile(sp):
+                continue
+            key = os.path.normcase(os.path.abspath(sp))
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(sp)
+        if not files:
+            return
+        if len(files) == 1:
+            self._send_file_path_to_current_chat(files[0])
+            return
+
+        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
+        content.add_widget(make_label(text=self.cu("multi_file_send_mode", n=len(files)), size_hint_y=None, height=dp(46), halign="left", valign="middle"))
+        btn_sep = make_button("secondary", text=self.cu("send_separately"), size_hint_y=None, height=dp(44))
+        btn_zip = make_button("primary", text=self.cu("package_send"), size_hint_y=None, height=dp(44))
+        btn_cancel = make_button("secondary", text=self.cu("cancel"), size_hint_y=None, height=dp(40))
+        content.add_widget(btn_zip)
+        content.add_widget(btn_sep)
+        content.add_widget(btn_cancel)
+        popup = Popup(title=self.cu("send_file"), content=content, size_hint=(None, None), size=(dp(460), dp(270)))
+
+        def _send_zip(*_):
+            popup.dismiss()
+            self._package_paths_and_send(files)
+
+        def _send_sep(*_):
+            popup.dismiss()
+            for p in files:
+                self._send_file_path_to_current_chat(p)
+
+        btn_zip.bind(on_release=_send_zip)
+        btn_sep.bind(on_release=_send_sep)
+        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
+        popup.open()
+
+    def _safe_package_name(self, name: str) -> str:
+        raw = str(name or "").strip() or time.strftime("AgoraLink_%Y%m%d_%H%M%S")
+        raw = re.sub(r'[\\/:*?"<>|]+', "_", raw).strip(" ._") or "AgoraLink_package"
+        if not raw.lower().endswith(".zip"):
+            raw += ".zip"
+        return raw
+
+    def _unique_zip_arcname(self, used: set, arcname: str) -> str:
+        arc = str(arcname or "").replace("\\", "/").strip("/")
+        arc = arc or "item"
+        if arc not in used:
+            used.add(arc)
+            return arc
+        base, ext = os.path.splitext(arc)
+        idx = 2
+        while True:
+            candidate = f"{base}_{idx}{ext}"
+            if candidate not in used:
+                used.add(candidate)
+                return candidate
+            idx += 1
+
+    def _create_uncompressed_zip(self, paths: List[str], suggested_name: str = "") -> str:
+        package_dir = user_data_dir() / "temp_packages"
+        package_dir.mkdir(parents=True, exist_ok=True)
+        out_name = self._safe_package_name(suggested_name or time.strftime("AgoraLink_%Y%m%d_%H%M%S"))
+        out_path = package_dir / out_name
+        if out_path.exists():
+            stem, suffix = out_path.stem, out_path.suffix
+            idx = 2
+            while out_path.exists():
+                out_path = package_dir / f"{stem}_{idx}{suffix}"
+                idx += 1
+
+        used = set()
+        with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for raw in paths or []:
+                p = Path(str(raw or "")).resolve()
+                if p.is_file():
+                    arc = self._unique_zip_arcname(used, p.name)
+                    zf.write(str(p), arc)
+                elif p.is_dir():
+                    root_name = self._safe_package_name(p.name).removesuffix(".zip")
+                    for dirpath, dirnames, filenames in os.walk(p, followlinks=False):
+                        dirnames[:] = [d for d in dirnames if not Path(dirpath, d).is_symlink()]
+                        rel_dir = Path(dirpath).resolve().relative_to(p)
+                        if not filenames and not dirnames:
+                            arc_dir = str(Path(root_name) / rel_dir).replace("\\", "/").strip("/") + "/"
+                            if arc_dir not in used:
+                                used.add(arc_dir)
+                                zf.writestr(arc_dir, b"")
+                        for fn in filenames:
+                            fp = Path(dirpath) / fn
+                            if fp.is_symlink() or not fp.is_file():
+                                continue
+                            rel = Path(root_name) / rel_dir / fn
+                            arc = self._unique_zip_arcname(used, str(rel).replace("\\", "/"))
+                            zf.write(str(fp), arc)
+        return str(out_path)
+
+    def _package_paths_and_send(self, paths: List[str], suggested_name: str = "") -> None:
+        valid = [str(p) for p in (paths or []) if p and (os.path.isfile(str(p)) or os.path.isdir(str(p)))]
+        if not valid:
+            return
+        self.main_messages_box.append(self.cu("packaging_files", n=len(valid)) + "\n")
+
+        def _run_package():
+            try:
+                zip_path = self._create_uncompressed_zip(valid, suggested_name=suggested_name)
+                Clock.schedule_once(lambda _dt, zp=zip_path: (
+                    self.main_messages_box.append(self.cu("package_created", name=os.path.basename(zp)) + "\n"),
+                    self._send_file_path_to_current_chat(zp, delete_after_success=True)
+                ), 0)
+            except Exception as exc:
+                Clock.schedule_once(lambda _dt, e=str(exc): self.main_messages_box.append(self.cu("package_failed", error=e) + "\n"), 0)
+
+        threading.Thread(target=_run_package, daemon=True).start()
+
+    def _send_file_path_to_current_chat(self, path: str, delete_after_success: bool = False) -> None:
         if not path or not os.path.isfile(path):
             return
         if self.message_service is None:
@@ -3911,10 +5041,10 @@ class RUDPTransferRoot(BoxLayout):
             self.main_messages_box.append("没有可发送文件的接收对象。\n")
             return
         self.render_current_chat()
-        self._start_file_transfer_for_message(msg=msg, recipients=recipients, path=path)
+        self._start_file_transfer_for_message(msg=msg, recipients=recipients, path=path, delete_after_success=delete_after_success)
 
 
-    def _start_file_transfer_for_message(self, *, msg: Dict[str, object], recipients: List[Dict[str, object]], path: str) -> None:
+    def _start_file_transfer_for_message(self, *, msg: Dict[str, object], recipients: List[Dict[str, object]], path: str, delete_after_success: bool = False) -> None:
         if self.message_service is None or not msg:
             return
         if not path or not os.path.isfile(path):
@@ -3984,6 +5114,7 @@ class RUDPTransferRoot(BoxLayout):
                 self._append_debug_line(f"file mark_failed failed: {exc}; original={err}", protocol=True)
 
         def _run():
+            all_ok = True
             file_meta_text = json.dumps({"kind": "file", "name": os.path.basename(path), "size": file_total, "chat_message_id": chat_message_id}, ensure_ascii=False, separators=(",", ":"))
             for r in recipients:
                 peer_id = str(r.get('peer_id') or '')
@@ -3994,6 +5125,7 @@ class RUDPTransferRoot(BoxLayout):
                     port = 9999
                 if not ip or is_unspecified_ip(ip):
                     Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_failed(pid, 'invalid_endpoint'), self._force_chat_refresh()), 0)
+                    all_ok = False
                     if self.file_transfer_service is not None:
                         self.file_transfer_service.mark_failed(chat_message_id, peer_id=peer_id, direction='outgoing', error='invalid_endpoint')
                     continue
@@ -4023,7 +5155,11 @@ class RUDPTransferRoot(BoxLayout):
                     "--stats-interval", "1",
                     "--payload-size", "1400",
                     "--file-read-chunk-mb", "4",
-                    "--max-unacked-pkts", "1152",
+                    "--max-unacked-pkts", "1024",
+                    "--adaptive-max-unacked-min", "960",
+                    "--adaptive-max-unacked-max", "1536",
+                    "--adaptive-max-unacked-step", "64",
+                    "--adaptive-eval-interval-sec", "5",
                     "--lan-pacing-burst-pkts", "32",
                     "--lan-pacing-interval-ms", "5",
                     "--reorder-tolerance-pkts", "128",
@@ -4037,9 +5173,18 @@ class RUDPTransferRoot(BoxLayout):
                 if ok:
                     Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_delivered(pid), self._force_chat_refresh()), 0)
                 else:
+                    all_ok = False
                     Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_failed(pid, 'file_send_failed'), self._force_chat_refresh()), 0)
                     if self.file_transfer_service is not None:
                         self.file_transfer_service.mark_failed(chat_message_id, peer_id=peer_id, direction='outgoing', error='file_send_failed')
+            if delete_after_success and all_ok:
+                try:
+                    package_root = (user_data_dir() / "temp_packages").resolve()
+                    target = Path(path).resolve()
+                    if package_root in target.parents and target.suffix.lower() == ".zip":
+                        target.unlink(missing_ok=True)
+                except Exception as exc:
+                    self._append_debug_line(f"temporary package cleanup failed: {exc}", protocol=True)
             Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
         threading.Thread(target=_run, daemon=True).start()
 
@@ -4186,7 +5331,7 @@ class RUDPTransferRoot(BoxLayout):
             "--approval-dir", str(approval_dir),
             "--approval-timeout", approval_timeout_text,
             "--idle-timeout", idle_timeout_text,
-            "--max-unacked-pkts", "1152",
+            "--max-unacked-pkts", "1536",
         ]
         if self.chat_store is not None:
             args += ["--chat-db", self.chat_db_path, "--chat-password", self.chat_password, "--chat-local-peer-id", self.chat_local_peer_id, "--chat-local-nickname", self.chat_nickname, "--contact-approval-dir", str(self.contact_approval_dir)]
@@ -4272,7 +5417,7 @@ class RUDPTransferRoot(BoxLayout):
             CONTACT_REQUEST_LOG_PREFIX, CONTACT_RESPONSE_LOG_PREFIX, TRANSFER_REQUEST_LOG_PREFIX,
             TRANSFER_STARTED_LOG_PREFIX, TRANSFER_PROGRESS_LOG_PREFIX,
             TRANSFER_SAVED_LOG_PREFIX, TRANSFER_COMPLETE_LOG_PREFIX, TRANSFER_FAILED_LOG_PREFIX,
-            USER_ERROR_LOG_PREFIX, USER_STATUS_LOG_PREFIX, "LAN_STATS ", "SUMMARY_STATS ", "WIFI_GUARD ",
+            USER_ERROR_LOG_PREFIX, USER_STATUS_LOG_PREFIX, "LAN_STATS ", "SUMMARY_STATS ", "WIFI_GUARD ", "ADAPTIVE_WIFI_STATS ",
         )))
         tev = self._parse_transfer_event_line(text)
         if tev:

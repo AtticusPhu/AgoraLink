@@ -135,9 +135,9 @@ def load_or_create_server_identity_key(path: str, logger=None):
 
 def _effective_max_unacked_pkts(args) -> int:
     try:
-        return max(0, int(getattr(args, "max_unacked_pkts", 1152) or 0))
+        return max(0, int(getattr(args, "max_unacked_pkts", 1536) or 0))
     except Exception:
-        return 1152
+        return 1536
 
 
 def _derived_sockbuf_bytes(args, attr: str = "sock_rcvbuf") -> int:
@@ -190,7 +190,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--complete-ack-timeout", type=float, default=60.0)
     p.add_argument("--stats-interval", type=float, default=1.0)
     p.add_argument("--progress-json-interval", type=float, default=0.2)
-    p.add_argument("--max-unacked-pkts", type=int, default=1152, help="Reference sender max in-flight packets; receiver buffers derive from this")
+    p.add_argument("--max-unacked-pkts", type=int, default=1536, help="Reference sender max in-flight packets; receiver buffers derive from this")
     p.add_argument("--reorder-buffer-pkts", type=int, default=0, help="Receiver reordering/replay floor; 0 derives from max_unacked_pkts")
     p.add_argument("--app-queue-max-items", type=int, default=0, help="Application queue limit; 0 derives from max_unacked_pkts")
     p.add_argument("--server-id-key-file", default="./rudp_receiver_ed25519.key", help="Receiver Ed25519 identity key")
