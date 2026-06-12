@@ -4,8 +4,8 @@
 Run:
     python screen_capability.py
 
-The script prints JSON to stdout. It does not touch AgoraLink protocol, GUI, or
-runtime data files.
+The probe uses real desktop capture by default. FFmpeg encoders compiled into a
+binary are reported separately from encoders that actually run on this machine.
 """
 
 from __future__ import annotations
@@ -35,12 +35,74 @@ ENCODERS_OF_INTEREST = (
 )
 
 TEST_PROFILES = (
-    {"name": "720p30 hevc_qsv", "width": 1280, "height": 720, "fps": 30, "encoder": "hevc_qsv"},
-    {"name": "720p30 h264_qsv", "width": 1280, "height": 720, "fps": 30, "encoder": "h264_qsv"},
-    {"name": "1080p30 h264_qsv", "width": 1920, "height": 1080, "fps": 30, "encoder": "h264_qsv"},
-    {"name": "720p60 h264_qsv", "width": 1280, "height": 720, "fps": 60, "encoder": "h264_qsv"},
-    {"name": "1080p60 h264_qsv", "width": 1920, "height": 1080, "fps": 60, "encoder": "h264_qsv"},
-    {"name": "1080p60 hevc_qsv", "width": 1920, "height": 1080, "fps": 60, "encoder": "hevc_qsv"},
+    {
+        "name": "720p30 hevc_qsv",
+        "mode": "auto",
+        "width": 1280,
+        "height": 720,
+        "fps": 30,
+        "encoder": "hevc_qsv",
+        "experimental": False,
+    },
+    {
+        "name": "720p30 h264_qsv",
+        "mode": "auto",
+        "width": 1280,
+        "height": 720,
+        "fps": 30,
+        "encoder": "h264_qsv",
+        "experimental": False,
+    },
+    {
+        "name": "1080p30 h264_qsv",
+        "mode": "auto",
+        "width": 1920,
+        "height": 1080,
+        "fps": 30,
+        "encoder": "h264_qsv",
+        "experimental": False,
+    },
+    {
+        "name": "720p60 h264_qsv",
+        "mode": "high_fps",
+        "width": 1280,
+        "height": 720,
+        "fps": 60,
+        "encoder": "h264_qsv",
+        "experimental": False,
+    },
+    {
+        "name": "1080p60 h264_qsv",
+        "mode": "experimental",
+        "width": 1920,
+        "height": 1080,
+        "fps": 60,
+        "encoder": "h264_qsv",
+        "experimental": True,
+    },
+    {
+        "name": "1080p60 hevc_qsv",
+        "mode": "experimental",
+        "width": 1920,
+        "height": 1080,
+        "fps": 60,
+        "encoder": "hevc_qsv",
+        "experimental": True,
+    },
+)
+
+AUTO_RECOMMENDATION_ORDER = (
+    "720p30 hevc_qsv",
+    "720p30 h264_qsv",
+    "1080p30 h264_qsv",
+    "1080p30 hevc_qsv",
+)
+
+FATAL_ENCODER_PATTERNS = (
+    "could not open encoder",
+    "unsupported",
+    "no device",
+    "error initializing",
 )
 
 
@@ -64,6 +126,19 @@ def _tail(text: str, max_chars: int = 3000) -> str:
     if len(joined) <= max_chars:
         return joined
     return joined[-max_chars:]
+
+
+def _output_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _has_fatal_encoder_error(text: str) -> bool:
+    lower = str(text or "").lower()
+    return any(pattern in lower for pattern in FATAL_ENCODER_PATTERNS)
 
 
 def find_ffmpeg(explicit_path: str = "") -> Dict[str, object]:
@@ -136,7 +211,7 @@ def parse_ffmpeg_encoders(ffmpeg_path: str) -> Dict[str, object]:
     except Exception as exc:
         return {
             "ok": False,
-            "available": {name: False for name in ENCODERS_OF_INTEREST},
+            "compiled": {name: False for name in ENCODERS_OF_INTEREST},
             "error_tail": str(exc),
         }
     text = (out or "") + "\n" + (err or "")
@@ -147,15 +222,20 @@ def parse_ffmpeg_encoders(ffmpeg_path: str) -> Dict[str, object]:
             found.add(match.group(1))
     return {
         "ok": rc == 0,
-        "available": {name: name in found for name in ENCODERS_OF_INTEREST},
+        "compiled": {name: name in found for name in ENCODERS_OF_INTEREST},
         "error_tail": "" if rc == 0 else _tail(text),
     }
 
 
-def _ffmpeg_test_command(ffmpeg_path: str, profile: Dict[str, object], seconds: float) -> List[str]:
-    size = f"{int(profile['width'])}x{int(profile['height'])}"
-    fps = int(profile["fps"])
-    encoder = str(profile["encoder"])
+def _desktop_capture_command(
+    ffmpeg_path: str,
+    *,
+    width: int,
+    height: int,
+    fps: int,
+    encoder: str,
+    seconds: float,
+) -> List[str]:
     return [
         ffmpeg_path,
         "-hide_banner",
@@ -164,56 +244,101 @@ def _ffmpeg_test_command(ffmpeg_path: str, profile: Dict[str, object], seconds: 
         "-loglevel",
         "info",
         "-f",
-        "lavfi",
+        "gdigrab",
+        "-framerate",
+        str(int(fps)),
         "-i",
-        f"testsrc2=size={size}:rate={fps}",
+        "desktop",
         "-t",
         f"{float(seconds):.3f}",
+        "-vf",
+        f"scale={int(width)}:{int(height)}",
         "-an",
         "-c:v",
-        encoder,
+        str(encoder),
         "-f",
         "null",
         "-",
     ]
 
 
-def _parse_encoded_frames(text: str) -> int:
+def _parse_last_status_metrics(text: str) -> Dict[str, object]:
+    normalized = str(text or "").replace("\r", "\n")
+    fps_values: List[float] = []
     frames = 0
-    for match in re.finditer(r"\bframe=\s*(\d+)", str(text or "")):
+    for match in re.finditer(r"\bfps=\s*([0-9]+(?:\.[0-9]+)?)", normalized):
+        try:
+            fps_values.append(float(match.group(1)))
+        except Exception:
+            pass
+    for match in re.finditer(r"\bframe=\s*(\d+)", normalized):
         try:
             frames = max(frames, int(match.group(1)))
         except Exception:
             pass
-    return frames
+    return {
+        "last_fps": fps_values[-1] if fps_values else None,
+        "frames": frames,
+    }
+
+
+def _profile_result_base(profile: Dict[str, object], *, seconds: float, compiled: bool) -> Dict[str, object]:
+    return {
+        "name": str(profile["name"]),
+        "mode": str(profile.get("mode") or "auto"),
+        "experimental": bool(profile.get("experimental", False)),
+        "encoder": str(profile["encoder"]),
+        "width": int(profile["width"]),
+        "height": int(profile["height"]),
+        "duration_sec": float(seconds),
+        "compiled": bool(compiled),
+        "runtime_ok": False,
+        "ok": False,
+        "avg_fps": 0.0,
+        "target_fps": int(profile["fps"]),
+        "recommended": False,
+        "reason": "",
+        "error_tail": "",
+    }
+
+
+def _reason_for_failure(returncode: Optional[int], combined: str, avg_fps: float, target_fps: int) -> str:
+    if _has_fatal_encoder_error(combined):
+        return "encoder_runtime_error"
+    if returncode is None:
+        return "timeout"
+    if int(returncode) != 0:
+        return f"ffmpeg_exit_{int(returncode)}"
+    if avg_fps <= 0:
+        return "no_fps_observed"
+    if avg_fps < float(target_fps) * 0.90:
+        return "below_realtime_threshold"
+    return "ok"
 
 
 def run_profile_test(
     ffmpeg_path: str,
     profile: Dict[str, object],
-    encoders_available: Dict[str, bool],
+    encoders_compiled: Dict[str, bool],
     seconds: float = 5.0,
 ) -> Dict[str, object]:
     target_fps = int(profile["fps"])
     encoder = str(profile["encoder"])
-    result = {
-        "name": str(profile["name"]),
-        "encoder": encoder,
-        "width": int(profile["width"]),
-        "height": int(profile["height"]),
-        "duration_sec": float(seconds),
-        "ok": False,
-        "avg_fps": 0.0,
-        "target_fps": target_fps,
-        "recommended": False,
-        "error_tail": "",
-    }
-    if not encoders_available.get(encoder, False):
-        result["error_tail"] = "encoder_not_available"
+    result = _profile_result_base(profile, seconds=seconds, compiled=bool(encoders_compiled.get(encoder, False)))
+    if not result["compiled"]:
+        result["reason"] = "encoder_not_compiled"
+        result["error_tail"] = "encoder_not_compiled"
         return result
 
-    cmd = _ffmpeg_test_command(ffmpeg_path, profile, seconds)
-    timeout = max(30.0, float(seconds) * 8.0)
+    cmd = _desktop_capture_command(
+        ffmpeg_path,
+        width=int(profile["width"]),
+        height=int(profile["height"]),
+        fps=target_fps,
+        encoder=encoder,
+        seconds=seconds,
+    )
+    timeout = max(20.0, float(seconds) + 15.0)
     start = time.perf_counter()
     try:
         proc = subprocess.run(
@@ -227,25 +352,68 @@ def run_profile_test(
         )
         elapsed = max(time.perf_counter() - start, 1e-6)
         combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        frames = _parse_encoded_frames(combined)
-        result["ok"] = int(proc.returncode) == 0
-        result["avg_fps"] = round(float(frames) / elapsed, 2) if frames > 0 else 0.0
-        if proc.returncode != 0:
-            result["error_tail"] = _tail(combined)
+        metrics = _parse_last_status_metrics(combined)
+        fps_value = metrics.get("last_fps")
+        if fps_value is None:
+            fps_value = float(metrics.get("frames") or 0) / elapsed if metrics.get("frames") else 0.0
+        avg_fps = round(float(fps_value or 0.0), 2)
+        runtime_ok = int(proc.returncode) == 0 and not _has_fatal_encoder_error(combined)
+        reason = _reason_for_failure(int(proc.returncode), combined, avg_fps, target_fps)
+        result.update({
+            "runtime_ok": bool(runtime_ok),
+            "ok": bool(runtime_ok and avg_fps >= float(target_fps) * 0.90),
+            "avg_fps": avg_fps,
+            "reason": reason,
+            "error_tail": "" if reason == "ok" else _tail(combined),
+        })
     except subprocess.TimeoutExpired as exc:
-        combined = (exc.stdout or "") + "\n" + (exc.stderr or "")
+        combined = _output_text(exc.stdout) + "\n" + _output_text(exc.stderr)
+        result["reason"] = "timeout"
         result["error_tail"] = "timeout\n" + _tail(combined)
     except Exception as exc:
+        result["reason"] = "probe_exception"
         result["error_tail"] = str(exc)
     return result
 
 
+def run_encoder_runtime_test(
+    ffmpeg_path: str,
+    encoder: str,
+    compiled: bool,
+    seconds: float = 1.5,
+) -> Dict[str, object]:
+    result = {
+        "compiled": bool(compiled),
+        "runtime_test_ok": False,
+        "reason": "",
+        "error_tail": "",
+    }
+    if not compiled:
+        result["reason"] = "encoder_not_compiled"
+        return result
+    profile = {
+        "name": f"runtime {encoder}",
+        "mode": "runtime",
+        "width": 640,
+        "height": 360,
+        "fps": 15,
+        "encoder": encoder,
+        "experimental": False,
+    }
+    probe = run_profile_test(ffmpeg_path, profile, {encoder: True}, seconds=max(0.5, float(seconds)))
+    result["runtime_test_ok"] = bool(probe.get("runtime_ok"))
+    result["reason"] = str(probe.get("reason") or ("ok" if probe.get("runtime_ok") else "runtime_failed"))
+    result["error_tail"] = str(probe.get("error_tail") or "")
+    return result
+
+
 def choose_recommended(results: Iterable[Dict[str, object]]) -> Optional[str]:
-    chosen: Optional[str] = None
-    for result in results:
-        if result.get("ok") and float(result.get("avg_fps") or 0.0) >= float(result.get("target_fps") or 0) * 0.95:
-            chosen = str(result.get("name") or "")
-    return chosen or None
+    by_name = {str(result.get("name") or ""): result for result in results}
+    for name in AUTO_RECOMMENDATION_ORDER:
+        result = by_name.get(name)
+        if result and result.get("ok") and not result.get("experimental"):
+            return name
+    return None
 
 
 def probe_screen_capability(ffmpeg_path: str = "", seconds: float = 5.0) -> Dict[str, object]:
@@ -253,27 +421,68 @@ def probe_screen_capability(ffmpeg_path: str = "", seconds: float = 5.0) -> Dict
     gpu = read_gpu_names()
     encoders = {
         "ok": False,
-        "available": {name: False for name in ENCODERS_OF_INTEREST},
+        "compiled": {name: False for name in ENCODERS_OF_INTEREST},
+        "runtime_test_ok": {name: False for name in ENCODERS_OF_INTEREST},
+        "usable": {name: False for name in ENCODERS_OF_INTEREST},
+        "runtime_reason": {name: "ffmpeg_not_available" for name in ENCODERS_OF_INTEREST},
         "error_tail": "ffmpeg_not_available",
     }
     tests: List[Dict[str, object]] = []
 
     if ffmpeg.get("ok"):
-        encoders = parse_ffmpeg_encoders(str(ffmpeg.get("path") or "ffmpeg"))
+        parsed = parse_ffmpeg_encoders(str(ffmpeg.get("path") or "ffmpeg"))
+        encoders["ok"] = bool(parsed.get("ok"))
+        encoders["compiled"] = dict(parsed.get("compiled") or {})
+        encoders["error_tail"] = str(parsed.get("error_tail") or "")
+
         for profile in TEST_PROFILES:
-            tests.append(run_profile_test(str(ffmpeg.get("path") or "ffmpeg"), profile, encoders["available"], seconds=seconds))
+            test = run_profile_test(str(ffmpeg.get("path") or "ffmpeg"), profile, encoders["compiled"], seconds=seconds)
+            tests.append(test)
+            encoder = str(test.get("encoder") or "")
+            if encoder:
+                encoders["runtime_test_ok"][encoder] = bool(encoders["runtime_test_ok"].get(encoder) or test.get("runtime_ok"))
+                if test.get("runtime_ok"):
+                    encoders["runtime_reason"][encoder] = "ok"
+                elif encoders["runtime_reason"].get(encoder) != "ok":
+                    encoders["runtime_reason"][encoder] = str(test.get("reason") or "runtime_failed")
+
+        covered = {str(profile["encoder"]) for profile in TEST_PROFILES}
+        runtime_seconds = min(max(0.5, float(seconds)), 1.5)
+        for encoder in ENCODERS_OF_INTEREST:
+            if encoder in covered:
+                if not encoders["compiled"].get(encoder, False):
+                    encoders["runtime_reason"][encoder] = "encoder_not_compiled"
+                continue
+            runtime = run_encoder_runtime_test(
+                str(ffmpeg.get("path") or "ffmpeg"),
+                encoder,
+                bool(encoders["compiled"].get(encoder, False)),
+                seconds=runtime_seconds,
+            )
+            encoders["runtime_test_ok"][encoder] = bool(runtime.get("runtime_test_ok"))
+            encoders["runtime_reason"][encoder] = str(runtime.get("reason") or "")
+
+        encoders["usable"] = {
+            name: bool(encoders["compiled"].get(name, False) and encoders["runtime_test_ok"].get(name, False))
+            for name in ENCODERS_OF_INTEREST
+        }
     else:
         for profile in TEST_PROFILES:
             tests.append({
                 "name": str(profile["name"]),
+                "mode": str(profile.get("mode") or "auto"),
+                "experimental": bool(profile.get("experimental", False)),
                 "encoder": str(profile["encoder"]),
                 "width": int(profile["width"]),
                 "height": int(profile["height"]),
                 "duration_sec": float(seconds),
+                "compiled": False,
+                "runtime_ok": False,
                 "ok": False,
                 "avg_fps": 0.0,
                 "target_fps": int(profile["fps"]),
                 "recommended": False,
+                "reason": "ffmpeg_not_found",
                 "error_tail": "ffmpeg_not_found",
             })
 
@@ -281,21 +490,27 @@ def probe_screen_capability(ffmpeg_path: str = "", seconds: float = 5.0) -> Dict
     for result in tests:
         result["recommended"] = bool(recommended and result.get("name") == recommended)
 
+    experimental_profiles = [str(result.get("name") or "") for result in tests if result.get("experimental") and result.get("ok")]
+    reason = "ok" if recommended else "no_stable_realtime_qsv_profile_ok; use software fallback or show unavailable"
+
     return {
-        "ok": bool(ffmpeg.get("ok") and encoders.get("ok")),
+        "ok": bool(recommended),
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "capture_source": "gdigrab:desktop",
         "ffmpeg": ffmpeg,
         "gpu": gpu,
         "encoders": encoders,
         "recommended": recommended,
+        "reason": reason,
+        "experimental_profiles": experimental_profiles,
         "tests": tests,
     }
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Probe AgoraLink screen casting capability.")
+    parser = argparse.ArgumentParser(description="Probe AgoraLink real desktop screen casting capability.")
     parser.add_argument("--ffmpeg", default="", help="Path to ffmpeg. Defaults to PATH lookup.")
-    parser.add_argument("--seconds", type=float, default=5.0, help="Synthetic source duration per profile. Default: 5.")
+    parser.add_argument("--seconds", type=float, default=5.0, help="Real desktop capture duration per profile. Default: 5.")
     parser.add_argument("--indent", type=int, default=2, help="JSON indentation. Use 0 for compact JSON.")
     return parser
 
