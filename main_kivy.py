@@ -301,6 +301,7 @@ from file_transfer_common import (
     is_unspecified_ip,
     normalize_peer_endpoint_ip,
 )
+from screen_runtime import ScreenRuntime
 
 
 I18N: Dict[str, Dict[str, str]] = {
@@ -3495,6 +3496,74 @@ class RUDPTransferRoot(BoxLayout):
                 pass
             return ""
 
+    def _screen_runtime(self) -> ScreenRuntime:
+        runtime = getattr(self.app, "screen_runtime", None)
+        if runtime is None:
+            runtime = ScreenRuntime()
+            self.app.screen_runtime = runtime
+        return runtime
+
+    def _format_screen_runtime_state(self, state: Dict[str, object]) -> str:
+        return (
+            f"state: {state.get('state') or ''}    running: {bool(state.get('running'))}\n"
+            f"mode: {state.get('mode') or ''}    host: {state.get('host') or ''}\n"
+            f"port: {state.get('port') or ''}    profile: {state.get('profile') or ''}\n"
+            f"last_error: {state.get('last_error') or ''}"
+        )
+
+    def _refresh_screen_runtime_status(self, status_label: Label) -> None:
+        try:
+            state = self._screen_runtime().get_state()
+            status_label.text = self._format_screen_runtime_state(state)
+        except Exception as exc:
+            status_label.text = f"screen runtime error: {exc}"
+
+    def _schedule_screen_runtime_status(self, status_label: Label) -> None:
+        Clock.schedule_once(lambda _dt: self._refresh_screen_runtime_status(status_label), 0)
+
+    def _screen_debug_start_receiver(self, status_label: Label) -> None:
+        try:
+            self._screen_runtime().start_receiver(port=50020)
+            self._append_debug_line("screen receiver start requested", protocol=False)
+        except Exception as exc:
+            try:
+                self._screen_runtime().last_error = str(exc)
+            except Exception:
+                pass
+            status_label.text = f"screen receiver start failed: {exc}"
+            return
+        self._schedule_screen_runtime_status(status_label)
+
+    def _screen_debug_start_sender(self, host_input: TextInput, status_label: Label) -> None:
+        try:
+            host = str(host_input.text or "").strip()
+            if not host:
+                status_label.text = "screen sender start failed: target IP is required"
+                return
+            self._screen_runtime().start_sender(host=host, port=50020, profile="720p30_h264_qsv")
+            self._append_debug_line(f"screen sender start requested host={host}", protocol=False)
+        except Exception as exc:
+            try:
+                self._screen_runtime().last_error = str(exc)
+            except Exception:
+                pass
+            status_label.text = f"screen sender start failed: {exc}"
+            return
+        self._schedule_screen_runtime_status(status_label)
+
+    def _screen_debug_stop(self, status_label: Label) -> None:
+        try:
+            self._screen_runtime().stop()
+            self._append_debug_line("screen runtime stop requested", protocol=False)
+        except Exception as exc:
+            try:
+                self._screen_runtime().last_error = str(exc)
+            except Exception:
+                pass
+            status_label.text = f"screen runtime stop failed: {exc}"
+            return
+        self._schedule_screen_runtime_status(status_label)
+
     def open_debug_popup(self) -> None:
         content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
         intro = make_label(
@@ -3507,6 +3576,40 @@ class RUDPTransferRoot(BoxLayout):
         )
         bind_label_wrap(intro)
         content.add_widget(intro)
+        screen_box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(154), spacing=dp(6))
+        screen_title = make_label(
+            text="Screen share debug (FFmpeg/UDP only)",
+            size_hint_y=None,
+            height=dp(24),
+            halign="left",
+            valign="middle",
+            color=THEME["muted_text"],
+        )
+        bind_label_wrap(screen_title)
+        screen_box.add_widget(screen_title)
+        screen_target_input = make_input(text="", hint_text="Target receiver IP", multiline=False, size_hint_x=1)
+        screen_target_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(8))
+        screen_target_row.add_widget(make_label(text="Target IP", size_hint_x=None, width=dp(92), halign="right", valign="middle", color=THEME["muted_text"]))
+        screen_target_row.add_widget(screen_target_input)
+        screen_box.add_widget(screen_target_row)
+        screen_buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(34), spacing=dp(8))
+        screen_status_label = make_label(
+            text="",
+            size_hint_y=None,
+            height=dp(58),
+            halign="left",
+            valign="top",
+            color=THEME["muted_text"],
+        )
+        bind_label_wrap(screen_status_label)
+        screen_buttons.add_widget(make_button("secondary", text="Receive screen", on_release=lambda *_: Clock.schedule_once(lambda _dt: self._screen_debug_start_receiver(screen_status_label), 0)))
+        screen_buttons.add_widget(make_button("secondary", text="Send screen", on_release=lambda *_: Clock.schedule_once(lambda _dt: self._screen_debug_start_sender(screen_target_input, screen_status_label), 0)))
+        screen_buttons.add_widget(make_button("danger", text="Stop screen", on_release=lambda *_: Clock.schedule_once(lambda _dt: self._screen_debug_stop(screen_status_label), 0)))
+        screen_buttons.add_widget(make_button("secondary", text="Refresh", on_release=lambda *_: self._schedule_screen_runtime_status(screen_status_label)))
+        screen_box.add_widget(screen_buttons)
+        screen_box.add_widget(screen_status_label)
+        self._schedule_screen_runtime_status(screen_status_label)
+        content.add_widget(screen_box)
         log = LogBox(size_hint_y=1)
         protocol_text = "\n".join(self.debug_protocol_lines[-160:]) or "暂无协议日志。"
         runtime_text = "\n".join(self.debug_runtime_lines[-120:]) or "暂无运行日志。"
@@ -6415,10 +6518,16 @@ class RUDPTransferApp(App):
     def build(self):
         Window.size = (1180, 760)
         Window.clearcolor = THEME["window_bg"]
+        self.screen_runtime = ScreenRuntime()
         self.root_widget = RUDPTransferRoot(self)
         return self.root_widget
 
     def on_stop(self):
+        try:
+            if hasattr(self, "screen_runtime"):
+                self.screen_runtime.stop()
+        except Exception:
+            pass
         try:
             self.root_widget.on_stop()
         except Exception:
