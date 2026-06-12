@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -30,19 +32,22 @@ class ScreenRuntime:
     def __init__(
         self,
         *,
-        python_executable: str = "python",
+        python_executable: Optional[str] = None,
         script_dir: Optional[Path] = None,
         popen_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+        taskkill_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         stop_timeout: float = 5.0,
     ) -> None:
-        self.python_executable = python_executable
-        self.script_dir = Path(script_dir) if script_dir is not None else Path(__file__).resolve().parent
+        self.python_executable = str(python_executable or sys.executable)
+        self.script_dir = (Path(script_dir) if script_dir is not None else Path(__file__).resolve().parent).resolve()
         self._popen_factory = popen_factory
+        self._taskkill_runner = taskkill_runner
         self.stop_timeout = float(stop_timeout)
         self._process: Optional[subprocess.Popen[bytes]] = None
         self._state = STATE_IDLE
         self.last_error = ""
         self.last_returncode: Optional[int] = None
+        self.last_command: List[str] = []
         self.current_mode: Optional[str] = None
         self.current_host: Optional[str] = None
         self.current_port: Optional[int] = None
@@ -56,10 +61,11 @@ class ScreenRuntime:
             cmd = [
                 self.python_executable,
                 "-B",
-                "screen_receiver.py",
+                str(self._script_path("screen_receiver.py")),
                 "--port",
                 str(port),
             ]
+            self.last_command = list(cmd)
             self._process = self._popen_factory(cmd, cwd=str(self.script_dir))
         except Exception as exc:
             return self._set_error(str(exc))
@@ -88,7 +94,7 @@ class ScreenRuntime:
             cmd = [
                 self.python_executable,
                 "-B",
-                "screen_sender.py",
+                str(self._script_path("screen_sender.py")),
                 "--host",
                 host,
                 "--port",
@@ -96,6 +102,7 @@ class ScreenRuntime:
                 "--profile",
                 profile,
             ]
+            self.last_command = list(cmd)
             self._process = self._popen_factory(cmd, cwd=str(self.script_dir))
         except Exception as exc:
             return self._set_error(str(exc))
@@ -120,12 +127,10 @@ class ScreenRuntime:
         self._state = STATE_STOPPING
         proc = self._process
         try:
-            proc.terminate()
-            try:
-                self.last_returncode = int(proc.wait(timeout=self.stop_timeout))
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                self.last_returncode = int(proc.wait(timeout=self.stop_timeout))
+            if os.name == "nt":
+                self._stop_windows_process_tree(proc)
+            else:
+                self._stop_portable_process(proc)
         except Exception as exc:
             return self._set_error(str(exc))
         finally:
@@ -178,6 +183,7 @@ class ScreenRuntime:
             "pid": int(self._process.pid) if running and getattr(self._process, "pid", None) is not None else None,
             "returncode": self.last_returncode,
             "last_error": self.last_error,
+            "command": list(self.last_command),
         }
 
     def _set_error(self, message: str) -> Dict[str, object]:
@@ -196,6 +202,54 @@ class ScreenRuntime:
         self.current_host = None
         self.current_port = None
         self.current_profile = None
+
+    def _script_path(self, name: str) -> Path:
+        return (self.script_dir / name).resolve()
+
+    def _stop_windows_process_tree(self, proc: subprocess.Popen[bytes]) -> None:
+        pid = getattr(proc, "pid", None)
+        if pid is None:
+            self._stop_portable_process(proc)
+            return
+        try:
+            completed = self._taskkill_runner(
+                ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=max(5.0, self.stop_timeout),
+            )
+            if int(getattr(completed, "returncode", 0) or 0) != 0:
+                stderr = str(getattr(completed, "stderr", "") or "").strip()
+                stdout = str(getattr(completed, "stdout", "") or "").strip()
+                self.last_error = stderr or stdout or f"taskkill failed for pid {pid}"
+                self._stop_portable_process(proc)
+                return
+        except Exception as exc:
+            self.last_error = f"taskkill failed for pid {pid}: {exc}"
+            self._stop_portable_process(proc)
+            return
+
+        try:
+            self.last_returncode = int(proc.wait(timeout=max(1.0, self.stop_timeout)))
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                self.last_returncode = int(proc.wait(timeout=max(1.0, self.stop_timeout)))
+            except Exception:
+                polled = proc.poll()
+                self.last_returncode = int(polled) if polled is not None else -9
+
+    def _stop_portable_process(self, proc: subprocess.Popen[bytes]) -> None:
+        if proc.poll() is not None:
+            self.last_returncode = int(proc.poll())
+            return
+        proc.terminate()
+        try:
+            self.last_returncode = int(proc.wait(timeout=self.stop_timeout))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self.last_returncode = int(proc.wait(timeout=self.stop_timeout))
 
     @staticmethod
     def _validate_port(port: int) -> int:
@@ -250,12 +304,19 @@ class _FakeProcess:
 
 def _run_self_test() -> Dict[str, object]:
     commands: List[List[str]] = []
+    cwd_values: List[Optional[str]] = []
+    taskkill_commands: List[List[str]] = []
 
     def fake_popen(cmd: List[str], cwd: Optional[str] = None) -> _FakeProcess:
         commands.append(list(cmd))
+        cwd_values.append(cwd)
         return _FakeProcess(cmd, cwd=cwd)
 
-    runtime = ScreenRuntime(popen_factory=fake_popen)
+    def fake_taskkill(cmd: List[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        taskkill_commands.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    runtime = ScreenRuntime(popen_factory=fake_popen, taskkill_runner=fake_taskkill)
     initial_state = runtime.get_state()
     receiver_state = runtime.start_receiver()
     duplicate_state = runtime.start_sender("127.0.0.1")
@@ -266,10 +327,26 @@ def _run_self_test() -> Dict[str, object]:
     if isinstance(sender_proc, _FakeProcess):
         sender_proc.returncode = 42
     crashed_state = runtime.get_state()
+    commands_after_crashed_state = len(commands)
+    expected_script_dir = str(Path(__file__).resolve().parent)
+    expected_receiver_script = str(Path(__file__).resolve().parent / "screen_receiver.py")
+    expected_sender_script = str(Path(__file__).resolve().parent / "screen_sender.py")
+
+    def fast_exit_popen(cmd: List[str], cwd: Optional[str] = None) -> _FakeProcess:
+        commands.append(list(cmd))
+        cwd_values.append(cwd)
+        proc = _FakeProcess(cmd, cwd=cwd)
+        proc.returncode = 7
+        return proc
+
+    fast_exit_runtime = ScreenRuntime(popen_factory=fast_exit_popen, taskkill_runner=fake_taskkill)
+    fast_exit_state = fast_exit_runtime.start_receiver()
     checks = [
         initial_state["state"] == STATE_IDLE,
         receiver_state["state"] == STATE_RECEIVING,
         receiver_state["mode"] == STATE_RECEIVING,
+        receiver_state["command"][0] == sys.executable,
+        receiver_state["command"][2] == expected_receiver_script,
         duplicate_state["last_error"] == "already running",
         duplicate_state["ok"] is False,
         duplicate_state["error"] == "already running",
@@ -280,11 +357,19 @@ def _run_self_test() -> Dict[str, object]:
         not runtime.is_running(),
         sender_state["state"] == STATE_SENDING,
         sender_state["profile"] == DEFAULT_SCREEN_PROFILE,
-        len(commands) == 2,
+        sender_state["command"][0] == sys.executable,
+        sender_state["command"][2] == expected_sender_script,
+        commands_after_crashed_state == 2,
         crashed_state["state"] == STATE_ERROR,
         crashed_state["returncode"] == 42,
         crashed_state["mode"] == STATE_SENDING,
         not runtime.is_running(),
+        cwd_values[0] == expected_script_dir,
+        os.name != "nt" or (bool(taskkill_commands) and taskkill_commands[0][0] == "taskkill" and "/T" in taskkill_commands[0] and "/F" in taskkill_commands[0]),
+        fast_exit_state["state"] == STATE_ERROR,
+        fast_exit_state["returncode"] == 7,
+        "exited with code 7" in str(fast_exit_state["last_error"]),
+        fast_exit_state["command"][2] == expected_receiver_script,
     ]
     return {
         "ok": all(checks),
