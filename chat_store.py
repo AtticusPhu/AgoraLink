@@ -265,15 +265,17 @@ class ChatStore:
         self.db.conn.execute("UPDATE groups SET updated_at=? WHERE group_id=?", (ts, str(group_id or "")))
         self.db.conn.commit()
 
-    def list_group_members(self, group_id: str, include_inactive: bool = True) -> List[Dict[str, object]]:
+    def list_group_members(self, group_id: str, include_inactive: bool = True, active_only: bool = False) -> List[Dict[str, object]]:
+        if active_only:
+            include_inactive = False
         if include_inactive:
             rows = self.db.conn.execute(
-                "SELECT * FROM group_members WHERE group_id=? ORDER BY member_state, peer_id",
+                "SELECT * FROM group_members WHERE group_id=? ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, member_state, peer_id",
                 (str(group_id or ""),),
             ).fetchall()
         else:
             rows = self.db.conn.execute(
-                "SELECT * FROM group_members WHERE group_id=? AND member_state='active' ORDER BY peer_id",
+                "SELECT * FROM group_members WHERE group_id=? AND member_state='active' ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, peer_id",
                 (str(group_id or ""),),
             ).fetchall()
         return [dict(r) for r in rows]
