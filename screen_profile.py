@@ -121,8 +121,8 @@ BUILTIN_PROFILES: Tuple[ScreenProfile, ...] = (
 PROFILES_BY_NAME: Dict[str, ScreenProfile] = {profile.name: profile for profile in BUILTIN_PROFILES}
 
 AUTO_PROFILE_ORDER: Tuple[str, ...] = (
-    "720p30_hevc_qsv",
     "720p30_h264_qsv",
+    "720p30_hevc_qsv",
     "1080p30_h264_qsv",
 )
 

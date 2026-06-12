@@ -96,7 +96,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Send desktop screen video with FFmpeg/UDP.")
     parser.add_argument("--host", required=True, help="Receiver IP address.")
     parser.add_argument("--port", type=_valid_port, default=50020, help="Receiver UDP port. Default: 50020.")
-    parser.add_argument("--profile", default="720p30_hevc_qsv", help="Screen profile name. Default: 720p30_hevc_qsv.")
+    parser.add_argument("--profile", default="720p30_h264_qsv", help="Screen profile name. Default: 720p30_h264_qsv.")
     return parser
 
 
