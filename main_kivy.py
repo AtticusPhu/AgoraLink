@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import os
 import hashlib
-from concurrent.futures import ThreadPoolExecutor
 import re
 import secrets
 import subprocess
@@ -122,50 +121,6 @@ def format_file_size(num_bytes: int) -> str:
 def is_image_file_for_preview(path_or_name: str) -> bool:
     ext = Path(str(path_or_name or "")).suffix.lower()
     return ext in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
-
-
-def thumbnail_cache_dir() -> Path:
-    path = user_data_dir() / "thumbnail_cache"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def thumbnail_cache_key(path: str) -> str:
-    try:
-        p = Path(path)
-        st = p.stat()
-        raw = f"{str(p.resolve())}|{int(st.st_size)}|{int(st.st_mtime_ns)}"
-    except Exception:
-        raw = str(path or "")
-    return hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:32]
-
-
-def cleanup_thumbnail_cache(max_bytes: int = 256 * 1024 * 1024, max_files: int = 5000) -> None:
-    """Best-effort cache trim for generated picker thumbnails."""
-    try:
-        cache = thumbnail_cache_dir()
-        files = [p for p in cache.glob("*.png") if p.is_file()]
-        if not files:
-            return
-        records = []
-        total = 0
-        for p in files:
-            try:
-                st = p.stat()
-                records.append((float(st.st_mtime), int(st.st_size), p))
-                total += int(st.st_size)
-            except Exception:
-                continue
-        records.sort(key=lambda x: x[0])
-        while records and (total > int(max_bytes) or len(records) > int(max_files)):
-            _mtime, size, p = records.pop(0)
-            try:
-                p.unlink(missing_ok=True)
-                total -= int(size)
-            except Exception:
-                pass
-    except Exception:
-        pass
 
 
 def file_icon_text(path_or_name: str, is_dir: bool = False) -> str:
@@ -1253,13 +1208,6 @@ class MixedPickerRow(RecycleDataViewBehavior, BoxLayout):
             self.preview_btn.font_name = UI_FONT
             self.preview_label.font_name = UI_FONT
             source = str(self.thumb_source or "")
-            if (not source) and (not self.is_dir) and str(self.icon_text or "").upper() == "IMG":
-                cb = self.on_request_thumb
-                if callable(cb):
-                    try:
-                        source = str(cb(str(self.full_path or "")) or "")
-                    except Exception:
-                        source = ""
             if source and Path(source).exists():
                 if source != self._last_thumb_source:
                     self.preview_img.source = source
@@ -1596,6 +1544,7 @@ class RUDPTransferRoot(BoxLayout):
         self.selected_contact: Optional[Dict[str, object]] = None
         self.selected_device: Optional[Dict[str, object]] = None
         self.selected_group: Optional[Dict[str, object]] = None
+        self.selected_group_member_peer_id: str = ""
         self.selected_chat_entry_value: str = ""
         self.file_message_progress: Dict[str, Dict[str, object]] = {}
         self.current_receiving_file_message_id = ""
@@ -1647,8 +1596,10 @@ class RUDPTransferRoot(BoxLayout):
         top.add_widget(self.online_btn)
         self.enter_chat_btn = make_button("primary", text="进入聊天", size_hint_x=None, width=dp(110), on_release=lambda *_: self.show_startup_unlock_popup())
         top.add_widget(self.enter_chat_btn)
-        self.settings_btn = make_button("secondary", text="设置/调试", size_hint_x=None, width=dp(110), on_release=lambda *_: self.open_settings_popup())
+        self.settings_btn = make_button("secondary", text="设置", size_hint_x=None, width=dp(96), on_release=lambda *_: self.open_settings_popup())
         top.add_widget(self.settings_btn)
+        self.debug_btn = make_button("secondary", text="诊断", size_hint_x=None, width=dp(112), on_release=lambda *_: self.open_debug_popup())
+        top.add_widget(self.debug_btn)
         self.add_widget(top)
 
         self.local_ip_label = make_label(size_hint_y=None, height=dp(30), halign="left", valign="middle", shorten=True)
@@ -2035,8 +1986,9 @@ class RUDPTransferRoot(BoxLayout):
     def _set_right_action_mode(self, mode: str) -> None:
         is_group = mode == "group"
         is_owner = bool(is_group and self._is_local_group_owner(getattr(self, "current_group_id", "")))
+        is_active_member = bool(is_group and self._is_local_active_group_member(getattr(self, "current_group_id", "")))
         if hasattr(self, "right_action1"):
-            self._set_widget_visible(self.right_action1, is_group)
+            self._set_widget_visible(self.right_action1, is_group and is_owner)
         if hasattr(self, "right_action2"):
             self._set_widget_visible(self.right_action2, is_group)
         if hasattr(self, "right_member_scroll"):
@@ -2044,11 +1996,11 @@ class RUDPTransferRoot(BoxLayout):
         if hasattr(self, "new_group_btn"):
             self._set_button_visible(self.new_group_btn, False)
         if hasattr(self, "add_member_main_btn"):
-            self._set_button_visible(self.add_member_main_btn, is_group)
+            self._set_button_visible(self.add_member_main_btn, is_group and is_owner)
         if hasattr(self, "remove_member_main_btn"):
             self._set_button_visible(self.remove_member_main_btn, is_group and is_owner)
         if hasattr(self, "leave_group_main_btn"):
-            self._set_button_visible(self.leave_group_main_btn, is_group)
+            self._set_button_visible(self.leave_group_main_btn, is_group and is_active_member)
         if hasattr(self, "delete_friend_main_btn"):
             self._set_button_visible(self.delete_friend_main_btn, False)
 
@@ -2268,7 +2220,10 @@ class RUDPTransferRoot(BoxLayout):
     def _add_peer_to_group_popup(self, peer_id: str) -> None:
         if self.group_service is None or self.contact_service is None:
             return
-        groups = self.group_service.list_groups()
+        groups = [
+            g for g in self.group_service.list_groups()
+            if self._is_local_group_owner(str(g.get("group_id") or ""))
+        ]
         contact = self.contact_service.find_contact(peer_id)
         if not groups or not contact:
             return
@@ -2629,21 +2584,103 @@ class RUDPTransferRoot(BoxLayout):
         except Exception:
             return ""
 
+    def _group_record_by_id(self, group_id: str) -> Dict[str, object]:
+        if self.group_service is None:
+            return {}
+        gid = str(group_id or "")
+        try:
+            for g in self.group_service.list_groups():
+                if str(g.get("group_id") or "") == gid:
+                    return dict(g)
+        except Exception:
+            pass
+        return {}
+
+    def _local_group_member(self, group_id: str, members: Optional[List[Dict[str, object]]] = None) -> Dict[str, object]:
+        local_id = str(getattr(self, "chat_local_peer_id", "") or "")
+        if not local_id:
+            return {}
+        if members is None and self.group_service is not None:
+            try:
+                members = self.group_service.members(str(group_id or ""), include_inactive=True)
+            except Exception:
+                members = []
+        for m in members or []:
+            if str(m.get("peer_id") or "") == local_id:
+                return dict(m)
+        return {}
+
+    def _member_role_label(self, member: Dict[str, object]) -> str:
+        role = str((member or {}).get("role") or "member")
+        if role == "owner":
+            return "群主" if self.lang == "zh" else "Owner"
+        return "成员" if self.lang == "zh" else "Member"
+
+    def _member_state_label(self, member: Dict[str, object]) -> str:
+        state = str((member or {}).get("member_state") or "active")
+        if self.lang != "zh":
+            return state
+        return {"active": "正常", "left": "已退出", "removed": "已移除"}.get(state, state)
+
+    def _is_local_active_group_member(self, group_id: str, members: Optional[List[Dict[str, object]]] = None) -> bool:
+        member = self._local_group_member(group_id, members)
+        return str(member.get("member_state") or "") == "active"
+
+    def _is_local_group_owner(self, group_id: str, members: Optional[List[Dict[str, object]]] = None) -> bool:
+        local_id = str(getattr(self, "chat_local_peer_id", "") or "")
+        if not local_id:
+            return False
+        member = self._local_group_member(group_id, members)
+        if str(member.get("role") or "") == "owner" and str(member.get("member_state") or "active") == "active":
+            return True
+        group = self._group_record_by_id(group_id)
+        return bool(str(group.get("creator_peer_id") or "") == local_id and self._is_local_active_group_member(group_id, members))
+
+    def _display_name_for_peer(self, peer_id: str, members: Optional[List[Dict[str, object]]] = None) -> str:
+        pid = str(peer_id or "")
+        if not pid:
+            return ""
+        for m in members or []:
+            if str(m.get("peer_id") or "") == pid:
+                return str(m.get("display_name") or m.get("nickname") or pid)
+        if self.contact_service is not None:
+            try:
+                contact = self.contact_service.find_contact(pid)
+                if contact:
+                    return str(contact.get("remark_name") or contact.get("display_name") or contact.get("nickname") or pid)
+            except Exception:
+                pass
+        return pid
+
     def _format_member_detail(self, member: Dict[str, object]) -> str:
         name = str(member.get("display_name") or member.get("nickname") or member.get("peer_id") or "").strip()
+        removable = (
+            self._is_local_group_owner(self.current_group_id)
+            and str(member.get("member_state") or "active") == "active"
+            and str(member.get("role") or "member") != "owner"
+            and str(member.get("peer_id") or "") != str(self.chat_local_peer_id or "")
+        )
+        action_hint = ""
+        if removable:
+            action_hint = "群主可移除此成员" if self.lang == "zh" else "Owner can remove this member"
+        role_key = "角色" if self.lang == "zh" else "Role"
         return (
             f"{self.cu('nickname')}: {name}\n"
             f"{self.cu('peer_id')}: {member.get('peer_id') or ''}\n"
             f"{self.cu('fingerprint')}: {self._short_fp(str(member.get('fingerprint') or ''))}\n"
             f"{self.cu('endpoint')}: {member.get('peer_ip') or ''}:{member.get('peer_port') or 9999}\n"
-            f"{self.cu('member_state')}: {member.get('member_state') or ''}\n"
+            f"{self.cu('member_state')}: {self._member_state_label(member)}\n"
+            f"{role_key}: {self._member_role_label(member)}\n"
+            + (f"{action_hint}\n" if action_hint else "")
         )
 
     def show_group_member_detail(self, member: Dict[str, object]) -> None:
+        self.selected_group_member_peer_id = str(member.get("peer_id") or "")
         if hasattr(self, "right_info_box"):
             self.right_info_box.text.text = self._format_member_detail(member)
         if hasattr(self, "right_title"):
             self.right_title.text = self.cu("member_detail")
+        self._set_right_action_mode("group")
 
     def _render_group_member_buttons(self, members: List[Dict[str, object]]) -> None:
         if not hasattr(self, "right_member_box"):
@@ -2662,11 +2699,14 @@ class RUDPTransferRoot(BoxLayout):
                 continue
             role = str(m.get("role") or "member")
             state = str(m.get("member_state") or "active")
-            suffix = " 群主" if role == "owner" else ""
+            suffix = " " + self._member_role_label(m) if role == "owner" else ""
             if state != "active":
-                suffix += f" {state}"
+                suffix += f" {self._member_state_label(m)}"
             text = shorten_middle(name + suffix, 28)
-            btn = make_button("secondary", text=text, size_hint_y=None, height=dp(38), halign="left", valign="middle")
+            role_style = "active" if role == "owner" and state == "active" else "secondary"
+            btn = make_button(role_style, text=text, size_hint_y=None, height=dp(38), halign="left", valign="middle")
+            if str(m.get("peer_id") or "") == str(getattr(self, "selected_group_member_peer_id", "") or ""):
+                style_button(btn, "primary")
             btn.bind(size=lambda inst, _val: setattr(inst, "text_size", (inst.width - dp(12), None)))
             btn.bind(on_release=lambda _btn, member=dict(m): self.show_group_member_detail(member))
             self.right_member_box.add_widget(btn)
@@ -2697,6 +2737,9 @@ class RUDPTransferRoot(BoxLayout):
         try:
             if self.current_chat_mode == "group" and self.current_group_id:
                 members = self.group_service.members(self.current_group_id, include_inactive=True)
+                member_ids = {str(m.get("peer_id") or "") for m in members}
+                if str(getattr(self, "selected_group_member_peer_id", "") or "") not in member_ids:
+                    self.selected_group_member_peer_id = ""
                 try:
                     self._show_detail_panel()
                 except Exception:
@@ -2775,8 +2818,16 @@ class RUDPTransferRoot(BoxLayout):
                 if hasattr(self, "right_member_scroll"):
                     self._set_widget_visible(self.right_member_scroll, True, height=210)
                 self._render_group_member_buttons(members)
-                role_text = "群主" if self._is_local_group_owner(self.current_group_id, members) else "成员"
-                self.right_info_box.text.text = f"群成员：{active_count}/{total_count}\n我的角色：{role_text}\n点击成员可查看详情。"
+                local_member = self._local_group_member(self.current_group_id, members)
+                if local_member:
+                    role_text = self._member_role_label(local_member)
+                    state_text = self._member_state_label(local_member)
+                else:
+                    role_text = "非成员" if self.lang == "zh" else "Not a member"
+                    state_text = "-"
+                can_manage = self._is_local_group_owner(self.current_group_id, members)
+                manage_text = "可添加和移除成员" if (self.lang == "zh" and can_manage) else ("Can add and remove members" if can_manage else ("仅可查看和退出群" if self.lang == "zh" else "Can view and leave only"))
+                self.right_info_box.text.text = f"群成员：{active_count}/{total_count}\n我的角色：{role_text}\n我的状态：{state_text}\n权限：{manage_text}\n点击成员可查看详情。"
                 for name, path, size, tsf in reversed(file_cards[-8:]):
                     self._add_shared_file_entry(name, path, size, tsf)
             elif self.current_chat_mode == "direct" and self.current_peer_id:
@@ -3008,6 +3059,10 @@ class RUDPTransferRoot(BoxLayout):
                 self.main_send_btn.text = self.cu("send")
             if hasattr(self, "main_file_btn"):
                 self.main_file_btn.text = self.cu("send_file")
+            if hasattr(self, "settings_btn"):
+                self.settings_btn.text = "设置" if self.lang == "zh" else "Settings"
+            if hasattr(self, "debug_btn"):
+                self.debug_btn.text = "诊断" if self.lang == "zh" else "Diagnostics"
             if hasattr(self, "right_title"):
                 if self.current_chat_mode == "group":
                     self.right_title.text = self.cu("group_members_title")
@@ -3322,23 +3377,18 @@ class RUDPTransferRoot(BoxLayout):
         package_checkbox = CheckBox(active=bool(getattr(self, "auto_package_multi_selection", True)), size_hint_x=None, width=dp(42))
         package_line.add_widget(package_checkbox)
         content.add_widget(package_line)
-        log = LogBox(size_hint_y=1)
-        protocol_text = "\n".join(self.debug_protocol_lines[-160:]) or "暂无协议日志。"
-        runtime_text = "\n".join(self.debug_runtime_lines[-120:]) or "暂无运行日志。"
-        log.append(
-            "调试日志入口\n\n"
-            "B 端接收日志查看方式：设置 / 调试 -> 本窗口下方日志。\n"
-            "重点搜索：CHAT_MESSAGE_JSON、TRANSFER_REQUEST_JSON、Session saved、end reason=complete、LAN_STATS。\n"
-            "性能测试：发送端日志搜索 LAN_STATS，重点看 payload_size / payload_mbps / wire_mbps / unacked / inflight_bytes / cwnd_pkts / sent_pps / ack_pps / retrans / rtt / bulk_budget / bulk_sent / bulk_blocked_* / ack_deleted / ack_scan / blocked_cc / blocked_unacked。若设置窗口日志为空，可查看本机 AppData\\Local\\AgoraLink\\debug\\sender_worker.log。\n\n"
-            "=== 协议日志 / Protocol ===\n"
-            + protocol_text[-12000:] +
-            "\n\n=== 运行日志 / Runtime ===\n"
-            + runtime_text[-12000:] +
-            "\n"
+        note = make_label(
+            text="诊断日志已移到“诊断”窗口。普通设置只保留日常选项。",
+            size_hint_y=None,
+            height=dp(46),
+            halign="left",
+            valign="middle",
+            color=THEME["muted_text"],
         )
-        content.add_widget(log)
+        bind_label_wrap(note)
+        content.add_widget(note)
         buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
-        popup = style_popup(Popup(title="设置 / 调试", content=content, size_hint=(0.78, 0.72)))
+        popup = style_popup(Popup(title="设置", content=content, size_hint=(0.58, 0.36)))
         def _apply_theme(*_):
             self.theme_mode = theme_spinner.text
             self.apply_theme_mode(self.theme_mode)
@@ -3348,8 +3398,135 @@ class RUDPTransferRoot(BoxLayout):
                 save_gui_config(self.gui_config)
             except Exception:
                 pass
-        buttons.add_widget(make_button("primary", text="应用设置", on_release=_apply_theme))
-        buttons.add_widget(make_button("secondary", text="打开防火墙脚本", on_release=lambda *_: self.allow_firewall()))
+        def _export(*_):
+            path = self.export_diagnostic_logs()
+            if path:
+                self.sender_log_box.append(f"Diagnostics exported: {path}\n")
+        buttons.add_widget(make_button("primary", text="应用", on_release=_apply_theme))
+        buttons.add_widget(make_button("secondary", text="导出诊断日志", on_release=_export))
+        buttons.add_widget(make_button("secondary", text="防火墙", on_release=lambda *_: self.allow_firewall()))
+        buttons.add_widget(make_button("secondary", text="关闭", on_release=lambda *_: popup.dismiss()))
+        content.add_widget(buttons)
+        apply_ui_font(content)
+        popup.open()
+
+    def _chat_diagnostic_summary(self) -> Dict[str, object]:
+        summary: Dict[str, object] = {
+            "app": APP_NAME,
+            "release": "v0.0.4",
+            "python": sys.version,
+            "platform": sys.platform,
+            "frozen": FROZEN,
+            "app_dir": str(APP_DIR),
+            "user_data_dir": str(user_data_dir()),
+            "chat_unlocked": bool(getattr(self, "chat_unlocked", False)),
+            "local_peer_id": str(getattr(self, "chat_local_peer_id", "") or ""),
+            "nickname": str(getattr(self, "chat_nickname", "") or ""),
+            "current_chat_mode": str(getattr(self, "current_chat_mode", "") or ""),
+            "current_group_id": str(getattr(self, "current_group_id", "") or ""),
+            "current_peer_id": str(getattr(self, "current_peer_id", "") or ""),
+            "sender_running": bool(self.sender_worker.is_running()) if hasattr(self, "sender_worker") else False,
+            "receiver_running": bool(self.receiver_worker.is_running()) if hasattr(self, "receiver_worker") else False,
+            "runtime_log_lines_in_memory": len(getattr(self, "debug_runtime_lines", []) or []),
+            "protocol_log_lines_in_memory": len(getattr(self, "debug_protocol_lines", []) or []),
+        }
+        try:
+            if self.contact_service is not None:
+                contacts = self.contact_service.list_contacts(trusted_only=False)
+                summary["contacts_count"] = len(contacts)
+                summary["trusted_contacts_count"] = len([c for c in contacts if str(c.get("trust_state") or "") == "trusted"])
+        except Exception as exc:
+            summary["contacts_error"] = str(exc)
+        try:
+            if self.group_service is not None:
+                groups = self.group_service.list_groups()
+                summary["groups_count"] = len(groups)
+                summary["groups"] = []
+                for g in groups:
+                    gid = str(g.get("group_id") or "")
+                    members = self.group_service.members(gid, include_inactive=True)
+                    local_member = self._local_group_member(gid, members)
+                    summary["groups"].append({
+                        "group_id": gid,
+                        "title": str(g.get("title") or ""),
+                        "creator_peer_id": str(g.get("creator_peer_id") or ""),
+                        "group_state": str(g.get("group_state") or ""),
+                        "active_members": len([m for m in members if str(m.get("member_state") or "active") == "active"]),
+                        "total_members": len(members),
+                        "local_role": self._member_role_label(local_member) if local_member else "",
+                        "local_state": self._member_state_label(local_member) if local_member else "",
+                    })
+        except Exception as exc:
+            summary["groups_error"] = str(exc)
+        try:
+            if self.transfer_store is not None:
+                row = self.transfer_store.conn.execute("SELECT COUNT(*) AS n FROM file_transfers").fetchone()
+                summary["file_transfers_count"] = int(row["n"] or 0)
+        except Exception as exc:
+            summary["file_transfers_error"] = str(exc)
+        return summary
+
+    def export_diagnostic_logs(self) -> str:
+        try:
+            out_dir = debug_log_dir()
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            out_path = out_dir / f"AgoraLink_diagnostics_{stamp}.zip"
+            with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for name in ("sender_worker.log", "receiver_worker.log"):
+                    path = out_dir / name
+                    if path.exists() and path.is_file():
+                        zf.write(path, arcname=name)
+                zf.writestr("gui_runtime_recent.log", "\n".join(getattr(self, "debug_runtime_lines", [])[-1000:]))
+                zf.writestr("gui_protocol_recent.log", "\n".join(getattr(self, "debug_protocol_lines", [])[-1000:]))
+                zf.writestr("version_info.json", json.dumps({
+                    "app": APP_NAME,
+                    "release": "v0.0.4",
+                    "python": sys.version,
+                    "platform": sys.platform,
+                    "frozen": FROZEN,
+                    "app_dir": str(APP_DIR),
+                }, ensure_ascii=False, indent=2))
+                zf.writestr("chat_state_summary.json", json.dumps(self._chat_diagnostic_summary(), ensure_ascii=False, indent=2))
+            return str(out_path)
+        except Exception as exc:
+            try:
+                self.sender_log_box.append(f"Diagnostics export failed: {exc}\n")
+            except Exception:
+                pass
+            return ""
+
+    def open_debug_popup(self) -> None:
+        content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
+        intro = make_label(
+            text="诊断窗口用于排查问题；普通设置不会显示这些协议日志。",
+            size_hint_y=None,
+            height=dp(36),
+            halign="left",
+            valign="middle",
+            color=THEME["muted_text"],
+        )
+        bind_label_wrap(intro)
+        content.add_widget(intro)
+        log = LogBox(size_hint_y=1)
+        protocol_text = "\n".join(self.debug_protocol_lines[-160:]) or "暂无协议日志。"
+        runtime_text = "\n".join(self.debug_runtime_lines[-120:]) or "暂无运行日志。"
+        log.append(
+            "重点搜索：CHAT_MESSAGE_JSON、TRANSFER_REQUEST_JSON、Session saved、end reason=complete、LAN_STATS。\n"
+            "若窗口日志为空，可查看本机 AppData\\Local\\AgoraLink\\debug\\sender_worker.log。\n\n"
+            "=== Protocol ===\n"
+            + protocol_text[-12000:]
+            + "\n\n=== Runtime ===\n"
+            + runtime_text[-12000:]
+            + "\n"
+        )
+        content.add_widget(log)
+        buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
+        popup = style_popup(Popup(title="诊断", content=content, size_hint=(0.78, 0.72)))
+        def _export(*_):
+            path = self.export_diagnostic_logs()
+            if path:
+                log.append(f"\nDiagnostics exported: {path}\n")
+        buttons.add_widget(make_button("primary", text="导出诊断日志", on_release=_export))
         buttons.add_widget(make_button("secondary", text="关闭", on_release=lambda *_: popup.dismiss()))
         content.add_widget(buttons)
         apply_ui_font(content)
@@ -3541,6 +3718,9 @@ class RUDPTransferRoot(BoxLayout):
         if not pid:
             self.chat_messages_box.append(self.t("need_member") + "\n")
             return
+        if not self._is_local_group_owner(gid):
+            self.chat_messages_box.append("只有群主可以添加成员。\n")
+            return
         try:
             port = int(self.member_port_input.text.strip() or "9999")
         except Exception:
@@ -3562,6 +3742,9 @@ class RUDPTransferRoot(BoxLayout):
         pid = self.member_peer_input.text.strip()
         if not gid or not pid:
             self.chat_messages_box.append(self.t("need_member") + "\n")
+            return
+        if not self._is_local_group_owner(gid):
+            self.chat_messages_box.append("只有群主可以移除成员。\n")
             return
         self.group_service.remove_member(gid, pid, removed=True)
         self.chat_messages_box.append(f"Member removed: {pid}\n")
@@ -3828,6 +4011,9 @@ class RUDPTransferRoot(BoxLayout):
         if self.contact_service is None or self.group_service is None or not self.current_group_id:
             self.main_messages_box.append("请先选择群聊。\n")
             return
+        if not self._is_local_group_owner(self.current_group_id):
+            self.main_messages_box.append("只有群主可以添加成员。\n")
+            return
         contacts = self.contact_service.trusted_contacts()
         if not contacts:
             self.main_messages_box.append("没有已允许的联系人。\n")
@@ -3871,12 +4057,21 @@ class RUDPTransferRoot(BoxLayout):
     def confirm_remove_member(self) -> None:
         if self.group_service is None or not self.current_group_id:
             return
-        members = [m for m in self.group_service.members(self.current_group_id, include_inactive=False) if str(m.get('peer_id')) != self.chat_local_peer_id]
+        if not self._is_local_group_owner(self.current_group_id):
+            self.right_info_box.append("只有群主可以移除成员。\n")
+            return
+        members = [
+            m for m in self.group_service.members(self.current_group_id, include_inactive=False)
+            if str(m.get('peer_id')) != self.chat_local_peer_id and str(m.get("role") or "member") != "owner"
+        ]
         if not members:
             self.right_info_box.append("没有可移除的成员。\n")
             return
-        # First non-self member for first UI version; details are shown in right panel.
-        pid = str(members[0].get('peer_id') or '')
+        pid = str(getattr(self, "selected_group_member_peer_id", "") or "")
+        allowed = {str(m.get("peer_id") or "") for m in members}
+        if pid not in allowed:
+            self.right_info_box.append("请先在右侧选择一个可移除的成员。\n")
+            return
         self._confirm_action("移除成员", f"确认移除成员 {pid}？", lambda: (self.group_service.remove_member(self.current_group_id, pid, removed=True), self.render_current_chat()))
 
 
@@ -4019,6 +4214,9 @@ class RUDPTransferRoot(BoxLayout):
                 group_id = ""
                 conversation_id = str(msg.get('conversation_id') or '')
             elif self.current_chat_mode == "group" and self.current_group_id:
+                if not self._is_local_active_group_member(self.current_group_id):
+                    self.main_messages_box.append("你已不在此群，不能发送消息。\n")
+                    return
                 msg, recipients = self.message_service.create_group_text(self.current_group_id, text)
                 group_id = self.current_group_id
                 conversation_id = ""
@@ -4247,11 +4445,7 @@ class RUDPTransferRoot(BoxLayout):
         state = {
             "path": str(Path.home()),
             "selected": set(),
-            "thumbs": {},
-            "thumb_pending": set(),
             "refreshing": False,
-            "thumb_executor": ThreadPoolExecutor(max_workers=2),
-            "thumb_refresh_scheduled": False,
             "sort_by": "name",
             "sort_reverse": False,
             "query": "",
@@ -4342,25 +4536,6 @@ class RUDPTransferRoot(BoxLayout):
 
         popup = style_popup(Popup(title=self.cu("mixed_picker_title"), content=content, size_hint=(0.90, 0.88)))
 
-        def _shutdown_thumb_executor(*_args):
-            try:
-                executor = state.get("thumb_executor")
-                if executor is not None:
-                    executor.shutdown(wait=False, cancel_futures=True)
-            except TypeError:
-                try:
-                    executor.shutdown(wait=False)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        popup.bind(on_dismiss=_shutdown_thumb_executor)
-        try:
-            threading.Thread(target=cleanup_thumbnail_cache, daemon=True).start()
-        except Exception:
-            pass
-
         def _selected_sorted() -> List[str]:
             return sorted(list(state["selected"]), key=lambda s: (0 if os.path.isdir(s) else 1, os.path.basename(s).lower()))
 
@@ -4395,9 +4570,6 @@ class RUDPTransferRoot(BoxLayout):
                 except Exception:
                     pass
 
-        def _thumbnail_path_for(file_path: str) -> str:
-            return str(thumbnail_cache_dir() / (thumbnail_cache_key(file_path) + ".png"))
-
         def _preview_image(path: str) -> None:
             try:
                 p = Path(str(path or "")).expanduser()
@@ -4418,91 +4590,6 @@ class RUDPTransferRoot(BoxLayout):
                     self._append_debug_line(f"image preview failed: {exc}", protocol=False)
                 except Exception:
                     pass
-
-        def _schedule_thumbnail_refresh() -> None:
-            if bool(state.get("thumb_refresh_scheduled", False)):
-                return
-            state["thumb_refresh_scheduled"] = True
-
-            def _do_refresh(_dt):
-                state["thumb_refresh_scheduled"] = False
-                try:
-                    _refresh()
-                except Exception:
-                    pass
-
-            Clock.schedule_once(_do_refresh, 0.20)
-
-        def _request_thumbnail(file_path: str) -> str:
-            """Cache-first thumbnail loader for visible rows.
-
-            This version no longer returns the original image as fallback because
-            decoding large originals in Kivy causes visible startup jank.  Rows
-            show the IMG badge until a small cached PNG is ready.
-            """
-            if not file_path or not is_image_file_for_preview(file_path):
-                return ""
-            cached = _thumbnail_path_for(file_path)
-            if os.path.exists(cached):
-                state["thumbs"][file_path] = cached
-                return cached
-            if file_path in state["thumb_pending"]:
-                return ""
-            state["thumb_pending"].add(file_path)
-
-            def _worker():
-                ok = False
-                err = ""
-                try:
-                    from PIL import Image as PILImage, ImageOps
-                    with PILImage.open(file_path) as img:
-                        try:
-                            img = ImageOps.exif_transpose(img)
-                        except Exception:
-                            pass
-                        # Keep the cache small and cheap to upload as a Kivy texture.
-                        img.thumbnail((128, 128))
-                        if img.mode not in ("RGB", "RGBA"):
-                            img = img.convert("RGBA")
-                        out = Path(cached)
-                        out.parent.mkdir(parents=True, exist_ok=True)
-                        tmp = out.with_suffix(".tmp.png")
-                        img.save(tmp, format="PNG")
-                        try:
-                            tmp.replace(out)
-                        except Exception:
-                            img.save(out, format="PNG")
-                            try:
-                                tmp.unlink(missing_ok=True)
-                            except Exception:
-                                pass
-                    ok = True
-                except Exception as exc:
-                    err = str(exc)
-                    ok = False
-
-                def _done(_dt):
-                    state["thumb_pending"].discard(file_path)
-                    if ok and os.path.exists(cached):
-                        state["thumbs"][file_path] = cached
-                        _schedule_thumbnail_refresh()
-                    elif err:
-                        try:
-                            self._append_debug_line(f"thumbnail cache build failed: {Path(file_path).name}: {err}", protocol=False)
-                        except Exception:
-                            pass
-
-                Clock.schedule_once(_done, 0)
-
-            try:
-                executor = state.get("thumb_executor")
-                if executor is not None:
-                    executor.submit(_worker)
-                else:
-                    threading.Thread(target=_worker, daemon=True).start()
-            except Exception:
-                threading.Thread(target=_worker, daemon=True).start()
-            return ""
 
         def _file_row_dict(p: Path) -> Dict[str, object]:
             try:
@@ -4530,7 +4617,7 @@ class RUDPTransferRoot(BoxLayout):
                 type_text = ext.upper() if ext else "文件"
                 icon_text = file_icon_text(str(p), is_dir=False)
                 size_text = format_file_size(size_num) if size_num >= 0 else ""
-                thumb_source = state["thumbs"].get(full, "")
+                thumb_source = ""
                 attr_text = "A"
             return {
                 "full_path": full,
@@ -4550,7 +4637,7 @@ class RUDPTransferRoot(BoxLayout):
                 "sort_mtime": mtime,
                 "on_toggle": _toggle_path,
                 "on_open": _enter_path,
-                "on_request_thumb": _request_thumbnail,
+                "on_request_thumb": None,
                 "on_preview": _preview_image,
             }
 
@@ -5032,6 +5119,9 @@ class RUDPTransferRoot(BoxLayout):
                 self.main_messages_box.append(f"文件消息创建失败: {exc}\n")
                 return
         elif self.current_chat_mode == "group" and self.current_group_id:
+            if not self._is_local_active_group_member(self.current_group_id):
+                self.main_messages_box.append("你已不在此群，不能发送文件。\n")
+                return
             try:
                 msg, recipients = self.message_service.create_group_file(self.current_group_id, path)
             except Exception as exc:
