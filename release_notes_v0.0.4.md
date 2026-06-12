@@ -23,3 +23,37 @@
 - 免安装版：解压 AgoraLink_portable_v0.0.4.zip 后运行 AgoraLink.exe。
 - 首次运行时，请允许 Windows 防火墙专用网络访问。
 - 两台设备需要处于同一局域网内，或网络允许 UDP 通信。
+
+发布打包：
+
+- 在项目根目录运行：
+  `powershell -ExecutionPolicy Bypass -File scripts/package_release_v0_0_4.ps1`
+- 脚本会依次执行 py_compile、PyInstaller、NSIS、免安装 ZIP 打包，并输出两个发布文件的 SHA256。
+- 发布产物：
+  - dist/AgoraLink_Setup_v0.0.4.exe
+  - dist/AgoraLink_portable_v0.0.4.zip
+- build/、dist/、__pycache__/、*.exe、*.zip、*.db、*.key、*.pin 不提交到仓库。
+
+GitHub Release 说明：
+
+- Tag：v0.0.4
+- Release title：AgoraLink v0.0.4
+- 上传附件：
+  - AgoraLink_Setup_v0.0.4.exe
+  - AgoraLink_portable_v0.0.4.zip
+- Release 正文应包含本文件“主要更新”“使用方式”和脚本输出的 SHA256。
+- 回滚方式：卸载当前安装版后安装上一版本，或删除免安装目录后解压上一版本 portable 包。回滚前建议备份本机数据目录 `%LOCALAPPDATA%\AgoraLink`。
+
+基础回归测试清单：
+
+- py_compile 检查通过。
+- PyInstaller 生成 dist/AgoraLink/AgoraLink.exe。
+- NSIS 生成 dist/AgoraLink_Setup_v0.0.4.exe。
+- 免安装 ZIP 可解压，解压后 AgoraLink.exe 可启动。
+- 首次启动后可解锁聊天数据库并自动启动接收端。
+- 两台局域网设备可发现对方并完成联系人请求/接受。
+- 一对一文本消息可发送、接收，并显示送达/已读状态。
+- 文件可发送、接收，接收目录中能看到完整文件。
+- 中断后重新发送同一文件时，断点续传路径可正常处理。
+- 群聊可创建、添加成员、查看群详情、发送群消息、移除成员或退群。
+- 文件选择器可选择单文件、多文件、文件夹，默认多选打包为 ZIP_STORED。
