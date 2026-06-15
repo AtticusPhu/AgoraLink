@@ -1881,7 +1881,7 @@ class RUDPTransferRoot(BoxLayout):
         self.main_messages_box = ChatMessageBox(root_owner=self)
         center.add_widget(self.main_messages_box)
         self.screen_share_status_label = make_label(
-            text="Screen: idle",
+            text=self._screen_share_status_text("idle"),
             size_hint_y=None,
             height=dp(28),
             halign="left",
@@ -3577,23 +3577,55 @@ class RUDPTransferRoot(BoxLayout):
             return "停止投屏" if self.lang == "zh" else "Stop Share"
         return "投屏" if self.lang == "zh" else "Share"
 
+    def _screen_share_active_states(self) -> set:
+        return {"pending_offer", "pending_accept", "sending", "receiving"}
+
+    def _screen_share_status_text(self, key: str, detail: str = "") -> str:
+        zh = {
+            "idle": "空闲",
+            "pending_offer": "等待对方接受投屏",
+            "pending_accept": "正在启动投屏接收端",
+            "sending": "正在投屏",
+            "receiving": "正在观看对方屏幕",
+            "remote_rejected": "对方拒绝投屏",
+            "remote_stopped": "对方停止投屏",
+            "startup_failed": "启动失败",
+            "stop_failed": "停止失败",
+        }
+        en = {
+            "idle": "Idle",
+            "pending_offer": "Waiting for the other side to accept screen sharing",
+            "pending_accept": "Starting screen receiver",
+            "sending": "Sharing screen",
+            "receiving": "Watching remote screen",
+            "remote_rejected": "Remote rejected screen sharing",
+            "remote_stopped": "Remote stopped screen sharing",
+            "startup_failed": "Start failed",
+            "stop_failed": "Stop failed",
+        }
+        text = (zh if self.lang == "zh" else en).get(str(key or ""), str(key or ""))
+        detail = str(detail or "").strip()
+        if detail:
+            return f"{text}：{detail}" if self.lang == "zh" else f"{text}: {detail}"
+        return text
+
     def _screen_share_button_active(self) -> bool:
         ui_state = str(getattr(self, "screen_share_ui_state", "idle") or "idle")
-        if ui_state == "pending":
+        if ui_state in ("pending_offer", "pending_accept"):
             return True
         try:
             state = self._screen_runtime().get_state()
             runtime_state = str(state.get("state") or "")
             running = bool(state.get("running"))
-            return bool(running and runtime_state in ("sending", "receiving", "stopping"))
+            return bool(running and runtime_state in ("sending", "receiving"))
         except Exception:
-            return ui_state in ("sending", "receiving", "stopping")
+            return ui_state in self._screen_share_active_states()
 
     def _refresh_screen_share_button(self) -> None:
         if not hasattr(self, "main_screen_btn"):
             return
         active = self._screen_share_button_active()
-        if not active and str(getattr(self, "screen_share_ui_state", "idle") or "") != "pending":
+        if not active and str(getattr(self, "screen_share_ui_state", "idle") or "") not in ("pending_offer", "pending_accept"):
             self.screen_share_ui_state = "idle"
         self.main_screen_btn.text = self._screen_share_button_text(active)
         self.main_screen_btn.width = dp(106)
@@ -3608,6 +3640,18 @@ class RUDPTransferRoot(BoxLayout):
     def _set_screen_share_ui_state(self, state: str) -> None:
         self.screen_share_ui_state = str(state or "idle")
         self._schedule_screen_share_button_refresh()
+
+    def _screen_runtime_error_detail(self, state: Optional[Dict[str, object]] = None) -> str:
+        try:
+            current = dict(state or self._screen_runtime().get_state())
+            detail = str(current.get("last_error") or current.get("error") or "").strip()
+            if not detail:
+                returncode = current.get("returncode")
+                if returncode not in (None, "", 0):
+                    detail = f"returncode={returncode}"
+            return detail or "unknown"
+        except Exception as exc:
+            return str(exc)
 
     def _on_screen_share_button(self) -> None:
         try:
@@ -3706,20 +3750,23 @@ class RUDPTransferRoot(BoxLayout):
         try:
             state = self._screen_runtime().get_state()
             runtime_state = str(state.get("state") or "idle")
-            if runtime_state in ("sending", "receiving", "stopping"):
+            if runtime_state in ("sending", "receiving"):
                 self.screen_share_ui_state = runtime_state
-            elif str(getattr(self, "screen_share_ui_state", "idle") or "") != "pending":
+            elif runtime_state == "error":
                 self.screen_share_ui_state = "idle"
-            text = (
-                f"Screen: {state.get('state') or ''}"
-                f" running={bool(state.get('running'))}"
-                f" mode={state.get('mode') or ''}"
-                f" host={state.get('host') or ''}"
-                f" error={state.get('last_error') or ''}"
-            )
+            elif str(getattr(self, "screen_share_ui_state", "idle") or "") not in ("pending_offer", "pending_accept"):
+                self.screen_share_ui_state = "idle"
+            if runtime_state == "sending":
+                text = self._screen_share_status_text("sending")
+            elif runtime_state == "receiving":
+                text = self._screen_share_status_text("receiving")
+            elif runtime_state == "error":
+                text = self._screen_share_status_text("startup_failed", self._screen_runtime_error_detail(state))
+            else:
+                text = self._screen_share_status_text("idle")
             self._set_screen_share_status((str(prefix or "").strip() + "  " + text).strip())
         except Exception as exc:
-            self._set_screen_share_status(f"Screen error: {exc}")
+            self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
 
     def _screen_control_payload_text(self, control: Dict[str, object]) -> str:
         return SCREEN_CONTROL_TEXT_PREFIX + json.dumps(control, ensure_ascii=False, separators=(",", ":"))
@@ -3742,17 +3789,17 @@ class RUDPTransferRoot(BoxLayout):
     def _send_screen_control_to_peer(self, peer_id: str, control: Dict[str, object]) -> bool:
         peer_id = str(peer_id or "").strip()
         if self.message_service is None:
-            self._set_screen_share_status("Screen control failed: chat is locked")
+            self._set_screen_share_status(self._screen_share_status_text("startup_failed", "chat is locked"))
             return False
         if not peer_id:
-            self._set_screen_share_status("Screen control failed: missing peer")
+            self._set_screen_share_status(self._screen_share_status_text("startup_failed", "missing peer"))
             return False
         try:
             control_type = str((control or {}).get("type") or "")
             text = self._screen_control_payload_text(control)
             msg, contact = self.message_service.create_direct_text(peer_id, text)
         except Exception as exc:
-            self._set_screen_share_status(f"Screen control message create failed: {exc}")
+            self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
             if str((control or {}).get("type") or "") == SCREEN_SHARE_OFFER:
                 self.screen_share_session_id = ""
                 self.screen_share_peer_id = ""
@@ -3802,7 +3849,7 @@ class RUDPTransferRoot(BoxLayout):
                         self.screen_share_session_id = ""
                         self.screen_share_peer_id = ""
                         self._set_screen_share_ui_state("idle")
-                    self._set_screen_share_status("Screen control failed: invalid endpoint")
+                    self._set_screen_share_status(self._screen_share_status_text("startup_failed", "invalid endpoint"))
                     self._force_chat_refresh()
                 Clock.schedule_once(_invalid_endpoint, 0)
                 return
@@ -3830,13 +3877,19 @@ class RUDPTransferRoot(BoxLayout):
                         self.screen_share_session_id = ""
                         self.screen_share_peer_id = ""
                         self._set_screen_share_ui_state("idle")
-                    self._set_screen_share_status("Screen control send failed")
+                    self._set_screen_share_status(self._screen_share_status_text("startup_failed", "screen control send failed"))
                     self._force_chat_refresh()
                 Clock.schedule_once(_send_failed, 0)
         threading.Thread(target=_run, daemon=True).start()
         return True
 
     def send_screen_share_offer(self) -> None:
+        ui_state = str(getattr(self, "screen_share_ui_state", "idle") or "idle")
+        if ui_state in ("pending_offer", "pending_accept"):
+            self._set_screen_share_status(self._screen_share_status_text(ui_state))
+            return
+        if self._screen_share_button_active():
+            return
         if self.current_chat_mode != "direct" or not self.current_peer_id:
             self._set_screen_share_status("Screen share requires a direct contact")
             self._set_screen_share_ui_state("idle")
@@ -3857,14 +3910,14 @@ class RUDPTransferRoot(BoxLayout):
             self.screen_share_session_id = session_id
             self.screen_share_peer_id = peer_id
             if self._send_screen_control_to_peer(peer_id, offer):
-                self._set_screen_share_ui_state("pending")
-                self._set_screen_share_status(f"Screen offer sent to {peer_id}; waiting for accept")
+                self._set_screen_share_ui_state("pending_offer")
+                self._set_screen_share_status(self._screen_share_status_text("pending_offer"))
             else:
                 self.screen_share_session_id = ""
                 self.screen_share_peer_id = ""
                 self._set_screen_share_ui_state("idle")
         except Exception as exc:
-            self._set_screen_share_status(f"Screen offer failed: {exc}")
+            self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
             self.screen_share_session_id = ""
             self.screen_share_peer_id = ""
             self._set_screen_share_ui_state("idle")
@@ -3873,11 +3926,14 @@ class RUDPTransferRoot(BoxLayout):
         peer_id = str(self.screen_share_peer_id or self.current_peer_id or "").strip()
         session_id = str(self.screen_share_session_id or ("screen_" + secrets.token_hex(12)))
         try:
-            self._screen_runtime().stop()
+            state = self._screen_runtime().stop()
             self._set_screen_share_ui_state("idle")
-            self._update_screen_share_status_from_runtime("Screen stopped")
+            if str(state.get("state") or "") == "error":
+                self._set_screen_share_status(self._screen_share_status_text("stop_failed", self._screen_runtime_error_detail(state)))
+            else:
+                self._set_screen_share_status(self._screen_share_status_text("idle"))
         except Exception as exc:
-            self._set_screen_share_status(f"Screen stop failed: {exc}")
+            self._set_screen_share_status(self._screen_share_status_text("stop_failed", str(exc)))
             self._set_screen_share_ui_state("idle")
         if peer_id:
             try:
@@ -3923,14 +3979,14 @@ class RUDPTransferRoot(BoxLayout):
                 self.screen_share_session_id = ""
                 self.screen_share_peer_id = ""
                 self._set_screen_share_ui_state("idle")
-                self._set_screen_share_status(f"Screen share rejected by {sender}: {reason}")
+                self._set_screen_share_status(self._screen_share_status_text("remote_rejected", reason))
             elif message_type == SCREEN_SHARE_STOP:
                 self._handle_screen_stop(control)
             elif message_type == SCREEN_SHARE_STATE:
                 payload = dict(control.get("payload") or {})
                 self._set_screen_share_status(f"Remote screen state: {payload.get('state') or ''} {payload.get('detail') or ''}")
         except Exception as exc:
-            self._set_screen_share_status(f"Screen control failed: {exc}")
+            self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
 
     def _show_screen_offer_popup(self, control: Dict[str, object]) -> None:
         sender = str(control.get("sender_peer_id") or "")
@@ -3957,12 +4013,14 @@ class RUDPTransferRoot(BoxLayout):
         session_id = str(control.get("session_id") or "")
         payload = dict(control.get("payload") or {})
         try:
+            self._set_screen_share_ui_state("pending_accept")
+            self._set_screen_share_status(self._screen_share_status_text("pending_accept"))
             state = self._screen_runtime().start_receiver(port=DEFAULT_SCREEN_PORT)
             if str(state.get("state") or "") != "receiving":
-                reason = str(state.get("last_error") or "receiver_start_failed")
-                self._set_screen_share_status(f"Screen receive failed: {reason}")
+                reason = self._screen_runtime_error_detail(self._screen_runtime().get_state())
+                self._set_screen_share_status(self._screen_share_status_text("startup_failed", reason))
                 self._set_screen_share_ui_state("idle")
-                self._reject_screen_offer(control, reason)
+                self._reject_screen_offer(control, reason, update_status=False)
                 return
             selected_profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else self._screen_profile_dict()
             accept = make_accept(
@@ -3977,21 +4035,22 @@ class RUDPTransferRoot(BoxLayout):
             self.screen_share_peer_id = sender
             self._set_screen_share_ui_state("receiving")
             self._send_screen_control_to_peer(sender, accept)
-            self._update_screen_share_status_from_runtime("Screen offer accepted")
+            self._set_screen_share_status(self._screen_share_status_text("receiving"))
         except Exception as exc:
-            self._set_screen_share_status(f"Screen accept failed: {exc}")
+            self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
             self._set_screen_share_ui_state("idle")
 
-    def _reject_screen_offer(self, control: Dict[str, object], reason: str) -> None:
+    def _reject_screen_offer(self, control: Dict[str, object], reason: str, update_status: bool = True) -> None:
         sender = str(control.get("sender_peer_id") or "")
         session_id = str(control.get("session_id") or "")
         try:
             reject = make_reject(session_id, self.chat_local_peer_id, sender, reason)
             self._send_screen_control_to_peer(sender, reject)
             self._set_screen_share_ui_state("idle")
-            self._set_screen_share_status(f"Screen offer rejected: {reason}")
+            if update_status:
+                self._set_screen_share_status(self._screen_share_status_text("idle"))
         except Exception as exc:
-            self._set_screen_share_status(f"Screen reject failed: {exc}")
+            self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
             self._set_screen_share_ui_state("idle")
 
     def _handle_screen_accept(self, control: Dict[str, object]) -> None:
@@ -4002,7 +4061,7 @@ class RUDPTransferRoot(BoxLayout):
             if not host or is_unspecified_ip(host):
                 host, _port = self._endpoint_for_peer(sender)
             if not host or is_unspecified_ip(host):
-                self._set_screen_share_status("Screen sender failed: missing receiver IP")
+                self._set_screen_share_status(self._screen_share_status_text("startup_failed", "missing receiver IP"))
                 self.screen_share_session_id = ""
                 self.screen_share_peer_id = ""
                 self._set_screen_share_ui_state("idle")
@@ -4011,16 +4070,16 @@ class RUDPTransferRoot(BoxLayout):
             self.screen_share_peer_id = sender
             state = self._screen_runtime().start_sender(host=host, port=DEFAULT_SCREEN_PORT, profile="720p30_h264_qsv")
             if str(state.get("state") or "") != "sending":
-                reason = str(state.get("last_error") or "sender_start_failed")
+                reason = self._screen_runtime_error_detail(self._screen_runtime().get_state())
                 self.screen_share_session_id = ""
                 self.screen_share_peer_id = ""
                 self._set_screen_share_ui_state("idle")
-                self._set_screen_share_status(f"Screen sender failed: {reason}")
+                self._set_screen_share_status(self._screen_share_status_text("startup_failed", reason))
                 return
             self._set_screen_share_ui_state("sending")
-            self._update_screen_share_status_from_runtime(f"Screen accepted by {sender}")
+            self._set_screen_share_status(self._screen_share_status_text("sending"))
         except Exception as exc:
-            self._set_screen_share_status(f"Screen accept handling failed: {exc}")
+            self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
             self._set_screen_share_ui_state("idle")
 
     def _handle_screen_stop(self, control: Dict[str, object]) -> None:
@@ -4030,9 +4089,9 @@ class RUDPTransferRoot(BoxLayout):
             self.screen_share_session_id = ""
             self.screen_share_peer_id = ""
             self._set_screen_share_ui_state("idle")
-            self._update_screen_share_status_from_runtime(f"Screen stopped by {sender}")
+            self._set_screen_share_status(self._screen_share_status_text("remote_stopped"))
         except Exception as exc:
-            self._set_screen_share_status(f"Screen remote stop failed: {exc}")
+            self._set_screen_share_status(self._screen_share_status_text("stop_failed", str(exc)))
             self._set_screen_share_ui_state("idle")
 
     def open_debug_popup(self) -> None:

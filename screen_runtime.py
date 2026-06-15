@@ -28,7 +28,7 @@ STATE_STOPPING = "stopping"
 STATE_ERROR = "error"
 
 DEFAULT_SCREEN_PROFILE = "720p30_h264_qsv"
-FFMPEG_INSTALL_HINT = "Install FFmpeg with: winget install --id Gyan.FFmpeg -e"
+FFMPEG_INSTALL_HINT = "需要安装 FFmpeg：winget install --id Gyan.FFmpeg -e"
 
 
 class ScreenRuntime:
