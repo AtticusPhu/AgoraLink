@@ -32,6 +32,7 @@ ENCODERS_OF_INTEREST = (
     "h264_amf",
     "hevc_amf",
     "av1_amf",
+    "libx264",
 )
 
 TEST_PROFILES = (
@@ -54,12 +55,39 @@ TEST_PROFILES = (
         "experimental": False,
     },
     {
+        "name": "720p30 h264_nvenc",
+        "mode": "auto",
+        "width": 1280,
+        "height": 720,
+        "fps": 30,
+        "encoder": "h264_nvenc",
+        "experimental": False,
+    },
+    {
         "name": "1080p30 h264_qsv",
         "mode": "auto",
         "width": 1920,
         "height": 1080,
         "fps": 30,
         "encoder": "h264_qsv",
+        "experimental": False,
+    },
+    {
+        "name": "1080p30 h264_nvenc",
+        "mode": "auto",
+        "width": 1920,
+        "height": 1080,
+        "fps": 30,
+        "encoder": "h264_nvenc",
+        "experimental": False,
+    },
+    {
+        "name": "720p30 h264_software",
+        "mode": "fallback",
+        "width": 1280,
+        "height": 720,
+        "fps": 30,
+        "encoder": "libx264",
         "experimental": False,
     },
     {
@@ -92,10 +120,12 @@ TEST_PROFILES = (
 )
 
 AUTO_RECOMMENDATION_ORDER = (
-    "720p30 hevc_qsv",
     "720p30 h264_qsv",
+    "720p30 h264_nvenc",
+    "720p30 hevc_qsv",
     "1080p30 h264_qsv",
-    "1080p30 hevc_qsv",
+    "1080p30 h264_nvenc",
+    "720p30 h264_software",
 )
 
 FATAL_ENCODER_PATTERNS = (
@@ -491,7 +521,7 @@ def probe_screen_capability(ffmpeg_path: str = "", seconds: float = 5.0) -> Dict
         result["recommended"] = bool(recommended and result.get("name") == recommended)
 
     experimental_profiles = [str(result.get("name") or "") for result in tests if result.get("experimental") and result.get("ok")]
-    reason = "ok" if recommended else "no_stable_realtime_qsv_profile_ok; use software fallback or show unavailable"
+    reason = "ok" if recommended else "no_stable_realtime_screen_profile_ok; use software fallback or show unavailable"
 
     return {
         "ok": bool(recommended),
@@ -505,6 +535,23 @@ def probe_screen_capability(ffmpeg_path: str = "", seconds: float = 5.0) -> Dict
         "experimental_profiles": experimental_profiles,
         "tests": tests,
     }
+
+
+def get_advertised_profiles(
+    capabilities: Optional[Dict[str, object]] = None,
+    *,
+    ffmpeg_path: str = "",
+    runtime_seconds: float = 0.75,
+    include_experimental: bool = False,
+) -> List[Dict[str, object]]:
+    from screen_profile import get_advertised_profiles as _get_advertised_profiles
+
+    return _get_advertised_profiles(
+        capabilities,
+        ffmpeg_path=ffmpeg_path,
+        runtime_seconds=runtime_seconds,
+        include_experimental=include_experimental,
+    )
 
 
 def build_argparser() -> argparse.ArgumentParser:

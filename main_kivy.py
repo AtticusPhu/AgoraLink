@@ -314,10 +314,23 @@ from screen_control import (
     make_stop,
     parse_screen_control_message,
 )
-from screen_profile import PROFILES_BY_NAME
+from screen_profile import (
+    DEFAULT_SCREEN_PROFILE,
+    PROFILES_BY_NAME,
+    choose_advertised_profile,
+    get_advertised_profiles,
+    profile_id_from_info,
+    profile_info,
+)
 from screen_runtime import ScreenRuntime
+from diagnostic_export import export_diagnostic_bundle
+from port_utils import find_available_udp_port, udp_port_status, udp_ports_status
 
 SCREEN_CONTROL_TEXT_PREFIX = "__AGORALINK_SCREEN_CONTROL__:"
+MAIN_UDP_PORT = 9999
+SCREEN_PORT_CANDIDATES = tuple(range(DEFAULT_SCREEN_PORT, DEFAULT_SCREEN_PORT + 6))
+MAIN_UDP_PORT_BUSY_MESSAGE = "UDP 9999 已被占用，请关闭旧的 AgoraLink 或修改配置后重启。"
+SCREEN_PORTS_BUSY_MESSAGE = "投屏端口 50020-50025 均被占用，无法启动接收端。"
 
 I18N: Dict[str, Dict[str, str]] = {
     "zh": {
@@ -1576,6 +1589,14 @@ class RUDPTransferRoot(BoxLayout):
         self._last_transfer_progress_line = ""
         self.screen_share_session_id = ""
         self.screen_share_peer_id = ""
+        self.screen_share_peer_label = ""
+        self.screen_share_current_port: Optional[int] = None
+        self.screen_share_selected_profile = ""
+        self.current_screen_peer = ""
+        self.current_screen_profile = ""
+        self.current_screen_port: Optional[int] = None
+        self.screen_share_advertised_profiles: List[Dict[str, object]] = []
+        self.screen_share_advertised_profiles_ts = 0.0
         self.screen_share_last_status = ""
         self.screen_share_ui_state = "idle"
         self._seen_screen_control_messages = set()
@@ -1883,7 +1904,7 @@ class RUDPTransferRoot(BoxLayout):
         self.screen_share_status_label = make_label(
             text=self._screen_share_status_text("idle"),
             size_hint_y=None,
-            height=dp(28),
+            height=dp(44),
             halign="left",
             valign="middle",
             color=THEME["muted_text"],
@@ -3454,8 +3475,10 @@ class RUDPTransferRoot(BoxLayout):
             path = self.export_diagnostic_logs()
             if path:
                 self.sender_log_box.append(f"Diagnostics exported: {path}\n")
+            else:
+                self.sender_log_box.append("Diagnostics export failed\n")
         buttons.add_widget(make_button("primary", text="应用", on_release=_apply_theme))
-        buttons.add_widget(make_button("secondary", text="导出诊断日志", on_release=_export))
+        buttons.add_widget(make_button("secondary", text="导出诊断包", on_release=_export))
         buttons.add_widget(make_button("secondary", text="防火墙", on_release=lambda *_: self.allow_firewall()))
         buttons.add_widget(make_button("secondary", text="关闭", on_release=lambda *_: popup.dismiss()))
         content.add_widget(buttons)
@@ -3520,26 +3543,16 @@ class RUDPTransferRoot(BoxLayout):
 
     def export_diagnostic_logs(self) -> str:
         try:
-            out_dir = debug_log_dir()
-            stamp = time.strftime("%Y%m%d_%H%M%S")
-            out_path = out_dir / f"AgoraLink_diagnostics_{stamp}.zip"
-            with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for name in ("sender_worker.log", "receiver_worker.log"):
-                    path = out_dir / name
-                    if path.exists() and path.is_file():
-                        zf.write(path, arcname=name)
-                zf.writestr("gui_runtime_recent.log", "\n".join(getattr(self, "debug_runtime_lines", [])[-1000:]))
-                zf.writestr("gui_protocol_recent.log", "\n".join(getattr(self, "debug_protocol_lines", [])[-1000:]))
-                zf.writestr("version_info.json", json.dumps({
-                    "app": APP_NAME,
-                    "release": "v0.0.4",
-                    "python": sys.version,
-                    "platform": sys.platform,
-                    "frozen": FROZEN,
-                    "app_dir": str(APP_DIR),
-                }, ensure_ascii=False, indent=2))
-                zf.writestr("chat_state_summary.json", json.dumps(self._chat_diagnostic_summary(), ensure_ascii=False, indent=2))
-            return str(out_path)
+            return export_diagnostic_bundle(
+                screen_runtime=self._screen_runtime(),
+                extra_json={
+                    "chat_state_summary.json": self._chat_diagnostic_summary(),
+                },
+                extra_text={
+                    "gui_runtime_recent.log": "\n".join(getattr(self, "debug_runtime_lines", [])[-1000:]),
+                    "gui_protocol_recent.log": "\n".join(getattr(self, "debug_protocol_lines", [])[-1000:]),
+                },
+            )
         except Exception as exc:
             try:
                 self.sender_log_box.append(f"Diagnostics export failed: {exc}\n")
@@ -3554,12 +3567,129 @@ class RUDPTransferRoot(BoxLayout):
             self.app.screen_runtime = runtime
         return runtime
 
+    def _choose_screen_receive_port(self) -> Optional[int]:
+        return find_available_udp_port(SCREEN_PORT_CANDIDATES)
+
+    def _screen_peer_label(self, peer_id: str = "", fallback_host: str = "") -> str:
+        pid = str(peer_id or "").strip()
+        fallback = str(fallback_host or "").strip()
+        label = ""
+        if pid:
+            try:
+                label = str(self._display_name_for_peer(pid) or "").strip()
+            except Exception:
+                label = ""
+        if label and label != pid:
+            return label
+        if fallback and not is_unspecified_ip(fallback):
+            return fallback
+        return label or fallback or pid or ("对方" if self.lang == "zh" else "Remote")
+
+    def _current_screen_peer_label(self, state: Optional[Dict[str, object]] = None) -> str:
+        label = str(getattr(self, "screen_share_peer_label", "") or getattr(self, "current_screen_peer", "") or "").strip()
+        if label:
+            return label
+        try:
+            runtime_label = str(dict(state or self._screen_runtime().get_state()).get("peer_label") or "").strip()
+            if runtime_label:
+                return runtime_label
+        except Exception:
+            pass
+        peer_id = str(getattr(self, "screen_share_peer_id", "") or "").strip()
+        ui_state = str(getattr(self, "screen_share_ui_state", "idle") or "idle")
+        if not peer_id and ui_state in self._screen_share_active_states():
+            peer_id = str(getattr(self, "current_peer_id", "") or "").strip()
+        return self._screen_peer_label(peer_id) if peer_id else ""
+
+    def _set_current_screen_context(
+        self,
+        *,
+        peer_label: Optional[str] = None,
+        profile: Optional[str] = None,
+        port: Optional[int] = None,
+    ) -> None:
+        if peer_label is not None:
+            self.screen_share_peer_label = str(peer_label or "").strip()
+            self.current_screen_peer = self.screen_share_peer_label
+        if profile is not None:
+            self.screen_share_selected_profile = str(profile or "").strip()
+            self.current_screen_profile = self.screen_share_selected_profile
+        if port is not None:
+            self.screen_share_current_port = int(port)
+            self.current_screen_port = int(port)
+
+    def _clear_current_screen_context(self) -> None:
+        self.screen_share_peer_label = ""
+        self.screen_share_current_port = None
+        self.screen_share_selected_profile = ""
+        self.current_screen_peer = ""
+        self.current_screen_profile = ""
+        self.current_screen_port = None
+
+    def _screen_port_from_accept(self, control: Dict[str, object], payload: Dict[str, object]) -> int:
+        for raw in (control.get("screen_port"), payload.get("screen_port"), payload.get("port")):
+            if raw in (None, ""):
+                continue
+            try:
+                value = int(raw)
+            except Exception:
+                continue
+            if 1 <= value <= 65535:
+                return value
+        return DEFAULT_SCREEN_PORT
+
+    def _current_screen_port_text(self, state: Optional[Dict[str, object]] = None) -> str:
+        port = getattr(self, "screen_share_current_port", None)
+        if port in (None, ""):
+            port = getattr(self, "current_screen_port", None)
+        if port in (None, ""):
+            try:
+                port = dict(state or self._screen_runtime().get_state()).get("port")
+            except Exception:
+                port = None
+        return "" if port in (None, "") else str(port)
+
+    def _format_udp_port_diagnostics(self, state: Optional[Dict[str, object]] = None) -> str:
+        try:
+            main = udp_port_status(MAIN_UDP_PORT)
+            main_status = "可用" if main.get("available") else "被占用"
+            screen_statuses = udp_ports_status(SCREEN_PORT_CANDIDATES)
+            occupied = [str(item.get("port")) for item in screen_statuses if not item.get("available")]
+            occupied_text = ", ".join(occupied) if occupied else "无"
+            current_port = self._current_screen_port_text(state) or "无"
+            selected_profile = self._current_screen_profile_name(state) or "无"
+            current_encoder = self._current_screen_encoder(selected_profile)
+            profile_ids = [str(item.get("id") or item.get("name") or "") for item in self._screen_advertised_profiles()]
+            profiles_text = ", ".join([item for item in profile_ids if item]) or "无"
+            return (
+                f"UDP 9999: {main_status}\n"
+                f"UDP 50020-50025 被占用: {occupied_text}\n"
+                f"本机可发送 profiles: {profiles_text}\n"
+                f"当前 selected_profile: {selected_profile}\n"
+                f"当前 encoder: {current_encoder or '无'}\n"
+                f"当前投屏实际端口: {current_port}"
+            )
+        except Exception as exc:
+            return f"UDP 端口检测失败: {exc}"
+
     def _format_screen_runtime_state(self, state: Dict[str, object]) -> str:
+        deps = {}
+        try:
+            deps = self._screen_runtime().check_dependencies()
+        except Exception as exc:
+            deps = {"error": str(exc)}
+        peer_label = self._current_screen_peer_label(state)
+        selected_profile = self._current_screen_profile_name(state) or str(state.get("profile") or "")
+        screen_port = self._current_screen_port_text(state)
         return (
-            f"state: {state.get('state') or ''}    running: {bool(state.get('running'))}\n"
+            f"screen_state: {state.get('state') or ''}    running: {bool(state.get('running'))}\n"
             f"mode: {state.get('mode') or ''}    host: {state.get('host') or ''}\n"
-            f"port: {state.get('port') or ''}    profile: {state.get('profile') or ''}\n"
-            f"last_error: {state.get('last_error') or ''}"
+            f"peer_label: {peer_label}\n"
+            f"selected_profile: {selected_profile}    screen_port: {screen_port}\n"
+            f"ffmpeg_path: {deps.get('ffmpeg_path') or ''}\n"
+            f"ffplay_path: {deps.get('ffplay_path') or ''}\n"
+            f"last_error: {state.get('last_error') or ''}\n"
+            f"{self._format_udp_port_diagnostics(state)}"
         )
 
     def _refresh_screen_runtime_status(self, status_label: Label) -> None:
@@ -3580,34 +3710,59 @@ class RUDPTransferRoot(BoxLayout):
     def _screen_share_active_states(self) -> set:
         return {"pending_offer", "pending_accept", "sending", "receiving"}
 
-    def _screen_share_status_text(self, key: str, detail: str = "") -> str:
-        zh = {
-            "idle": "空闲",
-            "pending_offer": "等待对方接受投屏",
-            "pending_accept": "正在启动投屏接收端",
-            "sending": "正在投屏",
-            "receiving": "正在观看对方屏幕",
-            "remote_rejected": "对方拒绝投屏",
-            "remote_stopped": "对方停止投屏",
-            "startup_failed": "启动失败",
-            "stop_failed": "停止失败",
-        }
-        en = {
-            "idle": "Idle",
-            "pending_offer": "Waiting for the other side to accept screen sharing",
-            "pending_accept": "Starting screen receiver",
-            "sending": "Sharing screen",
-            "receiving": "Watching remote screen",
-            "remote_rejected": "Remote rejected screen sharing",
-            "remote_stopped": "Remote stopped screen sharing",
-            "startup_failed": "Start failed",
-            "stop_failed": "Stop failed",
-        }
-        text = (zh if self.lang == "zh" else en).get(str(key or ""), str(key or ""))
+    def _screen_share_status_text(
+        self,
+        key: str,
+        detail: str = "",
+        *,
+        peer_label: Optional[str] = None,
+        profile: Optional[str] = None,
+        port: Optional[object] = None,
+    ) -> str:
+        name = str(peer_label or "").strip() or self._current_screen_peer_label()
+        profile_text = str(profile or "").strip() or self._current_screen_profile_name() or "-"
+        port_text = str(port or "").strip() or self._current_screen_port_text() or "-"
         detail = str(detail or "").strip()
-        if detail:
-            return f"{text}：{detail}" if self.lang == "zh" else f"{text}: {detail}"
-        return text
+        key = str(key or "")
+        if self.lang == "zh":
+            if key == "idle":
+                return "空闲"
+            if key == "pending_offer":
+                return f"等待 {name} 接受投屏"
+            if key == "pending_accept":
+                return f"{name} 已接受，正在启动投屏"
+            if key == "sending":
+                return f"正在投屏给 {name}（profile: {profile_text}，port: {port_text}）"
+            if key == "receiving":
+                return f"正在观看 {name} 的屏幕（profile: {profile_text}，port: {port_text}）"
+            if key == "remote_rejected":
+                return f"{name} 拒绝投屏" + (f"：{detail}" if detail else "")
+            if key == "remote_stopped":
+                return f"{name} 已停止投屏"
+            if key == "startup_failed":
+                return "启动失败" + (f"：{detail}" if detail else "")
+            if key == "stop_failed":
+                return "停止失败" + (f"：{detail}" if detail else "")
+            return key + (f"：{detail}" if detail else "")
+        if key == "idle":
+            return "Idle"
+        if key == "pending_offer":
+            return f"Waiting for {name} to accept screen sharing"
+        if key == "pending_accept":
+            return f"{name} accepted, starting screen sharing"
+        if key == "sending":
+            return f"Sharing screen with {name} (profile: {profile_text}, port: {port_text})"
+        if key == "receiving":
+            return f"Watching {name}'s screen (profile: {profile_text}, port: {port_text})"
+        if key == "remote_rejected":
+            return f"{name} rejected screen sharing" + (f": {detail}" if detail else "")
+        if key == "remote_stopped":
+            return f"{name} stopped screen sharing"
+        if key == "startup_failed":
+            return "Start failed" + (f": {detail}" if detail else "")
+        if key == "stop_failed":
+            return "Stop failed" + (f": {detail}" if detail else "")
+        return key + (f": {detail}" if detail else "")
 
     def _screen_share_button_active(self) -> bool:
         ui_state = str(getattr(self, "screen_share_ui_state", "idle") or "idle")
@@ -3661,13 +3816,36 @@ class RUDPTransferRoot(BoxLayout):
                 self.send_screen_share_offer()
         except Exception as exc:
             self._set_screen_share_status(f"Screen button failed: {exc}")
+            self._clear_current_screen_context()
             self._set_screen_share_ui_state("idle")
 
     def _screen_debug_start_receiver(self, status_label: Label) -> None:
         try:
-            self._screen_runtime().start_receiver(port=50020)
-            self._append_debug_line("screen receiver start requested", protocol=False)
+            screen_port = self._choose_screen_receive_port()
+            if screen_port is None:
+                self._clear_current_screen_context()
+                try:
+                    self._screen_runtime().last_error = SCREEN_PORTS_BUSY_MESSAGE
+                except Exception:
+                    pass
+                status_label.text = SCREEN_PORTS_BUSY_MESSAGE + "\n" + self._format_udp_port_diagnostics()
+                return
+            selected_profile = self._screen_preferred_profile()
+            peer_label = "Debug"
+            state = self._screen_runtime().start_receiver(
+                port=screen_port,
+                profile=selected_profile,
+                peer_label=peer_label,
+                selected_profile=selected_profile,
+                screen_port=screen_port,
+            )
+            if str(state.get("state") or "") == "receiving":
+                self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port)
+            else:
+                self._clear_current_screen_context()
+            self._append_debug_line(f"screen receiver start requested port={screen_port} profile={selected_profile}", protocol=False)
         except Exception as exc:
+            self._clear_current_screen_context()
             try:
                 self._screen_runtime().last_error = str(exc)
             except Exception:
@@ -3682,9 +3860,21 @@ class RUDPTransferRoot(BoxLayout):
             if not host:
                 status_label.text = "screen sender start failed: target IP is required"
                 return
-            self._screen_runtime().start_sender(host=host, port=50020, profile="720p30_h264_qsv")
-            self._append_debug_line(f"screen sender start requested host={host}", protocol=False)
+            selected_profile = self._screen_preferred_profile()
+            peer_label = host
+            state = self._screen_runtime().start_sender(
+                host=host,
+                port=DEFAULT_SCREEN_PORT,
+                profile=selected_profile,
+                peer_label=peer_label,
+                selected_profile=selected_profile,
+                screen_port=DEFAULT_SCREEN_PORT,
+            )
+            if str(state.get("state") or "") == "sending":
+                self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=DEFAULT_SCREEN_PORT)
+            self._append_debug_line(f"screen sender start requested host={host} port={DEFAULT_SCREEN_PORT} profile={selected_profile}", protocol=False)
         except Exception as exc:
+            self._clear_current_screen_context()
             try:
                 self._screen_runtime().last_error = str(exc)
             except Exception:
@@ -3696,6 +3886,7 @@ class RUDPTransferRoot(BoxLayout):
     def _screen_debug_stop(self, status_label: Label) -> None:
         try:
             self._screen_runtime().stop()
+            self._clear_current_screen_context()
             self._append_debug_line("screen runtime stop requested", protocol=False)
         except Exception as exc:
             try:
@@ -3706,23 +3897,84 @@ class RUDPTransferRoot(BoxLayout):
             return
         self._schedule_screen_runtime_status(status_label)
 
-    def _screen_profile_dict(self) -> Dict[str, object]:
-        profile = PROFILES_BY_NAME.get("720p30_h264_qsv")
-        if profile is not None:
-            return profile.to_dict()
-        return {
-            "name": "720p30_h264_qsv",
-            "codec": "h264",
-            "encoder": "h264_qsv",
-            "width": 1280,
-            "height": 720,
-            "fps": 30,
-            "bitrate": "6M",
-            "maxrate": "10M",
-            "bufsize": "2M",
-            "experimental": False,
-            "mode": "auto",
-        }
+    def _screen_advertised_profiles(self, force: bool = False) -> List[Dict[str, object]]:
+        now = time.time()
+        cached = getattr(self, "screen_share_advertised_profiles", []) or []
+        if cached and not force and now - float(getattr(self, "screen_share_advertised_profiles_ts", 0.0) or 0.0) < 60.0:
+            return [dict(item) for item in cached]
+        try:
+            deps = self._screen_runtime().check_dependencies()
+            ffmpeg_path = str(deps.get("ffmpeg_path") or "")
+            profiles = get_advertised_profiles(ffmpeg_path=ffmpeg_path, runtime_seconds=0.75)
+            self.screen_share_advertised_profiles = [dict(item) for item in profiles]
+            self.screen_share_advertised_profiles_ts = now
+            return [dict(item) for item in profiles]
+        except Exception as exc:
+            self._append_debug_line(f"screen advertised profiles failed: {exc}", protocol=False)
+            return [dict(item) for item in cached]
+
+    def _screen_preferred_profile(self) -> str:
+        value = ""
+        try:
+            value = str((self.gui_config or {}).get("screen_preferred_profile") or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            return profile_id_from_info(value, DEFAULT_SCREEN_PROFILE)
+        profiles = self._screen_advertised_profiles()
+        if profiles:
+            return profile_id_from_info(profiles[0], DEFAULT_SCREEN_PROFILE)
+        return DEFAULT_SCREEN_PROFILE
+
+    def _screen_profile_dict(self, profile_name: object = DEFAULT_SCREEN_PROFILE) -> Dict[str, object]:
+        return profile_info(profile_name)
+
+    def _current_screen_profile_name(self, state: Optional[Dict[str, object]] = None) -> str:
+        profile = str(getattr(self, "screen_share_selected_profile", "") or getattr(self, "current_screen_profile", "") or "").strip()
+        if profile:
+            return profile_id_from_info(profile, DEFAULT_SCREEN_PROFILE)
+        try:
+            runtime_profile = dict(state or self._screen_runtime().get_state()).get("profile")
+            if runtime_profile:
+                return profile_id_from_info(runtime_profile, DEFAULT_SCREEN_PROFILE)
+        except Exception:
+            pass
+        return ""
+
+    def _current_screen_encoder(self, profile_name: object) -> str:
+        name = profile_id_from_info(profile_name, default="")
+        profile = PROFILES_BY_NAME.get(name)
+        return str(profile.encoder) if profile is not None else ""
+
+    def _offered_screen_profiles(self, control: Dict[str, object], payload: Dict[str, object]) -> List[Dict[str, object]]:
+        raw = control.get("profiles")
+        if not isinstance(raw, list):
+            raw = payload.get("profiles")
+        if not isinstance(raw, list):
+            return []
+        return [dict(item) for item in raw if isinstance(item, dict)]
+
+    def _preferred_screen_profile_from_offer(self, control: Dict[str, object], payload: Dict[str, object]) -> str:
+        raw = control.get("preferred_profile") or payload.get("preferred_profile") or payload.get("profile_name") or DEFAULT_SCREEN_PROFILE
+        return profile_id_from_info(raw, DEFAULT_SCREEN_PROFILE)
+
+    def _legacy_screen_profile_from_offer(self, payload: Dict[str, object]) -> Dict[str, object]:
+        profile = payload.get("profile")
+        if isinstance(profile, dict):
+            return dict(profile)
+        return self._screen_profile_dict(payload.get("profile_name") or DEFAULT_SCREEN_PROFILE)
+
+    def _selected_profile_from_accept(self, control: Dict[str, object], payload: Dict[str, object]) -> str:
+        for raw in (
+            control.get("selected_profile"),
+            payload.get("selected_profile"),
+            control.get("selected_profile_info"),
+            payload.get("selected_profile_info"),
+        ):
+            if raw in (None, ""):
+                continue
+            return profile_id_from_info(raw, DEFAULT_SCREEN_PROFILE)
+        return DEFAULT_SCREEN_PROFILE
 
     def _local_screen_host(self) -> str:
         try:
@@ -3803,6 +4055,7 @@ class RUDPTransferRoot(BoxLayout):
             if str((control or {}).get("type") or "") == SCREEN_SHARE_OFFER:
                 self.screen_share_session_id = ""
                 self.screen_share_peer_id = ""
+                self._clear_current_screen_context()
                 self._set_screen_share_ui_state("idle")
             return False
 
@@ -3848,6 +4101,7 @@ class RUDPTransferRoot(BoxLayout):
                     if control_type == SCREEN_SHARE_OFFER:
                         self.screen_share_session_id = ""
                         self.screen_share_peer_id = ""
+                        self._clear_current_screen_context()
                         self._set_screen_share_ui_state("idle")
                     self._set_screen_share_status(self._screen_share_status_text("startup_failed", "invalid endpoint"))
                     self._force_chat_refresh()
@@ -3876,6 +4130,7 @@ class RUDPTransferRoot(BoxLayout):
                     if control_type == SCREEN_SHARE_OFFER:
                         self.screen_share_session_id = ""
                         self.screen_share_peer_id = ""
+                        self._clear_current_screen_context()
                         self._set_screen_share_ui_state("idle")
                     self._set_screen_share_status(self._screen_share_status_text("startup_failed", "screen control send failed"))
                     self._force_chat_refresh()
@@ -3896,30 +4151,48 @@ class RUDPTransferRoot(BoxLayout):
             return
         try:
             session_id = "screen_" + secrets.token_hex(12)
-            profile = self._screen_profile_dict()
+            profiles = self._screen_advertised_profiles(force=True)
+            if not profiles:
+                self._set_screen_share_status(self._screen_share_status_text("startup_failed", "没有可用的本机投屏档位"))
+                self._set_screen_share_ui_state("idle")
+                return
+            preferred_profile = self._screen_preferred_profile()
+            profile = self._screen_profile_dict(preferred_profile)
             peer_id = str(self.current_peer_id or "")
+            peer_label = self._screen_peer_label(peer_id)
+            self._append_debug_line(
+                "OFFER advertised profiles: " + ", ".join(str(item.get("id") or item.get("name") or "") for item in profiles),
+                protocol=False,
+            )
             offer = make_offer(
                 session_id,
                 self.chat_local_peer_id,
                 peer_id,
                 self._local_screen_host(),
                 DEFAULT_SCREEN_PORT,
-                "720p30_h264_qsv",
+                preferred_profile,
                 profile,
+                profiles=profiles,
+                preferred_profile=preferred_profile,
             )
             self.screen_share_session_id = session_id
             self.screen_share_peer_id = peer_id
+            self._clear_current_screen_context()
+            self.screen_share_peer_label = peer_label
+            self.current_screen_peer = peer_label
             if self._send_screen_control_to_peer(peer_id, offer):
                 self._set_screen_share_ui_state("pending_offer")
-                self._set_screen_share_status(self._screen_share_status_text("pending_offer"))
+                self._set_screen_share_status(self._screen_share_status_text("pending_offer", peer_label=peer_label))
             else:
                 self.screen_share_session_id = ""
                 self.screen_share_peer_id = ""
+                self._clear_current_screen_context()
                 self._set_screen_share_ui_state("idle")
         except Exception as exc:
             self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
             self.screen_share_session_id = ""
             self.screen_share_peer_id = ""
+            self._clear_current_screen_context()
             self._set_screen_share_ui_state("idle")
 
     def stop_screen_share_from_chat(self) -> None:
@@ -3943,6 +4216,7 @@ class RUDPTransferRoot(BoxLayout):
                 self._set_screen_share_status(f"Screen stop notify failed: {exc}")
         self.screen_share_session_id = ""
         self.screen_share_peer_id = ""
+        self._clear_current_screen_context()
         self._set_screen_share_ui_state("idle")
 
     def _parse_screen_control_from_chat(self, obj: Dict[str, object]) -> Optional[Dict[str, object]]:
@@ -3976,10 +4250,12 @@ class RUDPTransferRoot(BoxLayout):
                 self._handle_screen_accept(control)
             elif message_type == SCREEN_SHARE_REJECT:
                 reason = str(dict(control.get("payload") or {}).get("reason") or "")
+                peer_label = self._screen_peer_label(sender)
                 self.screen_share_session_id = ""
                 self.screen_share_peer_id = ""
                 self._set_screen_share_ui_state("idle")
-                self._set_screen_share_status(self._screen_share_status_text("remote_rejected", reason))
+                self._set_screen_share_status(self._screen_share_status_text("remote_rejected", reason, peer_label=peer_label))
+                self._clear_current_screen_context()
             elif message_type == SCREEN_SHARE_STOP:
                 self._handle_screen_stop(control)
             elif message_type == SCREEN_SHARE_STATE:
@@ -3991,7 +4267,7 @@ class RUDPTransferRoot(BoxLayout):
     def _show_screen_offer_popup(self, control: Dict[str, object]) -> None:
         sender = str(control.get("sender_peer_id") or "")
         payload = dict(control.get("payload") or {})
-        profile_name = str(payload.get("profile_name") or "720p30_h264_qsv")
+        profile_name = str(payload.get("profile_name") or DEFAULT_SCREEN_PROFILE)
         content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
         label = make_label(
             text=f"收到投屏邀请\n来自: {sender}\n档位: {profile_name}",
@@ -4012,31 +4288,71 @@ class RUDPTransferRoot(BoxLayout):
         sender = str(control.get("sender_peer_id") or "")
         session_id = str(control.get("session_id") or "")
         payload = dict(control.get("payload") or {})
+        sender_host = str(payload.get("host") or "").strip()
+        peer_label = self._screen_peer_label(sender, sender_host)
         try:
             self._set_screen_share_ui_state("pending_accept")
-            self._set_screen_share_status(self._screen_share_status_text("pending_accept"))
-            state = self._screen_runtime().start_receiver(port=DEFAULT_SCREEN_PORT)
+            self.screen_share_peer_label = peer_label
+            self.current_screen_peer = peer_label
+            self._set_screen_share_status(self._screen_share_status_text("pending_accept", peer_label=peer_label))
+            offered_profiles = self._offered_screen_profiles(control, payload)
+            if offered_profiles:
+                local_profiles = self._screen_advertised_profiles(force=True)
+                user_preferred = str((self.gui_config or {}).get("screen_preferred_profile") or "").strip()
+                preferred = user_preferred or self._preferred_screen_profile_from_offer(control, payload)
+                selected_profile_info = choose_advertised_profile(
+                    offered_profiles,
+                    local_profiles,
+                    preferred_profile=preferred,
+                )
+                if selected_profile_info is None:
+                    self._clear_current_screen_context()
+                    self._set_screen_share_status("没有可用的共同投屏档位")
+                    self._set_screen_share_ui_state("idle")
+                    self._reject_screen_offer(control, "没有可用的共同投屏档位", update_status=False)
+                    return
+            else:
+                selected_profile_info = self._legacy_screen_profile_from_offer(payload)
+            selected_profile_name = profile_id_from_info(selected_profile_info, DEFAULT_SCREEN_PROFILE)
+            self._append_debug_line(f"ACCEPT selected profile: {selected_profile_name}", protocol=False)
+            screen_port = self._choose_screen_receive_port()
+            if screen_port is None:
+                self._clear_current_screen_context()
+                self._set_screen_share_status(SCREEN_PORTS_BUSY_MESSAGE)
+                self._set_screen_share_ui_state("idle")
+                self._reject_screen_offer(control, SCREEN_PORTS_BUSY_MESSAGE, update_status=False)
+                return
+            state = self._screen_runtime().start_receiver(
+                port=screen_port,
+                profile=selected_profile_name,
+                peer_label=peer_label,
+                selected_profile=selected_profile_name,
+                screen_port=screen_port,
+            )
             if str(state.get("state") or "") != "receiving":
                 reason = self._screen_runtime_error_detail(self._screen_runtime().get_state())
                 self._set_screen_share_status(self._screen_share_status_text("startup_failed", reason))
                 self._set_screen_share_ui_state("idle")
+                self._clear_current_screen_context()
                 self._reject_screen_offer(control, reason, update_status=False)
                 return
-            selected_profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else self._screen_profile_dict()
             accept = make_accept(
                 session_id,
                 self.chat_local_peer_id,
                 sender,
                 self._local_screen_host(),
-                DEFAULT_SCREEN_PORT,
-                selected_profile,
+                screen_port,
+                selected_profile_info,
             )
             self.screen_share_session_id = session_id
             self.screen_share_peer_id = sender
+            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile_name, port=screen_port)
             self._set_screen_share_ui_state("receiving")
             self._send_screen_control_to_peer(sender, accept)
-            self._set_screen_share_status(self._screen_share_status_text("receiving"))
+            self._append_debug_line(f"receiver actually used port/profile: {screen_port}/{selected_profile_name}", protocol=False)
+            self._set_screen_share_status(self._screen_share_status_text("receiving", peer_label=peer_label, profile=selected_profile_name, port=screen_port))
         except Exception as exc:
+            self._clear_current_screen_context()
             self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
             self._set_screen_share_ui_state("idle")
 
@@ -4046,10 +4362,12 @@ class RUDPTransferRoot(BoxLayout):
         try:
             reject = make_reject(session_id, self.chat_local_peer_id, sender, reason)
             self._send_screen_control_to_peer(sender, reject)
+            self._clear_current_screen_context()
             self._set_screen_share_ui_state("idle")
             if update_status:
                 self._set_screen_share_status(self._screen_share_status_text("idle"))
         except Exception as exc:
+            self._clear_current_screen_context()
             self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
             self._set_screen_share_ui_state("idle")
 
@@ -4064,33 +4382,54 @@ class RUDPTransferRoot(BoxLayout):
                 self._set_screen_share_status(self._screen_share_status_text("startup_failed", "missing receiver IP"))
                 self.screen_share_session_id = ""
                 self.screen_share_peer_id = ""
+                self._clear_current_screen_context()
                 self._set_screen_share_ui_state("idle")
                 return
+            screen_port = self._screen_port_from_accept(control, payload)
+            selected_profile = self._selected_profile_from_accept(control, payload)
+            peer_label = self._screen_peer_label(sender, host)
             self.screen_share_session_id = str(control.get("session_id") or "")
             self.screen_share_peer_id = sender
-            state = self._screen_runtime().start_sender(host=host, port=DEFAULT_SCREEN_PORT, profile="720p30_h264_qsv")
+            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port)
+            self._set_screen_share_status(self._screen_share_status_text("pending_accept", peer_label=peer_label, profile=selected_profile, port=screen_port))
+            state = self._screen_runtime().start_sender(
+                host=host,
+                port=screen_port,
+                profile=selected_profile,
+                peer_label=peer_label,
+                selected_profile=selected_profile,
+                screen_port=screen_port,
+            )
             if str(state.get("state") or "") != "sending":
                 reason = self._screen_runtime_error_detail(self._screen_runtime().get_state())
                 self.screen_share_session_id = ""
                 self.screen_share_peer_id = ""
+                self._clear_current_screen_context()
                 self._set_screen_share_ui_state("idle")
                 self._set_screen_share_status(self._screen_share_status_text("startup_failed", reason))
                 return
+            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port)
+            self._append_debug_line(f"sender actually used profile: {selected_profile}", protocol=False)
             self._set_screen_share_ui_state("sending")
-            self._set_screen_share_status(self._screen_share_status_text("sending"))
+            self._set_screen_share_status(self._screen_share_status_text("sending", peer_label=peer_label, profile=selected_profile, port=screen_port))
         except Exception as exc:
+            self._clear_current_screen_context()
             self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
             self._set_screen_share_ui_state("idle")
 
     def _handle_screen_stop(self, control: Dict[str, object]) -> None:
         sender = str(control.get("sender_peer_id") or "")
+        peer_label = self._current_screen_peer_label() or self._screen_peer_label(sender)
         try:
             self._screen_runtime().stop()
             self.screen_share_session_id = ""
             self.screen_share_peer_id = ""
             self._set_screen_share_ui_state("idle")
-            self._set_screen_share_status(self._screen_share_status_text("remote_stopped"))
+            stopped_text = self._screen_share_status_text("remote_stopped", peer_label=peer_label)
+            self._clear_current_screen_context()
+            self._set_screen_share_status(stopped_text)
         except Exception as exc:
+            self._clear_current_screen_context()
             self._set_screen_share_status(self._screen_share_status_text("stop_failed", str(exc)))
             self._set_screen_share_ui_state("idle")
 
@@ -4106,7 +4445,7 @@ class RUDPTransferRoot(BoxLayout):
         )
         bind_label_wrap(intro)
         content.add_widget(intro)
-        screen_box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(154), spacing=dp(6))
+        screen_box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(292), spacing=dp(6))
         screen_title = make_label(
             text="Screen share debug (FFmpeg/UDP only)",
             size_hint_y=None,
@@ -4126,7 +4465,7 @@ class RUDPTransferRoot(BoxLayout):
         screen_status_label = make_label(
             text="",
             size_hint_y=None,
-            height=dp(58),
+            height=dp(196),
             halign="left",
             valign="top",
             color=THEME["muted_text"],
@@ -4156,10 +4495,15 @@ class RUDPTransferRoot(BoxLayout):
         buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
         popup = style_popup(Popup(title="诊断", content=content, size_hint=(0.78, 0.72)))
         def _export(*_):
-            path = self.export_diagnostic_logs()
-            if path:
-                log.append(f"\nDiagnostics exported: {path}\n")
-        buttons.add_widget(make_button("primary", text="导出诊断日志", on_release=_export))
+            try:
+                path = self.export_diagnostic_logs()
+                if path:
+                    log.append(f"\n诊断包已导出: {path}\n")
+                else:
+                    log.append("\n诊断包导出失败：请查看发送日志中的错误信息。\n")
+            except Exception as exc:
+                log.append(f"\n诊断包导出失败: {exc}\n")
+        buttons.add_widget(make_button("primary", text="导出诊断包", on_release=_export))
         buttons.add_widget(make_button("secondary", text="关闭", on_release=lambda *_: popup.dismiss()))
         content.add_widget(buttons)
         apply_ui_font(content)
@@ -6027,6 +6371,30 @@ class RUDPTransferRoot(BoxLayout):
         self.sender_log_box.append(self.t("request_waiting") + "\n")
 
     def start_receiver(self, auto: bool = False) -> None:
+        if self.receiver_worker.is_running():
+            if auto:
+                return
+            self.receiver_log_box.append(self.t("running") + "\n")
+            return
+        bind_host = self.bind_input.text.strip() or "0.0.0.0"
+        port_text = self.recv_port.text.strip() or str(MAIN_UDP_PORT)
+        try:
+            port_num = int(port_text)
+        except Exception:
+            port_num = MAIN_UDP_PORT
+            port_text = str(MAIN_UDP_PORT)
+        port_status = udp_port_status(port_num, bind_host)
+        if not port_status.get("available"):
+            if port_num == MAIN_UDP_PORT:
+                message = MAIN_UDP_PORT_BUSY_MESSAGE
+            else:
+                message = f"UDP {port_num} 已被占用，请关闭占用程序或修改配置后重启。"
+            error = str(port_status.get("error") or "").strip()
+            if error:
+                message = f"{message} ({error})"
+            self.receiver_log_box.append(message + "\n")
+            self._append_debug_line(message, protocol=False)
+            return
         save_dir = self.save_dir_input.text.strip() or str(user_data_dir() / "received")
         Path(save_dir).mkdir(parents=True, exist_ok=True)
         key_file = str(user_data_dir() / "rudp_receiver_ed25519.key")
@@ -6045,8 +6413,8 @@ class RUDPTransferRoot(BoxLayout):
         except Exception:
             idle_timeout_text = "360"
         args = [
-            "--bind", self.bind_input.text.strip() or "0.0.0.0",
-            "--port", self.recv_port.text.strip() or "9999",
+            "--bind", bind_host,
+            "--port", str(port_num),
             "--save-dir", save_dir,
             "--discovery-port", self.recv_discovery_port.text.strip() or str(DEFAULT_DISCOVERY_PORT),
             "--server-id-key-file", key_file,
@@ -6066,11 +6434,6 @@ class RUDPTransferRoot(BoxLayout):
             args += ["--receiver-name", name]
         if self.once_checkbox.active:
             args.append("--once")
-        if self.receiver_worker.is_running():
-            if auto:
-                return
-            self.receiver_log_box.append(self.t("running") + "\n")
-            return
         self.receiver_worker.start(args)
         self.online_btn.text = "Online"
         style_button(self.online_btn, "success")

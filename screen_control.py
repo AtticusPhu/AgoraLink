@@ -12,6 +12,8 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Union
 
+from screen_profile import DEFAULT_SCREEN_PROFILE, profile_id_from_info
+
 
 SCREEN_SHARE_OFFER = "SCREEN_SHARE_OFFER"
 SCREEN_SHARE_ACCEPT = "SCREEN_SHARE_ACCEPT"
@@ -63,6 +65,24 @@ def _require_port(value: object) -> int:
     return port
 
 
+def _profiles_list(value: object) -> list:
+    if value in (None, ""):
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("profiles must be an array")
+    profiles = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise ValueError("profile item must be an object")
+        profiles.append(dict(item))
+    return profiles
+
+
+def _validate_profiles(value: object, field: str) -> None:
+    for item in _profiles_list(value):
+        _require_text(item.get("id") or item.get("name"), f"{field}.id")
+
+
 def _base_message(
     message_type: str,
     session_id: object,
@@ -93,19 +113,31 @@ def make_offer(
     port: object,
     profile_name: object,
     profile_dict: Mapping[str, Any],
+    profiles: object = None,
+    preferred_profile: object = None,
 ) -> Dict[str, object]:
-    return _base_message(
+    payload: Dict[str, Any] = {
+        "host": _require_text(host, "host"),
+        "port": _require_port(port),
+        "profile_name": _require_text(profile_name, "profile_name"),
+        "profile": dict(profile_dict),
+    }
+    advertised_profiles = _profiles_list(profiles)
+    preferred = str(preferred_profile or "").strip()
+    if advertised_profiles:
+        payload["profiles"] = advertised_profiles
+        payload["preferred_profile"] = preferred or profile_id_from_info(advertised_profiles[0], DEFAULT_SCREEN_PROFILE)
+    message = _base_message(
         SCREEN_SHARE_OFFER,
         session_id,
         sender_peer_id,
         receiver_peer_id,
-        {
-            "host": _require_text(host, "host"),
-            "port": _require_port(port),
-            "profile_name": _require_text(profile_name, "profile_name"),
-            "profile": dict(profile_dict),
-        },
+        payload,
     )
+    if advertised_profiles:
+        message["profiles"] = advertised_profiles
+        message["preferred_profile"] = payload["preferred_profile"]
+    return message
 
 
 def make_accept(
@@ -114,19 +146,28 @@ def make_accept(
     receiver_peer_id: object,
     host: object,
     port: object,
-    selected_profile: Mapping[str, Any],
+    selected_profile: object,
 ) -> Dict[str, object]:
-    return _base_message(
+    screen_port = _require_port(port)
+    selected_profile_id = profile_id_from_info(selected_profile, DEFAULT_SCREEN_PROFILE)
+    selected_profile_info = dict(selected_profile) if isinstance(selected_profile, Mapping) else {"id": selected_profile_id, "name": selected_profile_id}
+    message = _base_message(
         SCREEN_SHARE_ACCEPT,
         session_id,
         sender_peer_id,
         receiver_peer_id,
         {
             "host": _require_text(host, "host"),
-            "port": _require_port(port),
-            "selected_profile": dict(selected_profile),
+            "port": screen_port,
+            "screen_port": screen_port,
+            "selected_profile": selected_profile_id,
+            "selected_profile_info": selected_profile_info,
         },
     )
+    message["screen_port"] = screen_port
+    message["selected_profile"] = selected_profile_id
+    message["selected_profile_info"] = selected_profile_info
+    return message
 
 
 def make_reject(
@@ -203,6 +244,16 @@ def _validate_common_fields(message: Mapping[str, Any]) -> None:
     _require_text(message.get("sender_peer_id"), "sender_peer_id")
     _require_text(message.get("receiver_peer_id"), "receiver_peer_id")
     _require_text(message.get("timestamp"), "timestamp")
+    if "screen_port" in message:
+        _require_port(message.get("screen_port"))
+    if "profiles" in message:
+        _validate_profiles(message.get("profiles"), "profiles")
+    if "preferred_profile" in message:
+        _require_text(message.get("preferred_profile"), "preferred_profile")
+    if "selected_profile" in message:
+        _require_text(message.get("selected_profile"), "selected_profile")
+    if "selected_profile_info" in message and not isinstance(message.get("selected_profile_info"), Mapping):
+        raise ValueError("selected_profile_info must be an object")
     if not isinstance(message.get("payload"), Mapping):
         raise ValueError("payload must be an object")
 
@@ -216,11 +267,23 @@ def _validate_payload(message: Mapping[str, Any]) -> None:
         _require_text(payload.get("profile_name"), "payload.profile_name")
         if not isinstance(payload.get("profile"), Mapping):
             raise ValueError("payload.profile must be an object")
+        if "profiles" in payload:
+            _validate_profiles(payload.get("profiles"), "payload.profiles")
+        if "preferred_profile" in payload:
+            _require_text(payload.get("preferred_profile"), "payload.preferred_profile")
     elif message_type == SCREEN_SHARE_ACCEPT:
         _require_text(payload.get("host"), "payload.host")
         _require_port(payload.get("port"))
-        if not isinstance(payload.get("selected_profile"), Mapping):
-            raise ValueError("payload.selected_profile must be an object")
+        if "screen_port" in payload:
+            _require_port(payload.get("screen_port"))
+        if "selected_profile" in payload:
+            selected = payload.get("selected_profile")
+            if isinstance(selected, Mapping):
+                _require_text(selected.get("id") or selected.get("name"), "payload.selected_profile.id")
+            else:
+                _require_text(selected, "payload.selected_profile")
+        if "selected_profile_info" in payload and not isinstance(payload.get("selected_profile_info"), Mapping):
+            raise ValueError("payload.selected_profile_info must be an object")
     elif message_type == SCREEN_SHARE_REJECT:
         if "reason" not in payload:
             raise ValueError("missing field: payload.reason")

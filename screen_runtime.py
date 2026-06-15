@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from screen_control import DEFAULT_SCREEN_PORT
-from screen_profile import PROFILES_BY_NAME, ScreenProfile, normalize_profile_name
+from screen_profile import PROFILES_BY_NAME, ScreenProfile, profile_id_from_info
 
 
 STATE_IDLE = "idle"
@@ -59,18 +59,33 @@ class ScreenRuntime:
         self.current_host: Optional[str] = None
         self.current_port: Optional[int] = None
         self.current_profile: Optional[str] = None
+        self.current_peer_label: Optional[str] = None
 
-    def start_receiver(self, port: int = DEFAULT_SCREEN_PORT) -> Dict[str, object]:
+    def start_receiver(
+        self,
+        port: int = DEFAULT_SCREEN_PORT,
+        profile: object = "",
+        *,
+        peer_label: Optional[str] = None,
+        selected_profile: object = None,
+        screen_port: Optional[int] = None,
+    ) -> Dict[str, object]:
         if self._has_running_process():
             return self._already_running_result()
         try:
+            if screen_port is not None:
+                port = int(screen_port)
+            if selected_profile:
+                profile = selected_profile
             port = self._validate_port(port)
+            profile_name = self._validate_profile(profile) if profile else ""
+            peer_label_text = self._validate_peer_label(peer_label)
             self.last_command = []
             deps = self.check_dependencies()
             ffplay = str(deps.get("ffplay_path") or "")
             if not ffplay:
                 return self._set_error(self._missing_tool_error(["ffplay"]))
-            cmd = self._build_receiver_command(port, ffplay_path=ffplay)
+            cmd = self._build_receiver_command(port, ffplay_path=ffplay, peer_label=peer_label_text)
             self.last_command = list(cmd)
             self._process = self._popen_factory(cmd, cwd=str(self.script_dir), stdin=subprocess.PIPE)
         except Exception as exc:
@@ -82,21 +97,31 @@ class ScreenRuntime:
         self.current_mode = STATE_RECEIVING
         self.current_host = None
         self.current_port = port
-        self.current_profile = None
+        self.current_profile = profile_name or None
+        self.current_peer_label = peer_label_text or None
         return self.get_state()
 
     def start_sender(
         self,
         host: str,
         port: int = DEFAULT_SCREEN_PORT,
-        profile: str = DEFAULT_SCREEN_PROFILE,
+        profile: object = DEFAULT_SCREEN_PROFILE,
+        *,
+        peer_label: Optional[str] = None,
+        selected_profile: object = None,
+        screen_port: Optional[int] = None,
     ) -> Dict[str, object]:
         if self._has_running_process():
             return self._already_running_result()
         try:
+            if screen_port is not None:
+                port = int(screen_port)
+            if selected_profile:
+                profile = selected_profile
             host = self._validate_host(host)
             port = self._validate_port(port)
             profile = self._validate_profile(profile)
+            peer_label_text = self._validate_peer_label(peer_label) or host
             self.last_command = []
             deps = self.check_dependencies()
             ffmpeg = str(deps.get("ffmpeg_path") or "")
@@ -115,6 +140,7 @@ class ScreenRuntime:
         self.current_host = host
         self.current_port = port
         self.current_profile = profile
+        self.current_peer_label = peer_label_text or None
         return self.get_state()
 
     def stop(self) -> Dict[str, object]:
@@ -181,6 +207,7 @@ class ScreenRuntime:
             "host": self.current_host,
             "port": self.current_port,
             "profile": self.current_profile,
+            "peer_label": self.current_peer_label,
             "pid": int(self._process.pid) if running and getattr(self._process, "pid", None) is not None else None,
             "returncode": self.last_returncode,
             "last_error": self.last_error,
@@ -203,6 +230,7 @@ class ScreenRuntime:
         self.current_host = None
         self.current_port = None
         self.current_profile = None
+        self.current_peer_label = None
 
     def check_dependencies(self) -> Dict[str, object]:
         ffmpeg = self._find_media_tool("ffmpeg")
@@ -230,10 +258,11 @@ class ScreenRuntime:
             return f"{FFMPEG_MISSING_MESSAGE}\n缺少：{names}"
         return FFMPEG_MISSING_MESSAGE
 
-    def _build_receiver_command(self, port: int, ffplay_path: Optional[str] = None) -> List[str]:
+    def _build_receiver_command(self, port: int, ffplay_path: Optional[str] = None, peer_label: str = "") -> List[str]:
         ffplay = str(ffplay_path or self._find_media_tool("ffplay") or "")
         if not ffplay:
             raise FileNotFoundError(self._missing_tool_error(["ffplay"]))
+        window_title = self._receiver_window_title(peer_label)
         return [
             ffplay,
             "-fflags",
@@ -245,6 +274,8 @@ class ScreenRuntime:
             "32",
             "-analyzeduration",
             "0",
+            "-window_title",
+            window_title,
             f"udp://0.0.0.0:{int(port)}?fifo_size=1000000&overrun_nonfatal=1",
         ]
 
@@ -285,8 +316,8 @@ class ScreenRuntime:
             f"udp://{host}:{int(port)}?pkt_size=1316",
         ]
 
-    def _profile_for_name(self, profile_name: str) -> ScreenProfile:
-        normalized = normalize_profile_name(profile_name)
+    def _profile_for_name(self, profile_name: object) -> ScreenProfile:
+        normalized = profile_id_from_info(profile_name)
         profile = PROFILES_BY_NAME.get(normalized)
         if profile is None:
             available = ", ".join(sorted(PROFILES_BY_NAME))
@@ -464,11 +495,20 @@ class ScreenRuntime:
         return value
 
     @staticmethod
-    def _validate_profile(profile: str) -> str:
-        value = str(profile or "").strip()
+    def _validate_profile(profile: object) -> str:
+        value = profile_id_from_info(profile, default="")
         if not value:
             raise ValueError("profile is required")
         return value
+
+    @staticmethod
+    def _validate_peer_label(peer_label: Optional[str]) -> str:
+        return str(peer_label or "").strip()
+
+    @classmethod
+    def _receiver_window_title(cls, peer_label: str = "") -> str:
+        label = cls._validate_peer_label(peer_label) or "Remote"
+        return f"AgoraLink Screen Viewer - {label}"
 
 
 class _FakeProcess:
