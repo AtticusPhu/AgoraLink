@@ -27,3 +27,7 @@ __pycache__/
 *.pyo
 *.zip
 *.exe
+
+# Bundled local FFmpeg binaries for packaging only
+tools/ffmpeg/bin/*.exe
+tools/ffmpeg/bin/*.dll

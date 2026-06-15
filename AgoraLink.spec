@@ -85,6 +85,10 @@ fonts_dir = project_dir / 'assets' / 'fonts'
 if fonts_dir.exists():
     datas.append((str(fonts_dir), 'assets/fonts'))
 
+ffmpeg_dir = project_dir / 'tools' / 'ffmpeg'
+if ffmpeg_dir.exists():
+    datas.append((str(ffmpeg_dir), 'tools/ffmpeg'))
+
 for src, dest in [
     (project_dir / 'assets' / 'app.png', 'assets'),
     (project_dir / 'assets' / 'app.ico', 'assets'),
@@ -166,4 +170,3 @@ coll = COLLECT(
     upx_exclude=[],
     name='AgoraLink',
 )
-

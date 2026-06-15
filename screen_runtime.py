@@ -28,7 +28,11 @@ STATE_STOPPING = "stopping"
 STATE_ERROR = "error"
 
 DEFAULT_SCREEN_PROFILE = "720p30_h264_qsv"
-FFMPEG_INSTALL_HINT = "需要安装 FFmpeg：winget install --id Gyan.FFmpeg -e"
+FFMPEG_INSTALL_HINT = "winget install --id Gyan.FFmpeg -e"
+FFMPEG_MISSING_MESSAGE = (
+    "找不到 ffmpeg/ffplay。请安装 FFmpeg 或使用内置 tools/ffmpeg/bin。\n"
+    f"安装命令：{FFMPEG_INSTALL_HINT}"
+)
 
 
 class ScreenRuntime:
@@ -62,7 +66,11 @@ class ScreenRuntime:
         try:
             port = self._validate_port(port)
             self.last_command = []
-            cmd = self._build_receiver_command(port)
+            deps = self.check_dependencies()
+            ffplay = str(deps.get("ffplay_path") or "")
+            if not ffplay:
+                return self._set_error(self._missing_tool_error(["ffplay"]))
+            cmd = self._build_receiver_command(port, ffplay_path=ffplay)
             self.last_command = list(cmd)
             self._process = self._popen_factory(cmd, cwd=str(self.script_dir), stdin=subprocess.PIPE)
         except Exception as exc:
@@ -90,7 +98,11 @@ class ScreenRuntime:
             port = self._validate_port(port)
             profile = self._validate_profile(profile)
             self.last_command = []
-            cmd = self._build_sender_command(host=host, port=port, profile_name=profile)
+            deps = self.check_dependencies()
+            ffmpeg = str(deps.get("ffmpeg_path") or "")
+            if not ffmpeg:
+                return self._set_error(self._missing_tool_error(["ffmpeg"]))
+            cmd = self._build_sender_command(host=host, port=port, profile_name=profile, ffmpeg_path=ffmpeg)
             self.last_command = list(cmd)
             self._process = self._popen_factory(cmd, cwd=str(self.script_dir), stdin=subprocess.PIPE)
         except Exception as exc:
@@ -192,10 +204,36 @@ class ScreenRuntime:
         self.current_port = None
         self.current_profile = None
 
-    def _build_receiver_command(self, port: int) -> List[str]:
+    def check_dependencies(self) -> Dict[str, object]:
+        ffmpeg = self._find_media_tool("ffmpeg")
         ffplay = self._find_media_tool("ffplay")
+        ffmpeg_ok = bool(ffmpeg)
+        ffplay_ok = bool(ffplay)
+        missing = []
+        if not ffmpeg_ok:
+            missing.append("ffmpeg")
+        if not ffplay_ok:
+            missing.append("ffplay")
+        return {
+            "ok": bool(ffmpeg_ok and ffplay_ok),
+            "ffmpeg_ok": ffmpeg_ok,
+            "ffplay_ok": ffplay_ok,
+            "ffmpeg_path": str(ffmpeg or ""),
+            "ffplay_path": str(ffplay or ""),
+            "error": "" if not missing else self._missing_tool_error(missing),
+            "install_hint": FFMPEG_INSTALL_HINT,
+        }
+
+    def _missing_tool_error(self, missing: List[str]) -> str:
+        names = ", ".join(str(name or "").strip() for name in missing if str(name or "").strip())
+        if names:
+            return f"{FFMPEG_MISSING_MESSAGE}\n缺少：{names}"
+        return FFMPEG_MISSING_MESSAGE
+
+    def _build_receiver_command(self, port: int, ffplay_path: Optional[str] = None) -> List[str]:
+        ffplay = str(ffplay_path or self._find_media_tool("ffplay") or "")
         if not ffplay:
-            raise FileNotFoundError(f"ffplay not found. {FFMPEG_INSTALL_HINT}")
+            raise FileNotFoundError(self._missing_tool_error(["ffplay"]))
         return [
             ffplay,
             "-fflags",
@@ -210,10 +248,10 @@ class ScreenRuntime:
             f"udp://0.0.0.0:{int(port)}?fifo_size=1000000&overrun_nonfatal=1",
         ]
 
-    def _build_sender_command(self, *, host: str, port: int, profile_name: str) -> List[str]:
-        ffmpeg = self._find_media_tool("ffmpeg")
+    def _build_sender_command(self, *, host: str, port: int, profile_name: str, ffmpeg_path: Optional[str] = None) -> List[str]:
+        ffmpeg = str(ffmpeg_path or self._find_media_tool("ffmpeg") or "")
         if not ffmpeg:
-            raise FileNotFoundError(f"ffmpeg not found. {FFMPEG_INSTALL_HINT}")
+            raise FileNotFoundError(self._missing_tool_error(["ffmpeg"]))
         profile = self._profile_for_name(profile_name)
         return [
             ffmpeg,
@@ -258,27 +296,56 @@ class ScreenRuntime:
     def _find_media_tool(self, name: str) -> str:
         if self._tool_finder is not None:
             return str(self._tool_finder(name) or "")
-        exe = name + ".exe" if os.name == "nt" and not name.lower().endswith(".exe") else name
-
-        found = shutil.which(exe) or shutil.which(name)
-        if found:
-            return str(Path(found).resolve())
+        exe_names = self._tool_executable_names(name)
 
         for base in self._env_ffmpeg_dirs():
-            found = self._find_tool_in_dir(base, exe)
+            found = self._find_tool_in_dir(base, exe_names)
             if found:
                 return found
 
-        for base in self._bundled_ffmpeg_dirs():
-            found = self._find_tool_in_dir(base, exe)
+        for exe in exe_names:
+            found = shutil.which(exe)
+            if found:
+                return str(Path(found).resolve())
+
+        for base in self._source_ffmpeg_dirs():
+            found = self._find_tool_in_dir(base, exe_names)
+            if found:
+                return found
+
+        for base in self._pyinstaller_meipass_ffmpeg_dirs():
+            found = self._find_tool_in_dir(base, exe_names)
+            if found:
+                return found
+
+        for base in self._pyinstaller_internal_ffmpeg_dirs():
+            found = self._find_tool_in_dir(base, exe_names)
+            if found:
+                return found
+
+        for base in self._exe_sibling_ffmpeg_dirs():
+            found = self._find_tool_in_dir(base, exe_names)
             if found:
                 return found
 
         for base in self._winget_ffmpeg_dirs():
-            found = self._find_tool_in_dir(base, exe)
+            found = self._find_tool_in_dir(base, exe_names)
             if found:
                 return found
         return ""
+
+    @staticmethod
+    def _tool_executable_names(name: str) -> List[str]:
+        base = str(name or "").strip()
+        if not base:
+            return []
+        stem = base[:-4] if base.lower().endswith(".exe") else base
+        names = [stem + ".exe", stem] if os.name == "nt" else [stem, stem + ".exe"]
+        result = []
+        for item in names:
+            if item and item not in result:
+                result.append(item)
+        return result
 
     def _env_ffmpeg_dirs(self) -> List[Path]:
         raw = str(os.environ.get("AGORALINK_FFMPEG_DIR") or "").strip()
@@ -286,12 +353,22 @@ class ScreenRuntime:
             return []
         return [Path(raw), Path(raw) / "bin"]
 
-    def _bundled_ffmpeg_dirs(self) -> List[Path]:
-        dirs = [self.script_dir / "tools" / "ffmpeg" / "bin"]
+    def _source_ffmpeg_dirs(self) -> List[Path]:
+        return [self.script_dir / "tools" / "ffmpeg" / "bin"]
+
+    def _pyinstaller_meipass_ffmpeg_dirs(self) -> List[Path]:
+        meipass = str(getattr(sys, "_MEIPASS", "") or "").strip()
+        if not meipass:
+            return []
+        return [Path(meipass) / "tools" / "ffmpeg" / "bin"]
+
+    def _pyinstaller_internal_ffmpeg_dirs(self) -> List[Path]:
         exe_dir = Path(sys.executable).resolve().parent
-        if exe_dir != self.script_dir:
-            dirs.append(exe_dir / "tools" / "ffmpeg" / "bin")
-        return dirs
+        return [exe_dir / "_internal" / "tools" / "ffmpeg" / "bin"]
+
+    def _exe_sibling_ffmpeg_dirs(self) -> List[Path]:
+        exe_dir = Path(sys.executable).resolve().parent
+        return [exe_dir / "tools" / "ffmpeg" / "bin"]
 
     def _winget_ffmpeg_dirs(self) -> List[Path]:
         if os.name != "nt":
@@ -314,15 +391,15 @@ class ScreenRuntime:
         return dirs
 
     @staticmethod
-    def _find_tool_in_dir(base: Path, exe: str) -> str:
+    def _find_tool_in_dir(base: Path, exe_names: List[str]) -> str:
         try:
-            direct = Path(base) / exe
-            if direct.exists() and direct.is_file():
-                return str(direct.resolve())
-            if os.name == "nt" and not exe.lower().endswith(".exe"):
-                direct_exe = Path(base) / (exe + ".exe")
-                if direct_exe.exists() and direct_exe.is_file():
-                    return str(direct_exe.resolve())
+            base_path = Path(base)
+            if base_path.exists() and base_path.is_file() and base_path.name in exe_names:
+                return str(base_path.resolve())
+            for exe in exe_names:
+                direct = base_path / exe
+                if direct.exists() and direct.is_file():
+                    return str(direct.resolve())
         except Exception:
             pass
         return ""
