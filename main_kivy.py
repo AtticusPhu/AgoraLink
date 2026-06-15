@@ -301,6 +301,20 @@ from file_transfer_common import (
     is_unspecified_ip,
     normalize_peer_endpoint_ip,
 )
+from screen_control import (
+    DEFAULT_SCREEN_PORT,
+    SCREEN_SHARE_ACCEPT,
+    SCREEN_SHARE_OFFER,
+    SCREEN_SHARE_REJECT,
+    SCREEN_SHARE_STATE,
+    SCREEN_SHARE_STOP,
+    make_accept,
+    make_offer,
+    make_reject,
+    make_stop,
+    parse_screen_control_message,
+)
+from screen_profile import PROFILES_BY_NAME
 from screen_runtime import ScreenRuntime
 
 
@@ -1559,6 +1573,10 @@ class RUDPTransferRoot(BoxLayout):
         self._transfer_refresh_scheduled = False
         self._last_transfer_card_refresh_ts = 0.0
         self._last_transfer_progress_line = ""
+        self.screen_share_session_id = ""
+        self.screen_share_peer_id = ""
+        self.screen_share_last_status = ""
+        self._seen_screen_control_messages = set()
         # Deduplicate the receiver's two log lines for one chat frame:
         #   CHAT_MESSAGE_JSON:{...}
         #   Chat from sender: text
@@ -1860,6 +1878,16 @@ class RUDPTransferRoot(BoxLayout):
         center.add_widget(title_bar)
         self.main_messages_box = ChatMessageBox(root_owner=self)
         center.add_widget(self.main_messages_box)
+        self.screen_share_status_label = make_label(
+            text="Screen: idle",
+            size_hint_y=None,
+            height=dp(28),
+            halign="left",
+            valign="middle",
+            color=THEME["muted_text"],
+        )
+        bind_label_wrap(self.screen_share_status_label)
+        center.add_widget(self.screen_share_status_label)
         input_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(46), spacing=dp(8))
         self.main_message_input = make_input(text="", multiline=False)
         self.main_message_input.hint_text = self.cu("input_hint")
@@ -1869,6 +1897,10 @@ class RUDPTransferRoot(BoxLayout):
         input_line.add_widget(self.main_send_btn)
         self.main_file_btn = make_button("secondary", text=self.cu("send_file"), size_hint_x=None, width=dp(104), on_release=lambda *_: self.send_file_to_current_chat())
         input_line.add_widget(self.main_file_btn)
+        self.main_screen_btn = make_button("secondary", text="投屏", size_hint_x=None, width=dp(84), on_release=lambda *_: Clock.schedule_once(lambda _dt: self.send_screen_share_offer(), 0))
+        input_line.add_widget(self.main_screen_btn)
+        self.main_screen_stop_btn = make_button("danger", text="停止投屏", size_hint_x=None, width=dp(106), on_release=lambda *_: Clock.schedule_once(lambda _dt: self.stop_screen_share_from_chat(), 0))
+        input_line.add_widget(self.main_screen_stop_btn)
         center.add_widget(input_line)
         root.add_widget(center)
 
@@ -3060,6 +3092,10 @@ class RUDPTransferRoot(BoxLayout):
                 self.main_send_btn.text = self.cu("send")
             if hasattr(self, "main_file_btn"):
                 self.main_file_btn.text = self.cu("send_file")
+            if hasattr(self, "main_screen_btn"):
+                self.main_screen_btn.text = "投屏" if self.lang == "zh" else "Share"
+            if hasattr(self, "main_screen_stop_btn"):
+                self.main_screen_stop_btn.text = "停止投屏" if self.lang == "zh" else "Stop Share"
             if hasattr(self, "settings_btn"):
                 self.settings_btn.text = "设置" if self.lang == "zh" else "Settings"
             if hasattr(self, "debug_btn"):
@@ -3563,6 +3599,300 @@ class RUDPTransferRoot(BoxLayout):
             status_label.text = f"screen runtime stop failed: {exc}"
             return
         self._schedule_screen_runtime_status(status_label)
+
+    def _screen_profile_dict(self) -> Dict[str, object]:
+        profile = PROFILES_BY_NAME.get("720p30_h264_qsv")
+        if profile is not None:
+            return profile.to_dict()
+        return {
+            "name": "720p30_h264_qsv",
+            "codec": "h264",
+            "encoder": "h264_qsv",
+            "width": 1280,
+            "height": 720,
+            "fps": 30,
+            "bitrate": "6M",
+            "maxrate": "10M",
+            "bufsize": "2M",
+            "experimental": False,
+            "mode": "auto",
+        }
+
+    def _local_screen_host(self) -> str:
+        try:
+            for ip in get_local_ip_candidates():
+                ip = str(ip or "").strip()
+                if ip and not ip.startswith("127.") and not is_unspecified_ip(ip):
+                    return ip
+            ips = get_local_ip_candidates()
+            return str(ips[0] or "127.0.0.1") if ips else "127.0.0.1"
+        except Exception:
+            return "127.0.0.1"
+
+    def _set_screen_share_status(self, text: str) -> None:
+        self.screen_share_last_status = str(text or "")
+        def _apply(_dt):
+            try:
+                if hasattr(self, "screen_share_status_label"):
+                    self.screen_share_status_label.text = self.screen_share_last_status
+            except Exception:
+                pass
+        Clock.schedule_once(_apply, 0)
+
+    def _update_screen_share_status_from_runtime(self, prefix: str = "") -> None:
+        try:
+            state = self._screen_runtime().get_state()
+            text = (
+                f"Screen: {state.get('state') or ''}"
+                f" running={bool(state.get('running'))}"
+                f" mode={state.get('mode') or ''}"
+                f" host={state.get('host') or ''}"
+                f" error={state.get('last_error') or ''}"
+            )
+            self._set_screen_share_status((str(prefix or "").strip() + "  " + text).strip())
+        except Exception as exc:
+            self._set_screen_share_status(f"Screen error: {exc}")
+
+    def _send_screen_control_to_peer(self, peer_id: str, control: Dict[str, object]) -> bool:
+        peer_id = str(peer_id or "").strip()
+        if self.message_service is None:
+            self._set_screen_share_status("Screen control failed: chat is locked")
+            return False
+        if not peer_id:
+            self._set_screen_share_status("Screen control failed: missing peer")
+            return False
+        try:
+            text = json.dumps(control, ensure_ascii=False, separators=(",", ":"))
+            msg, contact = self.message_service.create_direct_text(peer_id, text)
+        except Exception as exc:
+            self._set_screen_share_status(f"Screen control message create failed: {exc}")
+            return False
+
+        mid = str(msg.get("message_id") or "")
+        conv_id = str(msg.get("conversation_id") or "")
+        created_at = float(msg.get("created_at") or time.time())
+        self.render_current_chat()
+
+        def _mark_sent(pid: str) -> None:
+            try:
+                if self.message_service is not None:
+                    self.message_service.mark_sent(mid, pid)
+            except Exception as exc:
+                self._append_debug_line(f"screen mark_sent failed: {exc}", protocol=True)
+
+        def _mark_delivered(pid: str) -> None:
+            try:
+                if self.message_service is not None:
+                    self.message_service.mark_delivered(mid, pid)
+            except Exception as exc:
+                self._append_debug_line(f"screen mark_delivered failed: {exc}", protocol=True)
+
+        def _mark_failed(pid: str, err: str) -> None:
+            try:
+                if self.message_service is not None:
+                    self.message_service.mark_failed(mid, pid, error=err)
+            except Exception as exc:
+                self._append_debug_line(f"screen mark_failed failed: {exc}; original={err}", protocol=True)
+
+        def _run() -> None:
+            ip = str((contact or {}).get("peer_ip") or "")
+            try:
+                port = int((contact or {}).get("peer_port") or 9999)
+            except Exception:
+                port = 9999
+            if not ip or is_unspecified_ip(ip):
+                ip2, port2 = self._endpoint_for_peer(peer_id)
+                ip = ip or ip2
+                port = port2 or port
+            if not ip or is_unspecified_ip(ip):
+                Clock.schedule_once(lambda _dt: (_mark_failed(peer_id, "invalid_endpoint"), self._set_screen_share_status("Screen control failed: invalid endpoint"), self._force_chat_refresh()), 0)
+                return
+            Clock.schedule_once(lambda _dt: (_mark_sent(peer_id), self._force_chat_refresh()), 0)
+            try:
+                ok = self._send_chat_to_endpoint(
+                    ip=ip,
+                    port=port,
+                    peer_id=peer_id,
+                    text=text,
+                    message_id=mid,
+                    conversation_id=conv_id,
+                    created_at=created_at,
+                    body_type="screen_control",
+                )
+            except Exception as exc:
+                ok = False
+                self._append_debug_line(f"screen control send failed: {exc}", protocol=True)
+            if ok:
+                Clock.schedule_once(lambda _dt: (_mark_delivered(peer_id), self._force_chat_refresh()), 0)
+            else:
+                Clock.schedule_once(lambda _dt: (_mark_failed(peer_id, "screen_control_send_failed"), self._set_screen_share_status("Screen control send failed"), self._force_chat_refresh()), 0)
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+
+    def send_screen_share_offer(self) -> None:
+        if self.current_chat_mode != "direct" or not self.current_peer_id:
+            self._set_screen_share_status("Screen share requires a direct contact")
+            return
+        try:
+            session_id = "screen_" + secrets.token_hex(12)
+            profile = self._screen_profile_dict()
+            peer_id = str(self.current_peer_id or "")
+            offer = make_offer(
+                session_id,
+                self.chat_local_peer_id,
+                peer_id,
+                self._local_screen_host(),
+                DEFAULT_SCREEN_PORT,
+                "720p30_h264_qsv",
+                profile,
+            )
+            self.screen_share_session_id = session_id
+            self.screen_share_peer_id = peer_id
+            if self._send_screen_control_to_peer(peer_id, offer):
+                self._set_screen_share_status(f"Screen offer sent to {peer_id}; waiting for accept")
+        except Exception as exc:
+            self._set_screen_share_status(f"Screen offer failed: {exc}")
+
+    def stop_screen_share_from_chat(self) -> None:
+        peer_id = str(self.screen_share_peer_id or self.current_peer_id or "").strip()
+        session_id = str(self.screen_share_session_id or ("screen_" + secrets.token_hex(12)))
+        try:
+            self._screen_runtime().stop()
+            self._update_screen_share_status_from_runtime("Screen stopped")
+        except Exception as exc:
+            self._set_screen_share_status(f"Screen stop failed: {exc}")
+        if peer_id:
+            try:
+                stop_msg = make_stop(session_id, self.chat_local_peer_id, peer_id, reason="user_stop")
+                self._send_screen_control_to_peer(peer_id, stop_msg)
+            except Exception as exc:
+                self._set_screen_share_status(f"Screen stop notify failed: {exc}")
+        self.screen_share_session_id = ""
+        self.screen_share_peer_id = ""
+
+    def _parse_screen_control_from_chat(self, obj: Dict[str, object]) -> Optional[Dict[str, object]]:
+        try:
+            text = str((obj or {}).get("text") or "")
+            if not text:
+                return None
+            return parse_screen_control_message(text)
+        except Exception:
+            return None
+
+    def _handle_screen_control_from_chat(self, obj: Dict[str, object]) -> None:
+        control = self._parse_screen_control_from_chat(obj)
+        if not control:
+            return
+        try:
+            sender = str(control.get("sender_peer_id") or "")
+            receiver = str(control.get("receiver_peer_id") or "")
+            if sender == self.chat_local_peer_id:
+                return
+            if receiver and receiver != self.chat_local_peer_id:
+                return
+            key = str(obj.get("message_id") or "") or f"{control.get('type')}:{control.get('session_id')}:{sender}"
+            if key in self._seen_screen_control_messages:
+                return
+            self._seen_screen_control_messages.add(key)
+            message_type = str(control.get("type") or "")
+            if message_type == SCREEN_SHARE_OFFER:
+                self._show_screen_offer_popup(control)
+            elif message_type == SCREEN_SHARE_ACCEPT:
+                self._handle_screen_accept(control)
+            elif message_type == SCREEN_SHARE_REJECT:
+                reason = str(dict(control.get("payload") or {}).get("reason") or "")
+                self._set_screen_share_status(f"Screen share rejected by {sender}: {reason}")
+            elif message_type == SCREEN_SHARE_STOP:
+                self._handle_screen_stop(control)
+            elif message_type == SCREEN_SHARE_STATE:
+                payload = dict(control.get("payload") or {})
+                self._set_screen_share_status(f"Remote screen state: {payload.get('state') or ''} {payload.get('detail') or ''}")
+        except Exception as exc:
+            self._set_screen_share_status(f"Screen control failed: {exc}")
+
+    def _show_screen_offer_popup(self, control: Dict[str, object]) -> None:
+        sender = str(control.get("sender_peer_id") or "")
+        payload = dict(control.get("payload") or {})
+        profile_name = str(payload.get("profile_name") or "720p30_h264_qsv")
+        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
+        label = make_label(
+            text=f"收到投屏邀请\n来自: {sender}\n档位: {profile_name}",
+            halign="left",
+            valign="top",
+        )
+        bind_label_wrap(label)
+        content.add_widget(label)
+        buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
+        popup = style_popup(Popup(title="投屏邀请", content=content, size_hint=(0.52, 0.36), auto_dismiss=False))
+        buttons.add_widget(make_button("success", text="接受", on_release=lambda *_: (self._accept_screen_offer(control), popup.dismiss())))
+        buttons.add_widget(make_button("danger", text="拒绝", on_release=lambda *_: (self._reject_screen_offer(control, "user_rejected"), popup.dismiss())))
+        content.add_widget(buttons)
+        apply_ui_font(content)
+        popup.open()
+
+    def _accept_screen_offer(self, control: Dict[str, object]) -> None:
+        sender = str(control.get("sender_peer_id") or "")
+        session_id = str(control.get("session_id") or "")
+        payload = dict(control.get("payload") or {})
+        try:
+            state = self._screen_runtime().start_receiver(port=DEFAULT_SCREEN_PORT)
+            if str(state.get("state") or "") != "receiving":
+                reason = str(state.get("last_error") or "receiver_start_failed")
+                self._set_screen_share_status(f"Screen receive failed: {reason}")
+                self._reject_screen_offer(control, reason)
+                return
+            selected_profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else self._screen_profile_dict()
+            accept = make_accept(
+                session_id,
+                self.chat_local_peer_id,
+                sender,
+                self._local_screen_host(),
+                DEFAULT_SCREEN_PORT,
+                selected_profile,
+            )
+            self.screen_share_session_id = session_id
+            self.screen_share_peer_id = sender
+            self._send_screen_control_to_peer(sender, accept)
+            self._update_screen_share_status_from_runtime("Screen offer accepted")
+        except Exception as exc:
+            self._set_screen_share_status(f"Screen accept failed: {exc}")
+
+    def _reject_screen_offer(self, control: Dict[str, object], reason: str) -> None:
+        sender = str(control.get("sender_peer_id") or "")
+        session_id = str(control.get("session_id") or "")
+        try:
+            reject = make_reject(session_id, self.chat_local_peer_id, sender, reason)
+            self._send_screen_control_to_peer(sender, reject)
+            self._set_screen_share_status(f"Screen offer rejected: {reason}")
+        except Exception as exc:
+            self._set_screen_share_status(f"Screen reject failed: {exc}")
+
+    def _handle_screen_accept(self, control: Dict[str, object]) -> None:
+        sender = str(control.get("sender_peer_id") or "")
+        payload = dict(control.get("payload") or {})
+        try:
+            host = str(payload.get("host") or "").strip()
+            if not host or is_unspecified_ip(host):
+                host, _port = self._endpoint_for_peer(sender)
+            if not host or is_unspecified_ip(host):
+                self._set_screen_share_status("Screen sender failed: missing receiver IP")
+                return
+            self.screen_share_session_id = str(control.get("session_id") or "")
+            self.screen_share_peer_id = sender
+            self._screen_runtime().start_sender(host=host, port=DEFAULT_SCREEN_PORT, profile="720p30_h264_qsv")
+            self._update_screen_share_status_from_runtime(f"Screen accepted by {sender}")
+        except Exception as exc:
+            self._set_screen_share_status(f"Screen accept handling failed: {exc}")
+
+    def _handle_screen_stop(self, control: Dict[str, object]) -> None:
+        sender = str(control.get("sender_peer_id") or "")
+        try:
+            self._screen_runtime().stop()
+            self.screen_share_session_id = ""
+            self.screen_share_peer_id = ""
+            self._update_screen_share_status_from_runtime(f"Screen stopped by {sender}")
+        except Exception as exc:
+            self._set_screen_share_status(f"Screen remote stop failed: {exc}")
 
     def open_debug_popup(self) -> None:
         content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
@@ -5842,6 +6172,7 @@ class RUDPTransferRoot(BoxLayout):
                         self._append_debug_line(f"Failed to save incoming chat message in UI DB: {exc}", protocol=True)
                     except Exception:
                         pass
+            self._handle_screen_control_from_chat(obj)
             try:
                 self.chat_messages_box.append(f"Incoming {obj.get('group_id')}: {obj.get('sender_peer_id')}: {obj.get('text')}\n")
             except Exception:
