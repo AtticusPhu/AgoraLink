@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """AgoraLink screen sharing runtime process manager.
 
-This module only starts and stops the screen sender/receiver CLI prototypes.
-It does not send chat messages, touch GUI code, or modify protocol/database
+This module only starts and stops FFmpeg/FFplay screen streaming processes. It
+does not send chat messages, touch GUI code, or modify protocol/database
 behavior.
 """
 
@@ -11,12 +11,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from screen_control import DEFAULT_SCREEN_PORT
+from screen_profile import PROFILES_BY_NAME, ScreenProfile, normalize_profile_name
 
 
 STATE_IDLE = "idle"
@@ -26,22 +28,23 @@ STATE_STOPPING = "stopping"
 STATE_ERROR = "error"
 
 DEFAULT_SCREEN_PROFILE = "720p30_h264_qsv"
+FFMPEG_INSTALL_HINT = "Install FFmpeg with: winget install --id Gyan.FFmpeg -e"
 
 
 class ScreenRuntime:
     def __init__(
         self,
         *,
-        python_executable: Optional[str] = None,
         script_dir: Optional[Path] = None,
         popen_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
         taskkill_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        tool_finder: Optional[Callable[[str], str]] = None,
         stop_timeout: float = 5.0,
     ) -> None:
-        self.python_executable = str(python_executable or sys.executable)
         self.script_dir = (Path(script_dir) if script_dir is not None else Path(__file__).resolve().parent).resolve()
         self._popen_factory = popen_factory
         self._taskkill_runner = taskkill_runner
+        self._tool_finder = tool_finder
         self.stop_timeout = float(stop_timeout)
         self._process: Optional[subprocess.Popen[bytes]] = None
         self._state = STATE_IDLE
@@ -58,15 +61,10 @@ class ScreenRuntime:
             return self._already_running_result()
         try:
             port = self._validate_port(port)
-            cmd = [
-                self.python_executable,
-                "-B",
-                str(self._script_path("screen_receiver.py")),
-                "--port",
-                str(port),
-            ]
+            self.last_command = []
+            cmd = self._build_receiver_command(port)
             self.last_command = list(cmd)
-            self._process = self._popen_factory(cmd, cwd=str(self.script_dir))
+            self._process = self._popen_factory(cmd, cwd=str(self.script_dir), stdin=subprocess.PIPE)
         except Exception as exc:
             return self._set_error(str(exc))
 
@@ -91,19 +89,10 @@ class ScreenRuntime:
             host = self._validate_host(host)
             port = self._validate_port(port)
             profile = self._validate_profile(profile)
-            cmd = [
-                self.python_executable,
-                "-B",
-                str(self._script_path("screen_sender.py")),
-                "--host",
-                host,
-                "--port",
-                str(port),
-                "--profile",
-                profile,
-            ]
+            self.last_command = []
+            cmd = self._build_sender_command(host=host, port=port, profile_name=profile)
             self.last_command = list(cmd)
-            self._process = self._popen_factory(cmd, cwd=str(self.script_dir))
+            self._process = self._popen_factory(cmd, cwd=str(self.script_dir), stdin=subprocess.PIPE)
         except Exception as exc:
             return self._set_error(str(exc))
 
@@ -203,8 +192,140 @@ class ScreenRuntime:
         self.current_port = None
         self.current_profile = None
 
-    def _script_path(self, name: str) -> Path:
-        return (self.script_dir / name).resolve()
+    def _build_receiver_command(self, port: int) -> List[str]:
+        ffplay = self._find_media_tool("ffplay")
+        if not ffplay:
+            raise FileNotFoundError(f"ffplay not found. {FFMPEG_INSTALL_HINT}")
+        return [
+            ffplay,
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-framedrop",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+            f"udp://0.0.0.0:{int(port)}?fifo_size=1000000&overrun_nonfatal=1",
+        ]
+
+    def _build_sender_command(self, *, host: str, port: int, profile_name: str) -> List[str]:
+        ffmpeg = self._find_media_tool("ffmpeg")
+        if not ffmpeg:
+            raise FileNotFoundError(f"ffmpeg not found. {FFMPEG_INSTALL_HINT}")
+        profile = self._profile_for_name(profile_name)
+        return [
+            ffmpeg,
+            "-hide_banner",
+            "-fflags",
+            "+genpts",
+            "-f",
+            "gdigrab",
+            "-framerate",
+            str(profile.fps),
+            "-i",
+            "desktop",
+            "-vf",
+            f"scale={profile.width}:{profile.height},format=nv12",
+            "-c:v",
+            profile.encoder,
+            "-b:v",
+            profile.bitrate,
+            "-maxrate",
+            profile.maxrate,
+            "-bufsize",
+            profile.bufsize,
+            "-g",
+            str(profile.fps),
+            "-bf",
+            "0",
+            "-fps_mode",
+            "cfr",
+            "-f",
+            "mpegts",
+            f"udp://{host}:{int(port)}?pkt_size=1316",
+        ]
+
+    def _profile_for_name(self, profile_name: str) -> ScreenProfile:
+        normalized = normalize_profile_name(profile_name)
+        profile = PROFILES_BY_NAME.get(normalized)
+        if profile is None:
+            available = ", ".join(sorted(PROFILES_BY_NAME))
+            raise ValueError(f"unknown screen profile {profile_name!r}; available: {available}")
+        return profile
+
+    def _find_media_tool(self, name: str) -> str:
+        if self._tool_finder is not None:
+            return str(self._tool_finder(name) or "")
+        exe = name + ".exe" if os.name == "nt" and not name.lower().endswith(".exe") else name
+
+        found = shutil.which(exe) or shutil.which(name)
+        if found:
+            return str(Path(found).resolve())
+
+        for base in self._env_ffmpeg_dirs():
+            found = self._find_tool_in_dir(base, exe)
+            if found:
+                return found
+
+        for base in self._bundled_ffmpeg_dirs():
+            found = self._find_tool_in_dir(base, exe)
+            if found:
+                return found
+
+        for base in self._winget_ffmpeg_dirs():
+            found = self._find_tool_in_dir(base, exe)
+            if found:
+                return found
+        return ""
+
+    def _env_ffmpeg_dirs(self) -> List[Path]:
+        raw = str(os.environ.get("AGORALINK_FFMPEG_DIR") or "").strip()
+        if not raw:
+            return []
+        return [Path(raw), Path(raw) / "bin"]
+
+    def _bundled_ffmpeg_dirs(self) -> List[Path]:
+        dirs = [self.script_dir / "tools" / "ffmpeg" / "bin"]
+        exe_dir = Path(sys.executable).resolve().parent
+        if exe_dir != self.script_dir:
+            dirs.append(exe_dir / "tools" / "ffmpeg" / "bin")
+        return dirs
+
+    def _winget_ffmpeg_dirs(self) -> List[Path]:
+        if os.name != "nt":
+            return []
+        dirs: List[Path] = []
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            dirs.append(Path(local_appdata) / "Microsoft" / "WinGet" / "Links")
+            packages = Path(local_appdata) / "Microsoft" / "WinGet" / "Packages"
+            try:
+                for pkg in packages.glob("Gyan.FFmpeg*"):
+                    dirs.append(pkg)
+                    dirs.extend(pkg.glob("ffmpeg*\\bin"))
+                    dirs.extend(pkg.glob("*\\bin"))
+            except Exception:
+                pass
+        program_files = os.environ.get("ProgramFiles")
+        if program_files:
+            dirs.append(Path(program_files) / "ffmpeg" / "bin")
+        return dirs
+
+    @staticmethod
+    def _find_tool_in_dir(base: Path, exe: str) -> str:
+        try:
+            direct = Path(base) / exe
+            if direct.exists() and direct.is_file():
+                return str(direct.resolve())
+            if os.name == "nt" and not exe.lower().endswith(".exe"):
+                direct_exe = Path(base) / (exe + ".exe")
+                if direct_exe.exists() and direct_exe.is_file():
+                    return str(direct_exe.resolve())
+        except Exception:
+            pass
+        return ""
 
     def _stop_windows_process_tree(self, proc: subprocess.Popen[bytes]) -> None:
         pid = getattr(proc, "pid", None)
@@ -276,11 +397,12 @@ class ScreenRuntime:
 class _FakeProcess:
     _next_pid = 1000
 
-    def __init__(self, cmd: List[str], cwd: Optional[str] = None) -> None:
+    def __init__(self, cmd: List[str], cwd: Optional[str] = None, **kwargs) -> None:
         type(self)._next_pid += 1
         self.pid = type(self)._next_pid
         self.cmd = list(cmd)
         self.cwd = cwd
+        self.kwargs = dict(kwargs)
         self.returncode: Optional[int] = None
         self.terminated = False
         self.killed = False
@@ -307,16 +429,26 @@ def _run_self_test() -> Dict[str, object]:
     cwd_values: List[Optional[str]] = []
     taskkill_commands: List[List[str]] = []
 
-    def fake_popen(cmd: List[str], cwd: Optional[str] = None) -> _FakeProcess:
+    expected_ffmpeg = str(Path("C:/AgoraLinkTools/ffmpeg/bin/ffmpeg.exe"))
+    expected_ffplay = str(Path("C:/AgoraLinkTools/ffmpeg/bin/ffplay.exe"))
+
+    def fake_tool_finder(name: str) -> str:
+        if name == "ffmpeg":
+            return expected_ffmpeg
+        if name == "ffplay":
+            return expected_ffplay
+        return ""
+
+    def fake_popen(cmd: List[str], cwd: Optional[str] = None, **kwargs) -> _FakeProcess:
         commands.append(list(cmd))
         cwd_values.append(cwd)
-        return _FakeProcess(cmd, cwd=cwd)
+        return _FakeProcess(cmd, cwd=cwd, **kwargs)
 
     def fake_taskkill(cmd: List[str], **_kwargs) -> subprocess.CompletedProcess[str]:
         taskkill_commands.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    runtime = ScreenRuntime(popen_factory=fake_popen, taskkill_runner=fake_taskkill)
+    runtime = ScreenRuntime(popen_factory=fake_popen, taskkill_runner=fake_taskkill, tool_finder=fake_tool_finder)
     initial_state = runtime.get_state()
     receiver_state = runtime.start_receiver()
     duplicate_state = runtime.start_sender("127.0.0.1")
@@ -329,24 +461,24 @@ def _run_self_test() -> Dict[str, object]:
     crashed_state = runtime.get_state()
     commands_after_crashed_state = len(commands)
     expected_script_dir = str(Path(__file__).resolve().parent)
-    expected_receiver_script = str(Path(__file__).resolve().parent / "screen_receiver.py")
-    expected_sender_script = str(Path(__file__).resolve().parent / "screen_sender.py")
 
-    def fast_exit_popen(cmd: List[str], cwd: Optional[str] = None) -> _FakeProcess:
+    def fast_exit_popen(cmd: List[str], cwd: Optional[str] = None, **kwargs) -> _FakeProcess:
         commands.append(list(cmd))
         cwd_values.append(cwd)
-        proc = _FakeProcess(cmd, cwd=cwd)
+        proc = _FakeProcess(cmd, cwd=cwd, **kwargs)
         proc.returncode = 7
         return proc
 
-    fast_exit_runtime = ScreenRuntime(popen_factory=fast_exit_popen, taskkill_runner=fake_taskkill)
+    fast_exit_runtime = ScreenRuntime(popen_factory=fast_exit_popen, taskkill_runner=fake_taskkill, tool_finder=fake_tool_finder)
     fast_exit_state = fast_exit_runtime.start_receiver()
+    missing_runtime = ScreenRuntime(popen_factory=fake_popen, taskkill_runner=fake_taskkill, tool_finder=lambda _name: "")
+    missing_state = missing_runtime.start_sender("127.0.0.1")
     checks = [
         initial_state["state"] == STATE_IDLE,
         receiver_state["state"] == STATE_RECEIVING,
         receiver_state["mode"] == STATE_RECEIVING,
-        receiver_state["command"][0] == sys.executable,
-        receiver_state["command"][2] == expected_receiver_script,
+        receiver_state["command"][0] == expected_ffplay,
+        "udp://0.0.0.0:50020" in str(receiver_state["command"][-1]),
         duplicate_state["last_error"] == "already running",
         duplicate_state["ok"] is False,
         duplicate_state["error"] == "already running",
@@ -357,8 +489,11 @@ def _run_self_test() -> Dict[str, object]:
         not runtime.is_running(),
         sender_state["state"] == STATE_SENDING,
         sender_state["profile"] == DEFAULT_SCREEN_PROFILE,
-        sender_state["command"][0] == sys.executable,
-        sender_state["command"][2] == expected_sender_script,
+        sender_state["command"][0] == expected_ffmpeg,
+        "-f" in sender_state["command"],
+        "gdigrab" in sender_state["command"],
+        "720p30_h264_qsv" == sender_state["profile"],
+        str(sender_state["command"][-1]).startswith("udp://127.0.0.1:50020?pkt_size=1316"),
         commands_after_crashed_state == 2,
         crashed_state["state"] == STATE_ERROR,
         crashed_state["returncode"] == 42,
@@ -369,7 +504,9 @@ def _run_self_test() -> Dict[str, object]:
         fast_exit_state["state"] == STATE_ERROR,
         fast_exit_state["returncode"] == 7,
         "exited with code 7" in str(fast_exit_state["last_error"]),
-        fast_exit_state["command"][2] == expected_receiver_script,
+        fast_exit_state["command"][0] == expected_ffplay,
+        missing_state["state"] == STATE_ERROR,
+        "winget install --id Gyan.FFmpeg -e" in str(missing_state["last_error"]),
     ]
     return {
         "ok": all(checks),
