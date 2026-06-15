@@ -181,6 +181,26 @@ def _effective_max_unacked_pkts(args) -> int:
         return 1024
 
 
+def _initial_adaptive_wifi_state(args) -> dict:
+    adaptive_enabled = not bool(getattr(args, "disable_adaptive_wifi", False))
+    adaptive_min_unacked = max(1, int(getattr(args, "adaptive_max_unacked_min", 960) or 960))
+    adaptive_max_unacked = max(adaptive_min_unacked, int(getattr(args, "adaptive_max_unacked_max", 1536) or 1536))
+    adaptive_step_unacked = max(1, int(getattr(args, "adaptive_max_unacked_step", 64) or 64))
+    adaptive_eval_interval = max(2.0, float(getattr(args, "adaptive_eval_interval_sec", 5.0) or 5.0))
+    adaptive_current_unacked = max(
+        adaptive_min_unacked,
+        min(adaptive_max_unacked, _effective_max_unacked_pkts(args)),
+    )
+    return {
+        "enabled": adaptive_enabled,
+        "min_unacked": adaptive_min_unacked,
+        "max_unacked": adaptive_max_unacked,
+        "step_unacked": adaptive_step_unacked,
+        "eval_interval": adaptive_eval_interval,
+        "current_unacked": adaptive_current_unacked,
+    }
+
+
 def _effective_sockbuf_bytes(args, attr: str = "sock_rcvbuf") -> int:
     try:
         explicit = int(getattr(args, attr, 0) or 0)
@@ -407,13 +427,15 @@ def run_contact_request_client(args: argparse.Namespace) -> int:
             except Exception:
                 pass
 
-def run_chat_client(args: argparse.Namespace, messages: List[str]) -> int:
+def run_chat_client(args: argparse.Namespace, messages: List[str], adaptive_wifi: Optional[dict] = None) -> int:
     if not bool(getattr(args, "verbose_protocol", False)):
         os.environ.setdefault("RUDP_VERBOSE_PROTOCOL", "0")
     logger = setup_logger("AgoraLink-ChatSender")
     clean_messages = [str(m or "") for m in messages if str(m or "").strip()]
     if not clean_messages:
         raise ValueError("empty_chat_message")
+    adaptive_wifi = dict(adaptive_wifi or _initial_adaptive_wifi_state(args))
+    adaptive_current_unacked = int(adaptive_wifi["current_unacked"])
 
     chat_db = None
     if str(getattr(args, "chat_db", "") or ""):
@@ -628,6 +650,8 @@ def run_client(args: argparse.Namespace) -> int:
     if args.show_ips:
         print_local_ip_candidates()
 
+    adaptive_wifi = _initial_adaptive_wifi_state(args)
+
     if bool(getattr(args, "contact_request", False)):
         return run_contact_request_client(args)
 
@@ -637,7 +661,7 @@ def run_client(args: argparse.Namespace) -> int:
 
     chat_messages = [str(x or "") for x in (getattr(args, "chat_message", []) or []) if str(x or "").strip()]
     if chat_messages and not str(args.file or ""):
-        return run_chat_client(args, chat_messages)
+        return run_chat_client(args, chat_messages, adaptive_wifi)
 
     input_file = Path(args.file).expanduser().resolve()
     if not input_file.is_file():
@@ -724,12 +748,12 @@ def run_client(args: argparse.Namespace) -> int:
     wifi_guard_bad_streak = 0
     wifi_guard_good_streak = 0
 
-    adaptive_enabled = not bool(getattr(args, "disable_adaptive_wifi", False))
-    adaptive_min_unacked = max(1, int(getattr(args, "adaptive_max_unacked_min", 960) or 960))
-    adaptive_max_unacked = max(adaptive_min_unacked, int(getattr(args, "adaptive_max_unacked_max", 1536) or 1536))
-    adaptive_step_unacked = max(1, int(getattr(args, "adaptive_max_unacked_step", 64) or 64))
-    adaptive_eval_interval = max(2.0, float(getattr(args, "adaptive_eval_interval_sec", 5.0) or 5.0))
-    adaptive_current_unacked = max(adaptive_min_unacked, min(adaptive_max_unacked, _effective_max_unacked_pkts(args)))
+    adaptive_enabled = bool(adaptive_wifi["enabled"])
+    adaptive_min_unacked = int(adaptive_wifi["min_unacked"])
+    adaptive_max_unacked = int(adaptive_wifi["max_unacked"])
+    adaptive_step_unacked = int(adaptive_wifi["step_unacked"])
+    adaptive_eval_interval = float(adaptive_wifi["eval_interval"])
+    adaptive_current_unacked = int(adaptive_wifi["current_unacked"])
     adaptive_state = "DISABLED" if not adaptive_enabled else "STABLE"
     adaptive_last_eval_ts = start_ts
     adaptive_samples = 0
