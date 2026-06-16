@@ -325,6 +325,15 @@ from screen_profile import (
 from screen_runtime import ScreenRuntime
 from diagnostic_export import export_diagnostic_bundle
 from port_utils import find_available_udp_port, udp_port_status, udp_ports_status
+from chat_cards import (
+    CARD_FILE_OFFER,
+    CARD_FILE_TRANSFER,
+    CARD_SCREEN_OFFER,
+    CARD_SCREEN_STATE,
+    CARD_SYSTEM,
+    make_card,
+    system_card,
+)
 
 SCREEN_CONTROL_TEXT_PREFIX = "__AGORALINK_SCREEN_CONTROL__:"
 MAIN_UDP_PORT = 9999
@@ -1317,6 +1326,79 @@ class ChatMessageBox(BoxLayout):
         line.add_widget(BoxLayout())
         self.inner.add_widget(line)
 
+    def add_card(self, card: Dict[str, object]) -> None:
+        data = dict(card or {})
+        card_type = str(data.get("card_type") or data.get("type") or CARD_SYSTEM)
+        title = str(data.get("title") or "")
+        subtitle = str(data.get("subtitle") or "")
+        status = str(data.get("status") or "")
+        detail = str(data.get("detail") or "")
+        actions = [dict(item) for item in (data.get("actions") or []) if isinstance(item, dict)]
+
+        if card_type == CARD_SYSTEM:
+            text = detail or title or subtitle or status
+            line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(34), padding=(0, dp(4), 0, dp(4)))
+            line.add_widget(BoxLayout())
+            chip_width = dp(min(520, max(180, 84 + len(text) * 7)))
+            chip = BoxLayout(orientation="vertical", size_hint_x=None, width=chip_width, padding=(dp(12), dp(3), dp(12), dp(3)))
+            apply_card_background(chip, "secondary", radius=12)
+            lab = make_label(text=shorten_middle(text, 70), halign="center", valign="middle", color=THEME["muted_text"], size_hint_y=None, height=dp(20))
+            bind_label_wrap(lab)
+            chip.add_widget(lab)
+            line.add_widget(chip)
+            line.add_widget(BoxLayout())
+            self.inner.add_widget(line)
+            self.scroll.scroll_y = 0
+            return
+
+        has_actions = bool(actions)
+        height = 132 if has_actions else 106
+        line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(height), padding=(0, dp(5), 0, dp(5)))
+        line.add_widget(BoxLayout(size_hint_x=None, width=dp(8)))
+        card_box = BoxLayout(orientation="vertical", spacing=dp(5), padding=(dp(14), dp(10), dp(14), dp(10)), size_hint_x=None, width=dp(430))
+        bg_style = "panel_bg" if card_type in (CARD_FILE_OFFER, CARD_FILE_TRANSFER) else "secondary"
+        apply_card_background(card_box, bg_style, radius=12)
+        title_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(24), spacing=dp(8))
+        badge_text = {
+            CARD_FILE_OFFER: "FILE",
+            CARD_FILE_TRANSFER: "FILE",
+            CARD_SCREEN_OFFER: "SCREEN",
+            CARD_SCREEN_STATE: "SCREEN",
+        }.get(card_type, "INFO")
+        badge = make_label(text=badge_text, size_hint_x=None, width=dp(62), halign="center", valign="middle", color=THEME["primary_active"], bold=True)
+        title_line.add_widget(badge)
+        title_lab = make_label(text=shorten_middle(title or badge_text, 44), halign="left", valign="middle", color=THEME["text"], bold=True)
+        title_lab.shorten = True
+        title_lab.text_size = (dp(330), None)
+        title_line.add_widget(title_lab)
+        card_box.add_widget(title_line)
+        if subtitle:
+            sub_lab = make_label(text=shorten_middle(subtitle, 58), size_hint_y=None, height=dp(20), halign="left", valign="middle", color=THEME["muted_text"])
+            sub_lab.text_size = (dp(392), None)
+            card_box.add_widget(sub_lab)
+        body = "  ".join([part for part in (status, detail) if part])
+        body_lab = make_label(text=shorten_middle(body or status or detail or "-", 76), size_hint_y=None, height=dp(28), halign="left", valign="middle", color=THEME["text"])
+        body_lab.text_size = (dp(392), None)
+        card_box.add_widget(body_lab)
+        if has_actions:
+            owner = getattr(self, "root_owner", None)
+            action_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(28), spacing=dp(6))
+            for action in actions[:3]:
+                label = str(action.get("label") or "")
+                style = str(action.get("style") or "secondary")
+                action_id = str(action.get("action") or "")
+                btn = make_button(style, text=label, size_hint_y=None, height=dp(28))
+                if owner is not None and hasattr(owner, "handle_chat_card_action"):
+                    btn.bind(on_release=lambda _btn, cid=str(data.get("card_id") or ""), aid=action_id: owner.handle_chat_card_action(cid, aid))
+                else:
+                    btn.disabled = True
+                action_row.add_widget(btn)
+            card_box.add_widget(action_row)
+        line.add_widget(card_box)
+        line.add_widget(BoxLayout(size_hint_x=1))
+        self.inner.add_widget(line)
+        self.scroll.scroll_y = 0
+
     def _status_state(self, summary: str, mine: bool) -> tuple[str, tuple]:
         if not mine:
             return "", THEME["muted_text"]
@@ -1579,6 +1661,9 @@ class RUDPTransferRoot(BoxLayout):
         self.current_receiving_file_message_id = ""
         self.receiving_file_message_by_conn: Dict[int, str] = {}
         self.file_message_tasks: Dict[str, Dict[str, object]] = {}
+        self.chat_runtime_cards: List[Dict[str, object]] = []
+        self.pending_transfer_requests: Dict[int, Dict[str, object]] = {}
+        self.pending_transfer_popups: Dict[int, Popup] = {}
         self.live_message_cache: Dict[str, List[Dict[str, object]]] = {}
         self.debug_protocol_lines: List[str] = []
         self.debug_runtime_lines: List[str] = []
@@ -1600,6 +1685,8 @@ class RUDPTransferRoot(BoxLayout):
         self.screen_share_last_status = ""
         self.screen_share_ui_state = "idle"
         self._seen_screen_control_messages = set()
+        self.pending_screen_offers: Dict[str, Dict[str, object]] = {}
+        self.pending_screen_offer_popups: Dict[str, Popup] = {}
         # Deduplicate the receiver's two log lines for one chat frame:
         #   CHAT_MESSAGE_JSON:{...}
         #   Chat from sender: text
@@ -2595,6 +2682,603 @@ class RUDPTransferRoot(BoxLayout):
             return f'{self.cu("state")}: {summary or self.cu("pending")}  {self.cu("total_size")}: {format_file_size(int(total_size or 0))}'
         return f'{self.cu("state")}: {summary or self.cu("pending")}  {self.cu("total_size")}: {self.cu("unknown_size")}'
 
+    def _chat_card_context_from_message(
+        self,
+        message_id: str = "",
+        *,
+        peer_id: str = "",
+        group_id: str = "",
+        conversation_id: str = "",
+    ) -> Dict[str, object]:
+        mid = str(message_id or "").strip()
+        peer = str(peer_id or "").strip()
+        group = str(group_id or "").strip()
+        conv = str(conversation_id or "").strip()
+        if mid and self.message_service is not None:
+            try:
+                msg = self.message_service.get_message(mid) or {}
+            except Exception:
+                msg = {}
+            if msg:
+                group = group or str(msg.get("group_id") or "").strip()
+                conv = conv or str(msg.get("conversation_id") or "").strip()
+                sender = str(msg.get("sender_peer_id") or "").strip()
+                receiver = str(msg.get("receiver_peer_id") or "").strip()
+                local = str(getattr(self, "chat_local_peer_id", "") or "").strip()
+                if not peer:
+                    if sender and sender != local:
+                        peer = sender
+                    elif receiver and receiver != local:
+                        peer = receiver
+        if not group and not conv and not peer:
+            if self.current_chat_mode == "group" and self.current_group_id:
+                group = str(self.current_group_id or "")
+            elif self.current_chat_mode == "direct" and self.current_peer_id:
+                peer = str(self.current_peer_id or "")
+        if peer and not conv and self.message_service is not None:
+            try:
+                conv = self.message_service.create_direct_conversation(peer)
+            except Exception:
+                conv = ""
+        meta: Dict[str, object] = {}
+        if mid:
+            meta["message_id"] = mid
+        if peer:
+            meta["peer_id"] = peer
+        if group:
+            meta["group_id"] = group
+            meta["chat_mode"] = "group"
+            meta["target_id"] = group
+        elif conv or peer:
+            if conv:
+                meta["conversation_id"] = conv
+            meta["chat_mode"] = "direct"
+            meta["target_id"] = peer or conv
+        return meta
+
+    def _chat_card_matches_current(self, card: Dict[str, object]) -> bool:
+        meta = dict((card or {}).get("meta") or {})
+        if self.current_chat_mode == "group" and self.current_group_id:
+            return str(meta.get("group_id") or "") == str(self.current_group_id or "")
+        if self.current_chat_mode == "direct" and self.current_peer_id:
+            if str(meta.get("peer_id") or "") == str(self.current_peer_id or ""):
+                return True
+            conv = str(meta.get("conversation_id") or "")
+            if conv and self.message_service is not None:
+                try:
+                    return conv == self.message_service.create_direct_conversation(self.current_peer_id)
+                except Exception:
+                    return False
+        return False
+
+    def _add_runtime_chat_card(
+        self,
+        card: Dict[str, object],
+        *,
+        message_id: str = "",
+        peer_id: str = "",
+        group_id: str = "",
+        conversation_id: str = "",
+        replace: bool = True,
+    ) -> Dict[str, object]:
+        data = dict(card or {})
+        meta = dict(data.get("meta") or {})
+        ctx = self._chat_card_context_from_message(
+            str(message_id or meta.get("message_id") or ""),
+            peer_id=str(peer_id or meta.get("peer_id") or ""),
+            group_id=str(group_id or meta.get("group_id") or ""),
+            conversation_id=str(conversation_id or meta.get("conversation_id") or ""),
+        )
+        meta.update({k: v for k, v in ctx.items() if v not in (None, "")})
+        data["meta"] = meta
+        card_type = str(data.get("card_type") or data.get("type") or CARD_SYSTEM)
+        data["card_type"] = card_type
+        try:
+            ts = float(data.get("timestamp") or 0.0)
+        except Exception:
+            ts = 0.0
+        if ts <= 0:
+            ts = time.time()
+            data["timestamp"] = ts
+        if not str(data.get("card_id") or "").strip():
+            base = str(meta.get("message_id") or f"{ts:.3f}")
+            data["card_id"] = f"{card_type}:{base}"
+        card_id = str(data.get("card_id") or "")
+        if replace and card_id:
+            for idx, old in enumerate(list(self.chat_runtime_cards)):
+                if str(old.get("card_id") or "") == card_id:
+                    self.chat_runtime_cards[idx] = data
+                    return data
+        self.chat_runtime_cards.append(data)
+        if len(self.chat_runtime_cards) > 160:
+            self.chat_runtime_cards = self.chat_runtime_cards[-160:]
+        return data
+
+    def _render_runtime_chat_cards(self) -> None:
+        try:
+            cards = sorted(
+                [dict(card) for card in self.chat_runtime_cards if self._chat_card_matches_current(dict(card))],
+                key=lambda item: float(item.get("timestamp") or 0.0),
+            )
+            for card in cards:
+                self.main_messages_box.add_card(card)
+        except Exception as exc:
+            try:
+                self.sender_log_box.append(f"chat card render failed: {exc}\n")
+            except Exception:
+                pass
+
+    def _file_card_info(
+        self,
+        message_id: str = "",
+        *,
+        fallback_name: str = "",
+        fallback_path: str = "",
+        fallback_size: int = 0,
+    ) -> Tuple[str, str, int]:
+        name = str(fallback_name or "").strip()
+        path = str(fallback_path or "").strip()
+        size = int(fallback_size or 0)
+        mid = str(message_id or "").strip()
+        if mid and self.message_service is not None:
+            try:
+                msg = self.message_service.get_message(mid) or {}
+            except Exception:
+                msg = {}
+            text = str(msg.get("text") or "")
+            if text:
+                try:
+                    body = json.loads(text)
+                    if isinstance(body, dict):
+                        name = name or str(body.get("name") or "").strip()
+                        path = path or str(body.get("path") or "").strip()
+                        size = size or int(body.get("size") or 0)
+                except Exception:
+                    if not name:
+                        name = os.path.basename(text) or text
+                    if not path:
+                        path = text
+        if not name and path:
+            name = os.path.basename(path)
+        return name or "File", path, size
+
+    def _file_peer_label(self, peer_id: str = "", fallback: str = "") -> str:
+        peer = str(peer_id or "").strip()
+        try:
+            label = self._display_name_for_peer(peer)
+        except Exception:
+            label = ""
+        return str(label or fallback or peer or ("对方" if self.lang == "zh" else "Remote"))
+
+    def _file_card_title(self) -> str:
+        return "文件传输" if self.lang == "zh" else "File transfer"
+
+    def _file_offer_title(self) -> str:
+        return "文件邀请" if self.lang == "zh" else "File invitation"
+
+    def _file_waiting_text(self, peer_label: str = "") -> str:
+        name = str(peer_label or "").strip() or ("对方" if self.lang == "zh" else "remote")
+        return f"等待 {name} 接受" if self.lang == "zh" else f"Waiting for {name} to accept"
+
+    def _file_incoming_text(self, peer_label: str = "") -> str:
+        name = str(peer_label or "").strip() or ("对方" if self.lang == "zh" else "remote")
+        return f"来自 {name} 的文件邀请" if self.lang == "zh" else f"File invitation from {name}"
+
+    def _file_accepted_text(self) -> str:
+        return "已接受，等待传输开始" if self.lang == "zh" else "Accepted, waiting for transfer to start"
+
+    def _file_rejected_local_text(self) -> str:
+        return "已拒绝" if self.lang == "zh" else "Rejected"
+
+    def _file_rejected_by_peer_text(self) -> str:
+        return "对方拒绝接收文件" if self.lang == "zh" else "The receiver rejected this file"
+
+    def _file_completed_text(self) -> str:
+        return "已完成" if self.lang == "zh" else "Completed"
+
+    def _file_failed_text(self, reason: object = "") -> str:
+        detail = str(reason or "").strip()
+        if self.lang == "zh":
+            return "失败" + (f"：{detail}" if detail else "")
+        return "Failed" + (f": {detail}" if detail else "")
+
+    def _file_error_message(self, code: str = "", detail: str = "") -> str:
+        if str(code or "") in ("receiver_rejected", "user_rejected", "file_exists_cancelled"):
+            return self._file_rejected_by_peer_text()
+        key = localized_error_key(code)
+        if key == "transfer_failed":
+            return self.t("transfer_failed", reason=(detail or code or self.t("unknown")))
+        msg = self.t(key)
+        if detail:
+            msg = msg + " " + str(detail)
+        return msg
+
+    def _file_resume_text(self, offset: int = 0) -> str:
+        if int(offset or 0) > 0:
+            return ("续传可用：" if self.lang == "zh" else "Resume available: ") + format_file_size(int(offset or 0))
+        return "续传可用" if self.lang == "zh" else "Resume available"
+
+    def _file_size_detail(self, size: int = 0, *, peer_label: str = "", path: str = "", prefix: str = "") -> str:
+        parts = []
+        if prefix:
+            parts.append(str(prefix))
+        if peer_label:
+            parts.append(("对象: " if self.lang == "zh" else "Peer: ") + str(peer_label))
+        if int(size or 0) > 0:
+            parts.append(("大小: " if self.lang == "zh" else "Size: ") + format_file_size(int(size or 0)))
+        if path:
+            parts.append(("保存路径: " if self.lang == "zh" else "Saved: ") + str(path))
+        return "  ".join(parts)
+
+    def _add_file_offer_chat_card(
+        self,
+        *,
+        message_id: str = "",
+        peer_id: str = "",
+        group_id: str = "",
+        conversation_id: str = "",
+        file_name: str = "",
+        file_path: str = "",
+        total_size: int = 0,
+        status: str = "Waiting",
+        detail: str = "",
+        actions: Optional[List[Dict[str, object]]] = None,
+    ) -> None:
+        name, _path, size = self._file_card_info(
+            message_id,
+            fallback_name=file_name,
+            fallback_path=file_path,
+            fallback_size=total_size,
+        )
+        card = make_card(
+            CARD_FILE_OFFER,
+            title=self._file_offer_title(),
+            subtitle=name,
+            status=status,
+            detail=detail or self._file_size_detail(size),
+            actions=actions or [],
+            card_id=f"file_transfer:{message_id or name}",
+        )
+        self._add_runtime_chat_card(card, message_id=message_id, peer_id=peer_id, group_id=group_id, conversation_id=conversation_id)
+
+    def _add_file_transfer_chat_card(
+        self,
+        *,
+        message_id: str,
+        peer_id: str = "",
+        group_id: str = "",
+        conversation_id: str = "",
+        direction: str = "",
+        transferred: int = 0,
+        total: int = 0,
+        pct: float = 0.0,
+        avg: float = 0.0,
+        eta: str = "",
+        status: str = "",
+        error: str = "",
+        saved_path: str = "",
+        detail: str = "",
+        actions: Optional[List[Dict[str, object]]] = None,
+    ) -> None:
+        name, _path, size = self._file_card_info(message_id, fallback_size=total)
+        total = int(total or size or 0)
+        status_text = str(status or "").strip() or "Transferring"
+        parts = []
+        if total > 0:
+            parts.append(f"{float(pct or 0.0):.1f}%")
+            parts.append(f"{format_file_size(int(transferred or 0))} / {format_file_size(total)}")
+        elif transferred:
+            parts.append(format_file_size(int(transferred or 0)))
+        if detail:
+            parts.append(str(detail))
+        if avg:
+            parts.append(f"{float(avg):.2f} Mbps")
+        if eta and eta != "unknown":
+            parts.append(f"ETA {eta}")
+        if saved_path:
+            parts.append(("保存路径: " if self.lang == "zh" else "Saved: ") + str(saved_path))
+        if error:
+            parts.append(str(error))
+        card_actions = list(actions or [])
+        if saved_path:
+            card_actions.append({"label": "打开所在文件夹" if self.lang == "zh" else "Open folder", "action": f"open_folder:{saved_path}", "style": "secondary"})
+        status_lower = str(status_text).lower()
+        failed_prefix = str(self.cu("failed")).lower()
+        failed_zh = "失败"
+        if direction != "incoming" and message_id and (status_lower in ("failed", failed_prefix) or status_lower.startswith(failed_prefix) or str(status_text).startswith(failed_zh)):
+            card_actions.append({"label": "继续传输" if self.lang == "zh" else "Resume", "action": f"retry_file:{message_id}", "style": "danger"})
+        card = make_card(
+            CARD_FILE_TRANSFER,
+            title=self._file_card_title(),
+            subtitle=name,
+            status=status_text,
+            detail="  ".join(parts) or ("Incoming" if direction == "incoming" else "Outgoing"),
+            actions=card_actions,
+            card_id=f"file_transfer:{message_id}",
+        )
+        self._add_runtime_chat_card(card, message_id=message_id, peer_id=peer_id, group_id=group_id, conversation_id=conversation_id)
+
+    def _schedule_file_transfer_chat_card(self, **kwargs) -> None:
+        data = dict(kwargs)
+        Clock.schedule_once(lambda _dt, data=data: self._add_file_transfer_chat_card(**data), 0)
+
+    def _add_screen_chat_card(
+        self,
+        card_type: str,
+        *,
+        session_id: str = "",
+        peer_id: str = "",
+        title: str = "Screen share",
+        subtitle: str = "",
+        status: str = "",
+        detail: str = "",
+        profile: str = "",
+        port: object = "",
+        actions: Optional[List[Dict[str, object]]] = None,
+    ) -> None:
+        sid = str(session_id or self.screen_share_session_id or "screen").strip()
+        meta = {
+            "session_id": sid,
+            "profile": str(profile or "").strip(),
+            "port": "" if port in (None, "") else str(port),
+            "peer_label": str(subtitle or "").strip(),
+        }
+        card = make_card(
+            card_type,
+            title=title,
+            subtitle=subtitle,
+            status=status,
+            detail=detail,
+            actions=actions or [],
+            card_id=f"screen_share:{sid}",
+            meta=meta,
+        )
+        self._add_runtime_chat_card(card, peer_id=peer_id or self.screen_share_peer_id or self.current_peer_id)
+        self._schedule_force_chat_refresh(0.0)
+
+    def _screen_detail_text(self, profile: object = "", port: object = "") -> str:
+        parts = []
+        profile_text = str(profile or "").strip()
+        port_text = "" if port in (None, "") else str(port)
+        if profile_text:
+            parts.append(f"profile: {profile_text}")
+        if port_text:
+            parts.append(f"port: {port_text}")
+        return "  ".join(parts)
+
+    def _screen_start_failed_text(self, reason: object) -> str:
+        detail = str(reason or "").strip() or "unknown"
+        return f"启动失败：{detail}" if self.lang == "zh" else f"Start failed: {detail}"
+
+    def _screen_stop_failed_text(self, reason: object) -> str:
+        detail = str(reason or "").strip() or "unknown"
+        return f"停止失败：{detail}" if self.lang == "zh" else f"Stop failed: {detail}"
+
+    def _screen_stopped_text(self) -> str:
+        return "投屏已停止" if self.lang == "zh" else "Screen sharing stopped"
+
+    def _screen_rejected_by_peer_text(self, peer_label: str) -> str:
+        name = str(peer_label or "").strip() or ("对方" if self.lang == "zh" else "Remote")
+        return f"{name} 拒绝投屏" if self.lang == "zh" else f"{name} rejected screen sharing"
+
+    def _screen_rejected_local_text(self) -> str:
+        return "已拒绝投屏" if self.lang == "zh" else "Screen sharing rejected"
+
+    def _screen_offer_title(self) -> str:
+        return "投屏邀请" if self.lang == "zh" else "Screen share invitation"
+
+    def handle_chat_card_action(self, card_id: str, action_id: str) -> None:
+        try:
+            action = str(action_id or "")
+            if action == "stop_screen":
+                self.stop_screen_share_from_chat()
+                return
+            if action.startswith("accept_screen:"):
+                session_id = action.split(":", 1)[1]
+                control = dict(self.pending_screen_offers.get(session_id) or {})
+                if control:
+                    pop = self.pending_screen_offer_popups.pop(session_id, None)
+                    if pop is not None:
+                        try:
+                            pop.dismiss()
+                        except Exception:
+                            pass
+                    self._accept_screen_offer(control)
+                return
+            if action.startswith("reject_screen:"):
+                session_id = action.split(":", 1)[1]
+                control = dict(self.pending_screen_offers.get(session_id) or {})
+                if control:
+                    pop = self.pending_screen_offer_popups.pop(session_id, None)
+                    if pop is not None:
+                        try:
+                            pop.dismiss()
+                        except Exception:
+                            pass
+                    self._reject_screen_offer(control, "user_rejected")
+                return
+            if action.startswith("retry_file:"):
+                self.retry_file_message(action.split(":", 1)[1])
+                return
+            if action.startswith("file_accept:"):
+                self._decide_transfer_request(action.split(":", 1)[1], True)
+                return
+            if action.startswith("file_reject:"):
+                self._decide_transfer_request(action.split(":", 1)[1], False)
+                return
+            if action.startswith("open_folder:"):
+                open_file_location(action.split(":", 1)[1])
+                return
+            self._append_debug_line(f"unknown chat card action: {card_id} {action}", protocol=False)
+        except Exception as exc:
+            try:
+                self.sender_log_box.append(f"chat card action failed: {exc}\n")
+            except Exception:
+                pass
+
+    def _default_transfer_policy(self, req: Dict[str, object]) -> str:
+        if bool((req or {}).get("resume_available")):
+            return "resume"
+        if bool((req or {}).get("conflict")):
+            return "rename"
+        return "overwrite"
+
+    def _decide_transfer_request(self, conn_id: object, accepted: bool, policy: str = "") -> None:
+        try:
+            conn = int(conn_id or 0)
+        except Exception:
+            conn = 0
+        if conn <= 0:
+            return
+        req = dict(self.pending_transfer_requests.get(conn) or {})
+        selected_policy = str(policy or self._default_transfer_policy(req) or "overwrite")
+        if accepted and selected_policy == "cancel":
+            accepted = False
+            reason = "file_exists_cancelled"
+        else:
+            reason = "accepted" if accepted else "rejected"
+        approval_dir = self.approval_dir
+        approval_dir.mkdir(parents=True, exist_ok=True)
+        target = approval_dir / (f"{conn}.accept" if accepted else f"{conn}.reject")
+        request_path = approval_dir / f"{conn}.request.json"
+        try:
+            payload = {"accepted": bool(accepted), "reason": reason, "file_policy": selected_policy}
+            target.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            try:
+                request_path.unlink()
+            except Exception:
+                pass
+            self.seen_request_files.discard(str(request_path))
+            self.receiver_log_box.append(("Accepted" if accepted else "Rejected") + f" transfer request conn_id={conn}\n")
+        except Exception as exc:
+            self.receiver_log_box.append(f"Failed to write approval file: {exc}\n")
+            return
+
+        mid = str(req.get("chat_message_id") or self.receiving_file_message_by_conn.get(conn) or "")
+        total = int(req.get("size") or 0)
+        peer_id = str(req.get("chat_sender_peer_id") or req.get("sender_peer_id") or "")
+        if mid:
+            if self.file_transfer_service is not None:
+                try:
+                    self.file_transfer_service.upsert_incoming_task(
+                        chat_message_id=mid,
+                        peer_id=peer_id,
+                        conversation_id=str(req.get("chat_conversation_id") or ""),
+                        group_id=str(req.get("chat_group_id") or ""),
+                        file_name=str(req.get("name") or ""),
+                        remote_path=str(req.get("save_path") or ""),
+                        total_bytes=total,
+                        status="accepted" if accepted else "rejected",
+                    )
+                except Exception as exc:
+                    self._append_debug_line(f"transfer request status update failed: {exc}", protocol=True)
+            if accepted:
+                status_text = self._file_accepted_text()
+                detail = self._file_size_detail(total, peer_label=self._file_peer_label(peer_id, str(req.get("sender") or "")))
+                if selected_policy == "resume":
+                    detail = self._file_size_detail(
+                        total,
+                        peer_label=self._file_peer_label(peer_id, str(req.get("sender") or "")),
+                        prefix=self._file_resume_text(int(req.get("resume_offset") or 0)),
+                    )
+            else:
+                status_text = self._file_rejected_local_text()
+                detail = str(reason or "")
+            self._add_file_offer_chat_card(
+                message_id=mid,
+                peer_id=peer_id,
+                group_id=str(req.get("chat_group_id") or ""),
+                conversation_id=str(req.get("chat_conversation_id") or ""),
+                file_name=str(req.get("name") or ""),
+                file_path=str(req.get("save_path") or ""),
+                total_size=total,
+                status=status_text,
+                detail=detail,
+                actions=[],
+            )
+        self.pending_request_popups.discard(conn)
+        self.pending_transfer_requests.pop(conn, None)
+        pop = self.pending_transfer_popups.pop(conn, None)
+        if pop is not None:
+            try:
+                pop.dismiss()
+            except Exception:
+                pass
+        self._schedule_transfer_card_refresh(force=True)
+
+    def _show_transfer_request_card(self, req: Dict[str, object]) -> None:
+        data = dict(req or {})
+        try:
+            conn = int(data.get("conn_id") or 0)
+        except Exception:
+            conn = 0
+        mid = str(data.get("chat_message_id") or "")
+        total = int(data.get("size") or 0)
+        peer_id = str(data.get("chat_sender_peer_id") or data.get("sender_peer_id") or "")
+        peer_label = self._file_peer_label(peer_id, str(data.get("sender") or ""))
+        if conn > 0:
+            self.pending_transfer_requests[conn] = data
+        detail_prefix = ""
+        if bool(data.get("resume_available")):
+            detail_prefix = self._file_resume_text(int(data.get("resume_offset") or 0))
+        elif bool(data.get("conflict")):
+            detail_prefix = "文件已存在" if self.lang == "zh" else "File exists"
+        actions = []
+        if conn > 0:
+            actions = [
+                {"label": "接受" if self.lang == "zh" else "Accept", "action": f"file_accept:{conn}", "style": "success"},
+                {"label": "拒绝" if self.lang == "zh" else "Reject", "action": f"file_reject:{conn}", "style": "danger"},
+            ]
+        self._add_file_offer_chat_card(
+            message_id=mid,
+            peer_id=peer_id,
+            group_id=str(data.get("chat_group_id") or ""),
+            conversation_id=str(data.get("chat_conversation_id") or ""),
+            file_name=str(data.get("name") or ""),
+            file_path=str(data.get("save_path") or ""),
+            total_size=total,
+            status=self._file_incoming_text(peer_label),
+            detail=self._file_size_detail(total, peer_label=peer_label, prefix=detail_prefix),
+            actions=actions,
+        )
+
+    def _latest_outgoing_file_message_id(self) -> str:
+        best_mid = ""
+        best_ts = -1.0
+        for mid, task in (self.file_message_tasks or {}).items():
+            try:
+                ts = float((task or {}).get("created_at") or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts >= best_ts:
+                best_mid = str(mid or "")
+                best_ts = ts
+        return best_mid
+
+    def _update_latest_file_card_error(self, code: str, detail: str = "") -> None:
+        mid = self._latest_outgoing_file_message_id()
+        if not mid:
+            return
+        ctx = dict(self.file_message_tasks.get(mid) or {})
+        recipients = [dict(r) for r in (ctx.get("recipients") or [])]
+        peer_id = str((recipients[0] or {}).get("peer_id") or "") if recipients else ""
+        total = int(ctx.get("total") or 0)
+        error_text = self._file_error_message(code, detail)
+        self._add_file_transfer_chat_card(
+            message_id=mid,
+            peer_id=peer_id,
+            group_id=str(ctx.get("group_id") or ""),
+            conversation_id=str(ctx.get("conversation_id") or ""),
+            direction="outgoing",
+            transferred=int(self.file_message_progress.get(mid, {}).get("sent") or 0),
+            total=total or int(self.file_message_progress.get(mid, {}).get("total") or 0),
+            pct=float(self.file_message_progress.get(mid, {}).get("pct") or 0.0),
+            avg=float(self.file_message_progress.get(mid, {}).get("avg") or 0.0),
+            eta=str(self.file_message_progress.get(mid, {}).get("eta") or ""),
+            status=self._file_failed_text(error_text),
+            error=error_text,
+        )
+
     def _current_chat_signature(self) -> Optional[Tuple[object, ...]]:
         store = self.chat_store
         if store is None:
@@ -2788,7 +3472,7 @@ class RUDPTransferRoot(BoxLayout):
         self._chat_render_sig = self._current_chat_signature()
         store = self.chat_store
         if self.message_service is None or self.group_service is None or self.contact_service is None:
-            self.main_messages_box.append("聊天数据库未解锁。\n")
+            self.main_messages_box.add_card(system_card("Chat database is locked."))
             return
         self._mark_current_chat_read_and_notify()
         try:
@@ -2874,6 +3558,7 @@ class RUDPTransferRoot(BoxLayout):
                     progress_text = self._file_progress_text(mid, total_size, "") if body_type == "file" else ""
                     live_sender_id = str(live.get("sender_peer_id") or "")
                     self.main_messages_box.add_message(mine=False, sender=self._display_name_for_peer(live_sender_id, members), text=text_live, timestamp=ts, summary="", body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size, show_sender=True)
+                self._render_runtime_chat_cards()
                 active_count = sum(1 for m in members if str(m.get("member_state") or "active") == "active")
                 total_count = len(members)
                 if hasattr(self, "right_title"):
@@ -2969,6 +3654,7 @@ class RUDPTransferRoot(BoxLayout):
                             pass
                     progress_text = self._file_progress_text(mid, total_size, "") if body_type == "file" else ""
                     self.main_messages_box.add_message(mine=False, sender=str(live.get("sender_peer_id") or ""), text=text_live, timestamp=ts, summary="", body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size)
+                self._render_runtime_chat_cards()
                 contact_text = ""
                 seen_contact = False
                 for c in self.contact_service.list_contacts(trusted_only=False):
@@ -2991,7 +3677,7 @@ class RUDPTransferRoot(BoxLayout):
                 for name, path, size, tsf in reversed(file_cards[-8:]):
                     self._add_shared_file_entry(name, path, size, tsf)
         except Exception as exc:
-            self.main_messages_box.append(f"{self.cu('refresh_failed', error=exc)}\n")
+            self.main_messages_box.add_card(system_card(self.cu("refresh_failed", error=exc)))
 
 
 
@@ -4099,11 +4785,23 @@ class RUDPTransferRoot(BoxLayout):
                 def _invalid_endpoint(_dt):
                     _mark_failed(peer_id, "invalid_endpoint")
                     if control_type == SCREEN_SHARE_OFFER:
+                        session_id = str((control or {}).get("session_id") or "")
+                        peer_label = self._screen_peer_label(peer_id)
+                        status_text = self._screen_start_failed_text("invalid endpoint")
+                        self._add_screen_chat_card(
+                            CARD_SCREEN_STATE,
+                            session_id=session_id,
+                            peer_id=peer_id,
+                            title=self._screen_offer_title(),
+                            subtitle=peer_label,
+                            status=status_text,
+                            detail="invalid endpoint",
+                        )
                         self.screen_share_session_id = ""
                         self.screen_share_peer_id = ""
                         self._clear_current_screen_context()
                         self._set_screen_share_ui_state("idle")
-                    self._set_screen_share_status(self._screen_share_status_text("startup_failed", "invalid endpoint"))
+                    self._set_screen_share_status(self._screen_start_failed_text("invalid endpoint"))
                     self._force_chat_refresh()
                 Clock.schedule_once(_invalid_endpoint, 0)
                 return
@@ -4128,11 +4826,23 @@ class RUDPTransferRoot(BoxLayout):
                 def _send_failed(_dt):
                     _mark_failed(peer_id, "screen_control_send_failed")
                     if control_type == SCREEN_SHARE_OFFER:
+                        session_id = str((control or {}).get("session_id") or "")
+                        peer_label = self._screen_peer_label(peer_id)
+                        status_text = self._screen_start_failed_text("screen control send failed")
+                        self._add_screen_chat_card(
+                            CARD_SCREEN_STATE,
+                            session_id=session_id,
+                            peer_id=peer_id,
+                            title=self._screen_offer_title(),
+                            subtitle=peer_label,
+                            status=status_text,
+                            detail="screen control send failed",
+                        )
                         self.screen_share_session_id = ""
                         self.screen_share_peer_id = ""
                         self._clear_current_screen_context()
                         self._set_screen_share_ui_state("idle")
-                    self._set_screen_share_status(self._screen_share_status_text("startup_failed", "screen control send failed"))
+                    self._set_screen_share_status(self._screen_start_failed_text("screen control send failed"))
                     self._force_chat_refresh()
                 Clock.schedule_once(_send_failed, 0)
         threading.Thread(target=_run, daemon=True).start()
@@ -4153,7 +4863,20 @@ class RUDPTransferRoot(BoxLayout):
             session_id = "screen_" + secrets.token_hex(12)
             profiles = self._screen_advertised_profiles(force=True)
             if not profiles:
-                self._set_screen_share_status(self._screen_share_status_text("startup_failed", "没有可用的本机投屏档位"))
+                reason = "没有可用的本机投屏档位"
+                status_text = self._screen_start_failed_text(reason)
+                self._set_screen_share_status(status_text)
+                if self.current_peer_id:
+                    peer_label = self._screen_peer_label(self.current_peer_id)
+                    self._add_screen_chat_card(
+                        CARD_SCREEN_STATE,
+                        session_id=session_id,
+                        peer_id=str(self.current_peer_id or ""),
+                        title=self._screen_offer_title(),
+                        subtitle=peer_label,
+                        status=status_text,
+                        detail=reason,
+                    )
                 self._set_screen_share_ui_state("idle")
                 return
             preferred_profile = self._screen_preferred_profile()
@@ -4181,15 +4904,39 @@ class RUDPTransferRoot(BoxLayout):
             self.screen_share_peer_label = peer_label
             self.current_screen_peer = peer_label
             if self._send_screen_control_to_peer(peer_id, offer):
+                status_text = self._screen_share_status_text("pending_offer", peer_label=peer_label)
                 self._set_screen_share_ui_state("pending_offer")
-                self._set_screen_share_status(self._screen_share_status_text("pending_offer", peer_label=peer_label))
+                self._set_screen_share_status(status_text)
+                self._add_screen_chat_card(
+                    CARD_SCREEN_OFFER,
+                    session_id=session_id,
+                    peer_id=peer_id,
+                    title=self._screen_offer_title(),
+                    subtitle=peer_label,
+                    status=status_text,
+                    detail=self._screen_detail_text(preferred_profile, DEFAULT_SCREEN_PORT),
+                    profile=preferred_profile,
+                    port=DEFAULT_SCREEN_PORT,
+                )
             else:
+                status_text = self._screen_start_failed_text("screen control send failed")
+                self._add_screen_chat_card(
+                    CARD_SCREEN_STATE,
+                    session_id=session_id,
+                    peer_id=peer_id,
+                    title=self._screen_offer_title(),
+                    subtitle=peer_label,
+                    status=status_text,
+                    detail=self._screen_detail_text(preferred_profile, DEFAULT_SCREEN_PORT),
+                    profile=preferred_profile,
+                    port=DEFAULT_SCREEN_PORT,
+                )
                 self.screen_share_session_id = ""
                 self.screen_share_peer_id = ""
                 self._clear_current_screen_context()
                 self._set_screen_share_ui_state("idle")
         except Exception as exc:
-            self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
+            self._set_screen_share_status(self._screen_start_failed_text(str(exc)))
             self.screen_share_session_id = ""
             self.screen_share_peer_id = ""
             self._clear_current_screen_context()
@@ -4198,15 +4945,21 @@ class RUDPTransferRoot(BoxLayout):
     def stop_screen_share_from_chat(self) -> None:
         peer_id = str(self.screen_share_peer_id or self.current_peer_id or "").strip()
         session_id = str(self.screen_share_session_id or ("screen_" + secrets.token_hex(12)))
+        peer_label = self._current_screen_peer_label() or self._screen_peer_label(peer_id)
+        profile_name = self._current_screen_profile_name()
+        port_text = self._current_screen_port_text()
+        stop_status_text = self._screen_stopped_text()
         try:
             state = self._screen_runtime().stop()
             self._set_screen_share_ui_state("idle")
             if str(state.get("state") or "") == "error":
-                self._set_screen_share_status(self._screen_share_status_text("stop_failed", self._screen_runtime_error_detail(state)))
+                stop_status_text = self._screen_stop_failed_text(self._screen_runtime_error_detail(state))
+                self._set_screen_share_status(stop_status_text)
             else:
-                self._set_screen_share_status(self._screen_share_status_text("idle"))
+                self._set_screen_share_status(stop_status_text)
         except Exception as exc:
-            self._set_screen_share_status(self._screen_share_status_text("stop_failed", str(exc)))
+            stop_status_text = self._screen_stop_failed_text(str(exc))
+            self._set_screen_share_status(stop_status_text)
             self._set_screen_share_ui_state("idle")
         if peer_id:
             try:
@@ -4214,6 +4967,18 @@ class RUDPTransferRoot(BoxLayout):
                 self._send_screen_control_to_peer(peer_id, stop_msg)
             except Exception as exc:
                 self._set_screen_share_status(f"Screen stop notify failed: {exc}")
+        if peer_id:
+            self._add_screen_chat_card(
+                CARD_SCREEN_STATE,
+                session_id=session_id,
+                peer_id=peer_id,
+                title=self._screen_offer_title(),
+                subtitle=peer_label,
+                status=stop_status_text,
+                detail=self._screen_detail_text(profile_name, port_text),
+                profile=profile_name,
+                port=port_text,
+            )
         self.screen_share_session_id = ""
         self.screen_share_peer_id = ""
         self._clear_current_screen_context()
@@ -4245,32 +5010,78 @@ class RUDPTransferRoot(BoxLayout):
             self._seen_screen_control_messages.add(key)
             message_type = str(control.get("type") or "")
             if message_type == SCREEN_SHARE_OFFER:
+                payload = dict(control.get("payload") or {})
+                peer_label = self._screen_peer_label(sender, str(payload.get("host") or ""))
+                session_id = str(control.get("session_id") or "")
+                profile_name = profile_id_from_info(payload.get("preferred_profile") or payload.get("profile_name") or DEFAULT_SCREEN_PROFILE, DEFAULT_SCREEN_PROFILE)
+                offer_port = payload.get("port") or DEFAULT_SCREEN_PORT
+                self.pending_screen_offers[session_id] = dict(control)
+                status_text = f"收到 {peer_label} 的投屏邀请" if self.lang == "zh" else f"Screen share invitation from {peer_label}"
+                self._add_screen_chat_card(
+                    CARD_SCREEN_OFFER,
+                    session_id=session_id,
+                    peer_id=sender,
+                    title=self._screen_offer_title(),
+                    subtitle=peer_label,
+                    status=status_text,
+                    detail=self._screen_detail_text(profile_name, offer_port),
+                    profile=profile_name,
+                    port=offer_port,
+                    actions=[
+                        {"label": "接受", "action": f"accept_screen:{session_id}", "style": "success"},
+                        {"label": "拒绝", "action": f"reject_screen:{session_id}", "style": "danger"},
+                    ],
+                )
+                self._set_screen_share_status(status_text)
                 self._show_screen_offer_popup(control)
             elif message_type == SCREEN_SHARE_ACCEPT:
                 self._handle_screen_accept(control)
             elif message_type == SCREEN_SHARE_REJECT:
                 reason = str(dict(control.get("payload") or {}).get("reason") or "")
                 peer_label = self._screen_peer_label(sender)
+                status_text = self._screen_rejected_by_peer_text(peer_label)
+                self._add_screen_chat_card(
+                    CARD_SCREEN_STATE,
+                    session_id=str(control.get("session_id") or ""),
+                    peer_id=sender,
+                    title=self._screen_offer_title(),
+                    subtitle=peer_label,
+                    status=status_text,
+                    detail=reason,
+                )
                 self.screen_share_session_id = ""
                 self.screen_share_peer_id = ""
                 self._set_screen_share_ui_state("idle")
-                self._set_screen_share_status(self._screen_share_status_text("remote_rejected", reason, peer_label=peer_label))
+                self._set_screen_share_status(status_text)
                 self._clear_current_screen_context()
             elif message_type == SCREEN_SHARE_STOP:
                 self._handle_screen_stop(control)
             elif message_type == SCREEN_SHARE_STATE:
                 payload = dict(control.get("payload") or {})
+                peer_label = self._screen_peer_label(sender)
+                self._add_screen_chat_card(
+                    CARD_SCREEN_STATE,
+                    session_id=str(control.get("session_id") or ""),
+                    peer_id=sender,
+                    title="Screen share state",
+                    subtitle=peer_label,
+                    status=str(payload.get("state") or ""),
+                    detail=str(payload.get("detail") or ""),
+                )
                 self._set_screen_share_status(f"Remote screen state: {payload.get('state') or ''} {payload.get('detail') or ''}")
         except Exception as exc:
             self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
 
     def _show_screen_offer_popup(self, control: Dict[str, object]) -> None:
         sender = str(control.get("sender_peer_id") or "")
+        session_id = str(control.get("session_id") or "")
         payload = dict(control.get("payload") or {})
-        profile_name = str(payload.get("profile_name") or DEFAULT_SCREEN_PROFILE)
+        sender_host = str(payload.get("host") or "").strip()
+        peer_label = self._screen_peer_label(sender, sender_host)
+        profile_name = profile_id_from_info(payload.get("preferred_profile") or payload.get("profile_name") or DEFAULT_SCREEN_PROFILE, DEFAULT_SCREEN_PROFILE)
         content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
         label = make_label(
-            text=f"收到投屏邀请\n来自: {sender}\n档位: {profile_name}",
+            text=f"收到投屏邀请\n来自: {peer_label}\n推荐 profile: {profile_name}",
             halign="left",
             valign="top",
         )
@@ -4278,6 +5089,8 @@ class RUDPTransferRoot(BoxLayout):
         content.add_widget(label)
         buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
         popup = style_popup(Popup(title="投屏邀请", content=content, size_hint=(0.52, 0.36), auto_dismiss=False))
+        if session_id:
+            self.pending_screen_offer_popups[session_id] = popup
         buttons.add_widget(make_button("success", text="接受", on_release=lambda *_: (self._accept_screen_offer(control), popup.dismiss())))
         buttons.add_widget(make_button("danger", text="拒绝", on_release=lambda *_: (self._reject_screen_offer(control, "user_rejected"), popup.dismiss())))
         content.add_widget(buttons)
@@ -4291,10 +5104,28 @@ class RUDPTransferRoot(BoxLayout):
         sender_host = str(payload.get("host") or "").strip()
         peer_label = self._screen_peer_label(sender, sender_host)
         try:
+            if session_id:
+                self.pending_screen_offers.pop(session_id, None)
+                pop = self.pending_screen_offer_popups.pop(session_id, None)
+                if pop is not None:
+                    try:
+                        pop.dismiss()
+                    except Exception:
+                        pass
             self._set_screen_share_ui_state("pending_accept")
             self.screen_share_peer_label = peer_label
             self.current_screen_peer = peer_label
-            self._set_screen_share_status(self._screen_share_status_text("pending_accept", peer_label=peer_label))
+            starting_text = "正在启动接收端" if self.lang == "zh" else "Starting screen receiver"
+            self._set_screen_share_status(starting_text)
+            self._add_screen_chat_card(
+                CARD_SCREEN_STATE,
+                session_id=session_id,
+                peer_id=sender,
+                title=self._screen_offer_title(),
+                subtitle=peer_label,
+                status=starting_text,
+                detail=self._screen_detail_text(self._preferred_screen_profile_from_offer(control, payload), payload.get("port") or DEFAULT_SCREEN_PORT),
+            )
             offered_profiles = self._offered_screen_profiles(control, payload)
             if offered_profiles:
                 local_profiles = self._screen_advertised_profiles(force=True)
@@ -4307,8 +5138,18 @@ class RUDPTransferRoot(BoxLayout):
                 )
                 if selected_profile_info is None:
                     self._clear_current_screen_context()
-                    self._set_screen_share_status("没有可用的共同投屏档位")
+                    failed_text = self._screen_start_failed_text("没有可用的共同投屏档位")
+                    self._set_screen_share_status(failed_text)
                     self._set_screen_share_ui_state("idle")
+                    self._add_screen_chat_card(
+                        CARD_SCREEN_STATE,
+                        session_id=session_id,
+                        peer_id=sender,
+                        title=self._screen_offer_title(),
+                        subtitle=peer_label,
+                        status=failed_text,
+                        detail="没有可用的共同投屏档位",
+                    )
                     self._reject_screen_offer(control, "没有可用的共同投屏档位", update_status=False)
                     return
             else:
@@ -4318,8 +5159,19 @@ class RUDPTransferRoot(BoxLayout):
             screen_port = self._choose_screen_receive_port()
             if screen_port is None:
                 self._clear_current_screen_context()
-                self._set_screen_share_status(SCREEN_PORTS_BUSY_MESSAGE)
+                failed_text = self._screen_start_failed_text(SCREEN_PORTS_BUSY_MESSAGE)
+                self._set_screen_share_status(failed_text)
                 self._set_screen_share_ui_state("idle")
+                self._add_screen_chat_card(
+                    CARD_SCREEN_STATE,
+                    session_id=session_id,
+                    peer_id=sender,
+                    title=self._screen_offer_title(),
+                    subtitle=peer_label,
+                    status=failed_text,
+                    detail=SCREEN_PORTS_BUSY_MESSAGE,
+                    profile=selected_profile_name,
+                )
                 self._reject_screen_offer(control, SCREEN_PORTS_BUSY_MESSAGE, update_status=False)
                 return
             state = self._screen_runtime().start_receiver(
@@ -4331,9 +5183,21 @@ class RUDPTransferRoot(BoxLayout):
             )
             if str(state.get("state") or "") != "receiving":
                 reason = self._screen_runtime_error_detail(self._screen_runtime().get_state())
-                self._set_screen_share_status(self._screen_share_status_text("startup_failed", reason))
+                failed_text = self._screen_start_failed_text(reason)
+                self._set_screen_share_status(failed_text)
                 self._set_screen_share_ui_state("idle")
                 self._clear_current_screen_context()
+                self._add_screen_chat_card(
+                    CARD_SCREEN_STATE,
+                    session_id=session_id,
+                    peer_id=sender,
+                    title=self._screen_offer_title(),
+                    subtitle=peer_label,
+                    status=failed_text,
+                    detail=self._screen_detail_text(selected_profile_name, screen_port),
+                    profile=selected_profile_name,
+                    port=screen_port,
+                )
                 self._reject_screen_offer(control, reason, update_status=False)
                 return
             accept = make_accept(
@@ -4348,27 +5212,69 @@ class RUDPTransferRoot(BoxLayout):
             self.screen_share_peer_id = sender
             self._set_current_screen_context(peer_label=peer_label, profile=selected_profile_name, port=screen_port)
             self._set_screen_share_ui_state("receiving")
+            status_text = self._screen_share_status_text("receiving", peer_label=peer_label, profile=selected_profile_name, port=screen_port)
+            self._add_screen_chat_card(
+                CARD_SCREEN_STATE,
+                session_id=session_id,
+                peer_id=sender,
+                title=self._screen_offer_title(),
+                subtitle=peer_label,
+                status=status_text,
+                detail=self._screen_detail_text(selected_profile_name, screen_port),
+                profile=selected_profile_name,
+                port=screen_port,
+                actions=[{"label": "Stop", "action": "stop_screen", "style": "danger"}],
+            )
             self._send_screen_control_to_peer(sender, accept)
             self._append_debug_line(f"receiver actually used port/profile: {screen_port}/{selected_profile_name}", protocol=False)
-            self._set_screen_share_status(self._screen_share_status_text("receiving", peer_label=peer_label, profile=selected_profile_name, port=screen_port))
+            self._set_screen_share_status(status_text)
         except Exception as exc:
             self._clear_current_screen_context()
-            self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
+            failed_text = self._screen_start_failed_text(str(exc))
+            self._set_screen_share_status(failed_text)
+            self._add_screen_chat_card(
+                CARD_SCREEN_STATE,
+                session_id=session_id,
+                peer_id=sender,
+                title=self._screen_offer_title(),
+                subtitle=peer_label,
+                status=failed_text,
+                detail=str(exc),
+            )
             self._set_screen_share_ui_state("idle")
 
     def _reject_screen_offer(self, control: Dict[str, object], reason: str, update_status: bool = True) -> None:
         sender = str(control.get("sender_peer_id") or "")
         session_id = str(control.get("session_id") or "")
         try:
+            if session_id:
+                self.pending_screen_offers.pop(session_id, None)
+                pop = self.pending_screen_offer_popups.pop(session_id, None)
+                if pop is not None:
+                    try:
+                        pop.dismiss()
+                    except Exception:
+                        pass
             reject = make_reject(session_id, self.chat_local_peer_id, sender, reason)
             self._send_screen_control_to_peer(sender, reject)
+            if update_status:
+                status_text = self._screen_rejected_local_text()
+                self._add_screen_chat_card(
+                    CARD_SCREEN_STATE,
+                    session_id=session_id,
+                    peer_id=sender,
+                    title=self._screen_offer_title(),
+                    subtitle=self._screen_peer_label(sender),
+                    status=status_text,
+                    detail=str(reason or ""),
+                )
             self._clear_current_screen_context()
             self._set_screen_share_ui_state("idle")
             if update_status:
-                self._set_screen_share_status(self._screen_share_status_text("idle"))
+                self._set_screen_share_status(self._screen_rejected_local_text())
         except Exception as exc:
             self._clear_current_screen_context()
-            self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
+            self._set_screen_share_status(self._screen_stop_failed_text(str(exc)))
             self._set_screen_share_ui_state("idle")
 
     def _handle_screen_accept(self, control: Dict[str, object]) -> None:
@@ -4379,7 +5285,17 @@ class RUDPTransferRoot(BoxLayout):
             if not host or is_unspecified_ip(host):
                 host, _port = self._endpoint_for_peer(sender)
             if not host or is_unspecified_ip(host):
-                self._set_screen_share_status(self._screen_share_status_text("startup_failed", "missing receiver IP"))
+                failed_text = self._screen_start_failed_text("missing receiver IP")
+                self._set_screen_share_status(failed_text)
+                self._add_screen_chat_card(
+                    CARD_SCREEN_STATE,
+                    session_id=str(control.get("session_id") or ""),
+                    peer_id=sender,
+                    title=self._screen_offer_title(),
+                    subtitle=self._screen_peer_label(sender),
+                    status=failed_text,
+                    detail="Cannot start sender without receiver IP",
+                )
                 self.screen_share_session_id = ""
                 self.screen_share_peer_id = ""
                 self._clear_current_screen_context()
@@ -4391,7 +5307,19 @@ class RUDPTransferRoot(BoxLayout):
             self.screen_share_session_id = str(control.get("session_id") or "")
             self.screen_share_peer_id = sender
             self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port)
-            self._set_screen_share_status(self._screen_share_status_text("pending_accept", peer_label=peer_label, profile=selected_profile, port=screen_port))
+            starting_text = self._screen_share_status_text("pending_accept", peer_label=peer_label, profile=selected_profile, port=screen_port)
+            self._set_screen_share_status(starting_text)
+            self._add_screen_chat_card(
+                CARD_SCREEN_STATE,
+                session_id=str(control.get("session_id") or ""),
+                peer_id=sender,
+                title=self._screen_offer_title(),
+                subtitle=peer_label,
+                status=starting_text,
+                detail=self._screen_detail_text(selected_profile, screen_port),
+                profile=selected_profile,
+                port=screen_port,
+            )
             state = self._screen_runtime().start_sender(
                 host=host,
                 port=screen_port,
@@ -4406,31 +5334,79 @@ class RUDPTransferRoot(BoxLayout):
                 self.screen_share_peer_id = ""
                 self._clear_current_screen_context()
                 self._set_screen_share_ui_state("idle")
-                self._set_screen_share_status(self._screen_share_status_text("startup_failed", reason))
+                failed_text = self._screen_start_failed_text(reason)
+                self._set_screen_share_status(failed_text)
+                self._add_screen_chat_card(
+                    CARD_SCREEN_STATE,
+                    session_id=str(control.get("session_id") or ""),
+                    peer_id=sender,
+                    title=self._screen_offer_title(),
+                    subtitle=peer_label,
+                    status=failed_text,
+                    detail=self._screen_detail_text(selected_profile, screen_port),
+                    profile=selected_profile,
+                    port=screen_port,
+                )
                 return
             self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port)
             self._append_debug_line(f"sender actually used profile: {selected_profile}", protocol=False)
             self._set_screen_share_ui_state("sending")
-            self._set_screen_share_status(self._screen_share_status_text("sending", peer_label=peer_label, profile=selected_profile, port=screen_port))
+            status_text = self._screen_share_status_text("sending", peer_label=peer_label, profile=selected_profile, port=screen_port)
+            self._add_screen_chat_card(
+                CARD_SCREEN_STATE,
+                session_id=str(control.get("session_id") or ""),
+                peer_id=sender,
+                title=self._screen_offer_title(),
+                subtitle=peer_label,
+                status=status_text,
+                detail=self._screen_detail_text(selected_profile, screen_port),
+                profile=selected_profile,
+                port=screen_port,
+                actions=[{"label": "Stop", "action": "stop_screen", "style": "danger"}],
+            )
+            self._set_screen_share_status(status_text)
         except Exception as exc:
             self._clear_current_screen_context()
-            self._set_screen_share_status(self._screen_share_status_text("startup_failed", str(exc)))
+            failed_text = self._screen_start_failed_text(str(exc))
+            self._set_screen_share_status(failed_text)
+            self._add_screen_chat_card(
+                CARD_SCREEN_STATE,
+                session_id=str(control.get("session_id") or ""),
+                peer_id=sender,
+                title=self._screen_offer_title(),
+                subtitle=self._screen_peer_label(sender),
+                status=failed_text,
+                detail=str(exc),
+            )
             self._set_screen_share_ui_state("idle")
 
     def _handle_screen_stop(self, control: Dict[str, object]) -> None:
         sender = str(control.get("sender_peer_id") or "")
         peer_label = self._current_screen_peer_label() or self._screen_peer_label(sender)
+        profile_name = self._current_screen_profile_name()
+        port_text = self._current_screen_port_text()
         try:
             self._screen_runtime().stop()
             self.screen_share_session_id = ""
             self.screen_share_peer_id = ""
             self._set_screen_share_ui_state("idle")
-            stopped_text = self._screen_share_status_text("remote_stopped", peer_label=peer_label)
+            stopped_text = self._screen_stopped_text()
+            self._add_screen_chat_card(
+                CARD_SCREEN_STATE,
+                session_id=str(control.get("session_id") or ""),
+                peer_id=sender,
+                title=self._screen_offer_title(),
+                subtitle=peer_label,
+                status=stopped_text,
+                detail=self._screen_detail_text(profile_name, port_text),
+                profile=profile_name,
+                port=port_text,
+            )
             self._clear_current_screen_context()
             self._set_screen_share_status(stopped_text)
         except Exception as exc:
             self._clear_current_screen_context()
-            self._set_screen_share_status(self._screen_share_status_text("stop_failed", str(exc)))
+            self._set_screen_share_status(self._screen_start_failed_text(str(exc)))
             self._set_screen_share_ui_state("idle")
 
     def open_debug_popup(self) -> None:
@@ -5314,6 +6290,7 @@ class RUDPTransferRoot(BoxLayout):
                     USER_ERROR_LOG_PREFIX,
                     "LAN_STATS ",
                 )))
+                self._try_parse_user_event(line, "sender")
                 tev = self._parse_transfer_event_line(line)
                 if tev and mid:
                     try:
@@ -5334,6 +6311,17 @@ class RUDPTransferRoot(BoxLayout):
                         "eta": m.group("eta") or "",
                         "state": self.cu("sending_to", peer=peer_id),
                     }
+                    self._schedule_file_transfer_chat_card(
+                        message_id=mid,
+                        peer_id=peer_id,
+                        direction="outgoing",
+                        transferred=sent,
+                        total=total,
+                        pct=pct,
+                        avg=float(m.group("avg") or 0.0),
+                        eta=m.group("eta") or "",
+                        status=self.cu("sending"),
+                    )
                     self._schedule_transfer_card_refresh(force=False)
 
             rc = proc.wait(timeout=5)
@@ -5347,6 +6335,25 @@ class RUDPTransferRoot(BoxLayout):
                     "eta": "0:00" if rc == 0 else self.file_message_progress.get(mid, {}).get("eta", ""),
                     "state": self.cu("completed") if rc == 0 else self.cu("failed"),
                 }
+                final_sent = final_total if rc == 0 else int(self.file_message_progress.get(mid, {}).get("sent") or 0)
+                final_pct = 100.0 if rc == 0 else float(self.file_message_progress.get(mid, {}).get("pct") or 0.0)
+                final_avg = float(self.file_message_progress.get(mid, {}).get("avg") or 0.0)
+                final_eta = "0:00" if rc == 0 else str(self.file_message_progress.get(mid, {}).get("eta") or "")
+                final_status = self.cu("completed") if rc == 0 else self.cu("failed")
+                final_error = "" if rc == 0 else (str(self.last_sender_failure_code or "") or "file_send_failed")
+                final_status = final_status if rc == 0 else self._file_failed_text(self._file_error_message(final_error, ""))
+                self._schedule_file_transfer_chat_card(
+                    message_id=mid,
+                    peer_id=peer_id,
+                    direction="outgoing",
+                    transferred=final_sent,
+                    total=final_total,
+                    pct=final_pct,
+                    avg=final_avg,
+                    eta=final_eta,
+                    status=final_status,
+                    error=final_error,
+                )
                 if self.file_transfer_service is not None:
                     try:
                         self.file_transfer_service.update_progress(
@@ -5375,6 +6382,18 @@ class RUDPTransferRoot(BoxLayout):
                 old = self.file_message_progress.get(mid, {})
                 old.update({"state": f'{self.cu("failed")}: {exc}'})
                 self.file_message_progress[mid] = old
+                self._schedule_file_transfer_chat_card(
+                    message_id=mid,
+                    peer_id=peer_id,
+                    direction="outgoing",
+                    transferred=int(old.get("sent") or 0),
+                    total=int(old.get("total") or total_size or 0),
+                    pct=float(old.get("pct") or 0.0),
+                    avg=float(old.get("avg") or 0.0),
+                    eta=str(old.get("eta") or ""),
+                    status=self.cu("failed"),
+                    error=str(exc),
+                )
                 self._schedule_transfer_card_refresh(force=True)
             return False
 
@@ -6126,6 +7145,21 @@ class RUDPTransferRoot(BoxLayout):
         chat_sender_peer_id = str(msg.get('sender_peer_id') or self.chat_local_peer_id or '')
         created_at = float(msg.get('created_at') or time.time())
         file_total = os.path.getsize(path) if os.path.exists(path) else 0
+        first_peer_id = str((recipients[0] or {}).get("peer_id") or "") if recipients else ""
+        first_peer_label = self._file_peer_label(first_peer_id)
+        self._add_file_transfer_chat_card(
+            message_id=chat_message_id,
+            peer_id=first_peer_id,
+            group_id=chat_group_id,
+            conversation_id=chat_conversation_id,
+            direction="outgoing",
+            transferred=0,
+            total=file_total,
+            pct=0.0,
+            status=self._file_waiting_text(first_peer_label),
+            detail=self._file_size_detail(file_total, peer_label=first_peer_label),
+        )
+        self._schedule_transfer_card_refresh(force=True)
 
         if self.file_transfer_service is not None:
             self.file_transfer_service.remember_runtime_task(
@@ -6191,7 +7225,18 @@ class RUDPTransferRoot(BoxLayout):
                 except Exception:
                     port = 9999
                 if not ip or is_unspecified_ip(ip):
-                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_failed(pid, 'invalid_endpoint'), self._force_chat_refresh()), 0)
+                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_failed(pid, 'invalid_endpoint'), self._add_file_transfer_chat_card(
+                        message_id=chat_message_id,
+                        peer_id=pid,
+                        group_id=chat_group_id,
+                        conversation_id=chat_conversation_id,
+                        direction="outgoing",
+                        transferred=0,
+                        total=file_total,
+                        pct=0.0,
+                        status=self._file_failed_text("invalid_endpoint"),
+                        error="invalid_endpoint",
+                    ), self._force_chat_refresh()), 0)
                     all_ok = False
                     if self.file_transfer_service is not None:
                         self.file_transfer_service.mark_failed(chat_message_id, peer_id=peer_id, direction='outgoing', error='invalid_endpoint')
@@ -6236,6 +7281,18 @@ class RUDPTransferRoot(BoxLayout):
                     "--chat-sender-peer-id", chat_sender_peer_id,
                     "--chat-receiver-peer-id", peer_id,
                 ]
+                self._schedule_file_transfer_chat_card(
+                    message_id=chat_message_id,
+                    peer_id=peer_id,
+                    group_id=chat_group_id,
+                    conversation_id=chat_conversation_id,
+                    direction="outgoing",
+                    transferred=0,
+                    total=file_total,
+                    pct=0.0,
+                    status=self._file_accepted_text(),
+                    detail=self._file_size_detail(file_total, peer_label=self._file_peer_label(peer_id)),
+                )
                 ok = self._run_file_sender_with_progress(args=args, message_id=chat_message_id, peer_id=peer_id, total_size=file_total)
                 if ok:
                     Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_delivered(pid), self._force_chat_refresh()), 0)
@@ -6469,6 +7526,7 @@ class RUDPTransferRoot(BoxLayout):
             self.last_sender_failure_code = str(code or "transfer_failed")
             self.retry_send_btn.disabled = False
             self.sender_log_box.append(self.t("retry_ready") + "\n")
+            self._update_latest_file_card_error(str(code or "transfer_failed"), str(detail or ""))
 
     def _try_parse_user_event(self, text: str, target: str) -> bool:
         marker = USER_ERROR_LOG_PREFIX
@@ -6488,11 +7546,30 @@ class RUDPTransferRoot(BoxLayout):
             except Exception:
                 return False
             if str(obj.get("code") or "") == "resume_enabled":
-                msg = self.t("resume_enabled", offset=format_file_size(int(obj.get("resume_offset") or 0)))
+                resume_offset = int(obj.get("resume_offset") or 0)
+                msg = self.t("resume_enabled", offset=format_file_size(resume_offset))
                 if target == "receiver":
                     self.receiver_log_box.append(msg + "\n")
                 else:
                     self.sender_log_box.append(msg + "\n")
+                    mid = self._latest_outgoing_file_message_id()
+                    if mid:
+                        ctx = dict(self.file_message_tasks.get(mid) or {})
+                        recipients = [dict(r) for r in (ctx.get("recipients") or [])]
+                        peer_id = str((recipients[0] or {}).get("peer_id") or "") if recipients else ""
+                        total = int(ctx.get("total") or self.file_message_progress.get(mid, {}).get("total") or 0)
+                        self._add_file_transfer_chat_card(
+                            message_id=mid,
+                            peer_id=peer_id,
+                            group_id=str(ctx.get("group_id") or ""),
+                            conversation_id=str(ctx.get("conversation_id") or ""),
+                            direction="outgoing",
+                            transferred=resume_offset,
+                            total=total,
+                            pct=(resume_offset * 100.0 / total) if total else 0.0,
+                            status=self._file_resume_text(resume_offset),
+                            detail=self._file_size_detail(total, peer_label=self._file_peer_label(peer_id)),
+                        )
                 return True
         return False
 
@@ -6771,6 +7848,16 @@ class RUDPTransferRoot(BoxLayout):
                             )
                         except Exception:
                             pass
+                    self._add_file_offer_chat_card(
+                        message_id=mid,
+                        peer_id=str(obj.get("sender_peer_id") or ""),
+                        group_id=str(obj.get("group_id") or ""),
+                        conversation_id=str(obj.get("conversation_id") or ""),
+                        file_name=body_name,
+                        total_size=total,
+                        status=self._file_incoming_text(self._file_peer_label(str(obj.get("sender_peer_id") or ""))),
+                        detail=self._file_size_detail(total, peer_label=self._file_peer_label(str(obj.get("sender_peer_id") or ""))),
+                    )
             self._schedule_force_chat_refresh(0.0, 0.15, 0.5)
         except Exception as exc:
             try:
@@ -6791,6 +7878,17 @@ class RUDPTransferRoot(BoxLayout):
             if mid:
                 total = os.path.getsize(saved_path) if os.path.exists(saved_path) else int(self.file_message_progress.get(mid, {}).get("total") or 0)
                 self.file_message_progress[mid] = {"sent": total, "total": total, "pct": 100.0, "avg": self.file_message_progress.get(mid, {}).get("avg", 0.0), "eta": "0:00", "state": self.cu("received")}
+                self._add_file_transfer_chat_card(
+                    message_id=mid,
+                    direction="incoming",
+                    transferred=total,
+                    total=total,
+                    pct=100.0,
+                    avg=float(self.file_message_progress.get(mid, {}).get("avg") or 0.0),
+                    eta="0:00",
+                    status=self._file_completed_text(),
+                    saved_path=saved_path,
+                )
                 if self.file_transfer_service is not None:
                     self.file_transfer_service.bind_saved_path(mid, saved_path)
             self.receiving_file_message_by_conn.pop(int(conn or 0), None)
@@ -6834,6 +7932,17 @@ class RUDPTransferRoot(BoxLayout):
                         "eta": "0:00",
                         "state": self.cu("received"),
                     }
+                    self._add_file_transfer_chat_card(
+                        message_id=mid,
+                        direction="incoming",
+                        transferred=total,
+                        total=total,
+                        pct=100.0,
+                        avg=float(self.file_message_progress.get(mid, {}).get("avg") or 0.0),
+                        eta="0:00",
+                        status=self._file_completed_text(),
+                        saved_path=saved_path,
+                    )
                     if self.file_transfer_service is not None:
                         self.file_transfer_service.update_progress(
                             chat_message_id=mid,
@@ -6860,6 +7969,7 @@ class RUDPTransferRoot(BoxLayout):
             conn = int(req.get("conn_id") or 0)
             mid = str(req.get("chat_message_id") or "")
             total = int(req.get("size") or 0)
+            self._show_transfer_request_card(req)
             if mid and self.message_service is not None:
                 try:
                     self.message_service.ensure_incoming_file_placeholder_from_transfer_request(req, local_peer_id=self.chat_local_peer_id)
@@ -6886,7 +7996,7 @@ class RUDPTransferRoot(BoxLayout):
                         local_path=str(req.get("save_path") or ""),
                         remote_path=str(req.get("save_path") or ""),
                         total_bytes=total,
-                        status="accepted",
+                        status="offered",
                     )
                 self._schedule_force_chat_refresh(0.0, 0.15)
             self.show_transfer_request(req)
@@ -7092,11 +8202,11 @@ class RUDPTransferRoot(BoxLayout):
             return True
 
         state_map = {
-            "started": self.cu("pending"),
+            "started": self._file_accepted_text(),
             "transferring": self.cu("receiving") if direction == "incoming" else self.cu("sending"),
-            "received": self.cu("received"),
-            "completed": self.cu("completed"),
-            "failed": self.cu("failed"),
+            "received": self._file_completed_text(),
+            "completed": self._file_completed_text(),
+            "failed": self._file_failed_text(str(obj.get("error") or obj.get("reason") or "")),
         }
         latest = {
             "sent": transferred,
@@ -7116,6 +8226,21 @@ class RUDPTransferRoot(BoxLayout):
             # Keep only recent states to prevent unbounded memory growth.
             for k in list(self.last_transfer_state.keys())[:-200]:
                 self.last_transfer_state.pop(k, None)
+        self._add_file_transfer_chat_card(
+            message_id=mid,
+            peer_id=peer_id,
+            group_id=str(obj.get("chat_group_id") or obj.get("group_id") or ""),
+            conversation_id=str(obj.get("chat_conversation_id") or obj.get("conversation_id") or ""),
+            direction=direction,
+            transferred=transferred,
+            total=total,
+            pct=pct,
+            avg=current or avg,
+            eta=eta,
+            status=state_map.get(status, status),
+            error=str(obj.get("error") or ""),
+            saved_path=str(obj.get("save_path") or obj.get("local_path") or ""),
+        )
 
         persist = self._should_persist_transfer_event(
             mid=mid,
@@ -7202,6 +8327,20 @@ class RUDPTransferRoot(BoxLayout):
                     self.receiver_log_box.append(f"Failed to parse CHAT_MESSAGE_JSON: {exc}\n")
                 except Exception:
                     pass
+        if TRANSFER_REQUEST_LOG_PREFIX in text:
+            try:
+                payload = text.split(TRANSFER_REQUEST_LOG_PREFIX, 1)[1].strip()
+                req = json.loads(payload)
+                try:
+                    self.seen_request_files.add(str(self.approval_dir / f"{int(req.get('conn_id') or 0)}.request.json"))
+                except Exception:
+                    pass
+                Clock.schedule_once(lambda _dt, data=req: self._handle_transfer_request_ui(data), 0)
+            except Exception as exc:
+                try:
+                    self.receiver_log_box.append(f"Failed to parse TRANSFER_REQUEST_JSON: {exc}\n")
+                except Exception:
+                    pass
         # Do not parse "Chat from ..." as a message. That line is a human-readable
         # server log emitted after CHAT_MESSAGE_JSON and must not create a second
         # live_* message. If CHAT_MESSAGE_JSON is absent, keep it as a diagnostic
@@ -7216,6 +8355,16 @@ class RUDPTransferRoot(BoxLayout):
                     total = int(m_recv.group("total") or 0)
                     pct = float(m_recv.group("pct") or ((sent * 100.0 / total) if total else 0.0))
                     self.file_message_progress[mid] = {"sent": sent, "total": total, "pct": pct, "avg": float(m_recv.group("avg") or 0.0), "eta": m_recv.group("eta") or "", "state": self.cu("receiving")}
+                    self._schedule_file_transfer_chat_card(
+                        message_id=mid,
+                        direction="incoming",
+                        transferred=sent,
+                        total=total,
+                        pct=pct,
+                        avg=float(m_recv.group("avg") or 0.0),
+                        eta=m_recv.group("eta") or "",
+                        status=self.cu("receiving"),
+                    )
                     self._schedule_transfer_card_refresh(force=False)
             except Exception:
                 pass
@@ -7233,6 +8382,17 @@ class RUDPTransferRoot(BoxLayout):
                     if mid:
                         total = os.path.getsize(saved_path) if os.path.exists(saved_path) else int(self.file_message_progress.get(mid, {}).get("total") or 0)
                         self.file_message_progress[mid] = {"sent": total, "total": total, "pct": 100.0, "avg": self.file_message_progress.get(mid, {}).get("avg", 0.0), "eta": "0:00", "state": self.cu("received")}
+                        self._schedule_file_transfer_chat_card(
+                            message_id=mid,
+                            direction="incoming",
+                            transferred=total,
+                            total=total,
+                            pct=100.0,
+                            avg=float(self.file_message_progress.get(mid, {}).get("avg") or 0.0),
+                            eta="0:00",
+                            status=self._file_completed_text(),
+                            saved_path=saved_path,
+                        )
                         if self.file_transfer_service is not None:
                             self.file_transfer_service.bind_saved_path(mid, saved_path)
                     self.receiving_file_message_by_conn.pop(conn, None)
@@ -7246,10 +8406,12 @@ class RUDPTransferRoot(BoxLayout):
 
 
     def show_transfer_request(self, req: Dict[str, object]) -> None:
+        req = self._normalize_transfer_request_for_visible_context(dict(req or {}))
         conn_id = int(req.get("conn_id") or 0)
         try:
             mid = str(req.get("chat_message_id") or "")
             total = int(req.get("size") or 0)
+            self._show_transfer_request_card(req)
             if mid and self.message_service is not None:
                 try:
                     self.message_service.ensure_incoming_file_placeholder_from_transfer_request(req, local_peer_id=self.chat_local_peer_id)
@@ -7268,7 +8430,7 @@ class RUDPTransferRoot(BoxLayout):
                         file_name=str(req.get("name") or ""),
                         remote_path=str(req.get("save_path") or ""),
                         total_bytes=total,
-                        status="accepted",
+                        status="offered",
                     )
                 Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
         except Exception:
@@ -7322,6 +8484,9 @@ class RUDPTransferRoot(BoxLayout):
             content.add_widget(policy_spinner)
         buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
         popup = style_popup(Popup(title=self.t("incoming_request_title"), title_font=UI_FONT, content=content, size_hint=(0.72, 0.60), auto_dismiss=False))
+        if conn_id > 0:
+            self.pending_transfer_requests[conn_id] = dict(req)
+            self.pending_transfer_popups[conn_id] = popup
 
         def _selected_policy() -> str:
             if policy_spinner is None:
@@ -7336,32 +8501,13 @@ class RUDPTransferRoot(BoxLayout):
             return "rename"
 
         def _decision(accepted: bool):
-            policy = _selected_policy()
-            if accepted and policy == "cancel":
-                accepted = False
-                reason = "file_exists_cancelled"
-            else:
-                reason = "accepted" if accepted else "rejected"
-            target = approval_dir / (f"{conn_id}.accept" if accepted else f"{conn_id}.reject")
-            try:
-                payload = {"accepted": bool(accepted), "reason": reason, "file_policy": policy}
-                target.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-                try:
-                    request_path.unlink()
-                except Exception:
-                    pass
-                self.seen_request_files.discard(str(request_path))
-                self.receiver_log_box.append(("Accepted" if accepted else "Rejected") + f" transfer request conn_id={conn_id}\n")
-            except Exception as exc:
-                self.receiver_log_box.append(f"Failed to write approval file: {exc}\n")
-            self.pending_request_popups.discard(conn_id)
-            popup.dismiss()
+            self._decide_transfer_request(conn_id, accepted, _selected_policy())
 
         buttons.add_widget(make_button("success", text=self.t("accept"), on_release=lambda *_: _decision(True)))
         buttons.add_widget(make_button("danger", text=self.t("reject"), on_release=lambda *_: _decision(False)))
         content.add_widget(buttons)
         apply_ui_font(content)
-        popup.bind(on_dismiss=lambda *_: self.pending_request_popups.discard(conn_id))
+        popup.bind(on_dismiss=lambda *_: (self.pending_request_popups.discard(conn_id), self.pending_transfer_popups.pop(conn_id, None)))
         popup.open()
 
     def sender_exit(self, rc) -> None:
