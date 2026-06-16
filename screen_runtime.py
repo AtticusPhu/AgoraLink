@@ -17,6 +17,8 @@ import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+from app_paths import debug_log_dir
+from process_utils import popen_no_console, run_no_console
 from screen_control import DEFAULT_SCREEN_PORT
 from screen_profile import PROFILES_BY_NAME, ScreenProfile, profile_id_from_info
 
@@ -33,58 +35,6 @@ FFMPEG_MISSING_MESSAGE = (
     "找不到 ffmpeg/ffplay。请安装 FFmpeg 或使用内置 tools/ffmpeg/bin。\n"
     f"安装命令：{FFMPEG_INSTALL_HINT}"
 )
-
-def make_no_window_startupinfo() -> Optional[subprocess.STARTUPINFO]:
-    """Build Windows startupinfo that hides console windows only."""
-    if os.name != "nt":
-        return None
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
-    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
-    return startupinfo
-
-
-def get_no_window_creationflags() -> int:
-    if os.name != "nt":
-        return 0
-    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
-
-
-def _apply_no_window_kwargs(kwargs: Dict[str, object]) -> Dict[str, object]:
-    if os.name != "nt":
-        return kwargs
-    fixed = dict(kwargs)
-    fixed["creationflags"] = int(fixed.get("creationflags") or 0) | get_no_window_creationflags()
-    startupinfo = fixed.get("startupinfo") or make_no_window_startupinfo()
-    if startupinfo is not None:
-        try:
-            startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
-            startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
-        except Exception:
-            pass
-        fixed["startupinfo"] = startupinfo
-    return fixed
-
-
-def popen_no_console(
-    cmd,
-    *args,
-    popen_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
-    **kwargs,
-):
-    """Start a child process without creating a console window on Windows."""
-    return popen_factory(cmd, *args, **_apply_no_window_kwargs(kwargs))
-
-
-def run_no_console(
-    cmd,
-    *args,
-    run_factory: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-    **kwargs,
-):
-    """Run a child process without creating a console window on Windows."""
-    return run_factory(cmd, *args, **_apply_no_window_kwargs(kwargs))
-
 
 class ScreenRuntime:
     def __init__(
@@ -230,13 +180,7 @@ class ScreenRuntime:
         return self._snapshot()
 
     def _debug_log_dir(self) -> Path:
-        if os.name == "nt":
-            base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-            path = Path(base) / "AgoraLink" / "debug"
-        else:
-            path = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "AgoraLink" / "debug"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return debug_log_dir()
 
     def _open_process_log_file(self, tool_name: str):
         if self._popen_factory is not subprocess.Popen:

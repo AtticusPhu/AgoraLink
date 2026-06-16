@@ -23,11 +23,47 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-APP_NAME = "AgoraLink"
-IS_WINDOWS = os.name == "nt"
-FROZEN = bool(getattr(sys, "frozen", False))
-APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
-RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
+from app_paths import APP_DIR, APP_NAME, APP_VERSION, FROZEN, IS_WINDOWS, RESOURCE_DIR, debug_log_dir, temp_dir, user_data_dir
+from file_transfer_presenter import (
+    file_accepted_text,
+    file_card_title,
+    file_completed_text,
+    file_error_message,
+    file_failed_text,
+    file_incoming_text,
+    file_offer_title,
+    file_progress_detail,
+    file_progress_text,
+    file_rejected_by_peer_text,
+    file_rejected_local_text,
+    file_resume_text,
+    file_size_detail,
+    file_transfer_card_detail,
+    file_waiting_confirm_text,
+    file_waiting_text,
+    folder_not_supported_text,
+    format_file_size,
+    is_failed_status,
+    multi_file_card_title,
+    multi_file_summary,
+    remote_peer_text as file_transfer_remote_peer_text,
+    transfer_status_label,
+    truncate_filename,
+    unnamed_file_text,
+)
+from process_utils import popen_no_console, run_no_console
+from screen_share_presenter import (
+    screen_detail_text,
+    screen_offer_title,
+    screen_rejected_by_peer_text,
+    screen_rejected_local_text,
+    screen_share_active_states,
+    screen_share_button_text,
+    screen_share_status_text,
+    screen_start_failed_text,
+    screen_stop_failed_text,
+    screen_stopped_text,
+)
 
 PROGRESS_RE = re.compile(
     r"Progress:\s+(?P<sent>\d+)/(?:\s*)?(?P<total>\d+)\s+bytes\s+\((?P<pct>[0-9.]+)%\).*?"
@@ -36,24 +72,6 @@ PROGRESS_RE = re.compile(
 COMPLETE_RE = re.compile(r"Transfer complete:\s+(?P<total>\d+)\s+bytes.*?avg=(?P<avg>[0-9.]+)\s+Mbps")
 RECEIVED_SAVE_RE = re.compile(r"Session\s+(?P<conn>\d+):\s+saved\s+(?P<path>.+?),\s+bytes=")
 RECEIVE_PROGRESS_RE = re.compile(r"Session\s+(?P<conn>\d+):\s+(?P<sent>\d+)/(?:\s*)?(?P<total>\d+)\s+bytes\s+\((?P<pct>[0-9.]+)%\).*?avg=(?P<avg>[0-9.]+)\s+Mbps.*?eta=(?P<eta>[^,\s]+)")
-
-
-def user_data_dir() -> Path:
-    if IS_WINDOWS:
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-        path = Path(base) / APP_NAME
-    elif sys.platform == "darwin":
-        path = Path.home() / "Library" / "Application Support" / APP_NAME
-    else:
-        path = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / APP_NAME
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def debug_log_dir() -> Path:
-    path = user_data_dir() / "debug"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
 
 
 def append_worker_debug_log(role: str, line: str) -> None:
@@ -106,17 +124,6 @@ def receiver_pin_file(ip: str, port: int) -> Path:
     return pins_dir / f"{safe}.pin"
 
 
-def format_file_size(num_bytes: int) -> str:
-    n = float(max(0, int(num_bytes)))
-    units = ["B", "KiB", "MiB", "GiB", "TiB"]
-    for unit in units:
-        if n < 1024.0 or unit == units[-1]:
-            return f"{int(n)} B" if unit == "B" else f"{n:.2f} {unit}"
-        n /= 1024.0
-    return f"{int(num_bytes)} B"
-
-
-
 def is_image_file_for_preview(path_or_name: str) -> bool:
     ext = Path(str(path_or_name or "")).suffix.lower()
     return ext in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
@@ -162,28 +169,6 @@ def shorten_middle(value: str, max_chars: int = 34) -> str:
         return text
     keep = max(4, (max_chars - 1) // 2)
     return text[:keep] + "…" + text[-keep:]
-
-
-def localized_error_key(code: str) -> str:
-    code = str(code or "transfer_failed")
-    mapping = {
-        "approval_timeout": "approval_timeout_msg",
-        "receiver_approval_timeout": "approval_timeout_msg",
-        "receiver_rejected": "receiver_rejected_msg",
-        "user_rejected": "receiver_rejected_msg",
-        "file_exists_cancelled": "receiver_rejected_msg",
-        "save_dir_not_writable": "save_dir_not_writable_msg",
-        "save_dir_create_failed": "save_dir_not_writable_msg",
-        "save_dir_not_directory": "save_dir_not_writable_msg",
-        "disk_space_not_enough": "disk_space_not_enough_msg",
-        "network_no_progress": "network_no_progress_msg",
-        "receiver_unreachable": "receiver_unreachable_msg",
-        "receiver_identity_changed": "receiver_identity_changed_msg",
-        "complete_timeout": "complete_timeout_msg",
-        "sha256_mismatch": "sha256_mismatch_msg",
-        "output_open_failed": "output_open_failed_msg",
-    }
-    return mapping.get(code, "transfer_failed")
 
 
 def configure_stdio_utf8() -> None:
@@ -321,7 +306,7 @@ from screen_profile import (
     profile_id_from_info,
     profile_info,
 )
-from screen_runtime import ScreenRuntime, popen_no_console, run_no_console
+from screen_runtime import ScreenRuntime
 from diagnostic_export import export_diagnostic_bundle
 from file_packaging import package_files_to_zip
 from port_utils import find_available_udp_port, udp_port_status, udp_ports_status
@@ -333,7 +318,6 @@ from chat_cards import (
     CARD_SYSTEM,
     make_card,
     system_card,
-    truncate_filename,
 )
 
 SCREEN_CONTROL_TEXT_PREFIX = "__AGORALINK_SCREEN_CONTROL__:"
@@ -1603,27 +1587,18 @@ class ChatMessageBox(BoxLayout):
 
         failed = "failed" in str(summary or "").lower() or "失败" in state or "failed" in state.lower()
         complete = pct >= 99.9 or state in ("completed", "received", self._cu("completed"), self._cu("received")) or "read" in str(summary or "").lower()
-        def _mbps(v) -> str:
-            try:
-                return f"{float(v):.1f}"
-            except Exception:
-                return "0.0"
-        current_part = f"Cur {_mbps(current)} Mbps" if current not in (None, "", 0) else ""
-        avg_part = f"Avg {_mbps(avg)} Mbps" if avg not in (None, "", 0) else ""
-        peak_part = f"Peak {_mbps(peak)} Mbps" if peak not in (None, "", 0) else ""
-        elapsed_part = ""
-        try:
-            if elapsed not in (None, "", 0):
-                elapsed_part = f"{float(elapsed):.1f}s"
-        except Exception:
-            elapsed_part = ""
-        eta_part = f"ETA {eta}" if eta and eta != "unknown" else ""
-        metric_line = " · ".join([x for x in (current_part, avg_part, peak_part, elapsed_part, eta_part) if x])
-        if total > 0:
-            size_line = f"{format_file_size(sent)} / {format_file_size(total)}" if sent > 0 and not complete else format_file_size(total)
-            detail = f"{size_line}  {metric_line}" if metric_line else size_line
-        else:
-            detail = metric_line or self._cu("unknown_size")
+        detail = file_progress_detail(
+            sent=sent,
+            total=total,
+            pct=pct,
+            avg=avg,
+            current=current,
+            peak=peak,
+            elapsed=elapsed,
+            eta=eta,
+            complete=complete,
+            unknown_size=self._cu("unknown_size"),
+        )
         return max(0.0, min(100.0, pct)), bool(failed), bool(complete), detail
 
 
@@ -2764,29 +2739,7 @@ class RUDPTransferRoot(BoxLayout):
             }
         else:
             prog = self.file_message_progress.get(mid, {})
-        if prog:
-            sent = int(prog.get("sent") or 0)
-            total = int(prog.get("total") or total_size or 0)
-            pct = float(prog.get("pct") or ((sent * 100.0 / total) if total else 0.0))
-            state_raw = str(prog.get("state") or self.cu("receiving"))
-            status_map = {
-                "queued": self.cu("pending"),
-                "offered": self.cu("pending"),
-                "accepted": self.cu("pending"),
-                "transferring": self.cu("receiving"),
-                "completed": self.cu("completed"),
-                "received": self.cu("received"),
-                "failed": self.cu("failed"),
-            }
-            state = status_map.get(state_raw, state_raw)
-            avg = prog.get("avg")
-            eta = str(prog.get("eta") or "")
-            rate_part = f"  {float(avg):.2f} Mbps" if avg not in (None, "", 0) else ""
-            eta_part = f"  ETA {eta}" if eta and eta != "unknown" else ""
-            return f"{state}: {pct:.1f}%  {format_file_size(sent)} / {format_file_size(total)}{rate_part}{eta_part}"
-        if int(total_size or 0) > 0:
-            return f'{self.cu("state")}: {summary or self.cu("pending")}  {self.cu("total_size")}: {format_file_size(int(total_size or 0))}'
-        return f'{self.cu("state")}: {summary or self.cu("pending")}  {self.cu("total_size")}: {self.cu("unknown_size")}'
+        return file_progress_text(prog, total_size=total_size, summary=summary, translate=self.cu)
 
     def _chat_card_context_from_message(
         self,
@@ -3033,7 +2986,7 @@ class RUDPTransferRoot(BoxLayout):
                         path = text
         if not name and path:
             name = os.path.basename(path)
-        return name or ("未命名文件" if self.lang == "zh" else "Unnamed file"), path, size
+        return name or unnamed_file_text(self.lang), path, size
 
     def _file_peer_label(self, peer_id: str = "", fallback: str = "") -> str:
         peer = str(peer_id or "").strip()
@@ -3041,79 +2994,55 @@ class RUDPTransferRoot(BoxLayout):
             label = self._display_name_for_peer(peer)
         except Exception:
             label = ""
-        return str(label or fallback or peer or ("对方" if self.lang == "zh" else "Remote"))
+        return str(label or fallback or peer or file_transfer_remote_peer_text(self.lang))
 
     def _file_card_title(self) -> str:
-        return "文件传输" if self.lang == "zh" else "File transfer"
+        return file_card_title(self.lang)
 
     def _multi_file_card_title(self) -> str:
-        return "多个文件" if self.lang == "zh" else "Multiple files"
+        return multi_file_card_title(self.lang)
 
     def _multi_file_summary(self, count: int) -> str:
-        return f"共 {int(count or 0)} 个文件，打包后发送" if self.lang == "zh" else f"{int(count or 0)} files, sent as one ZIP"
+        return multi_file_summary(count, self.lang)
 
     def _folder_not_supported_text(self) -> str:
-        return "不支持文件夹，请选择文件" if self.lang == "zh" else "Folders are not supported. Please select files."
+        return folder_not_supported_text(self.lang)
 
     def _file_offer_title(self) -> str:
-        return "文件邀请" if self.lang == "zh" else "File invitation"
+        return file_offer_title(self.lang)
 
     def _file_waiting_text(self, peer_label: str = "") -> str:
-        name = str(peer_label or "").strip() or ("对方" if self.lang == "zh" else "remote")
-        return f"等待 {name} 接受" if self.lang == "zh" else f"Waiting for {name} to accept"
+        return file_waiting_text(peer_label, self.lang)
 
     def _file_incoming_text(self, peer_label: str = "") -> str:
-        name = str(peer_label or "").strip() or ("对方" if self.lang == "zh" else "remote")
-        return f"来自 {name} 的文件邀请" if self.lang == "zh" else f"File invitation from {name}"
+        return file_incoming_text(peer_label, self.lang)
 
     def _file_waiting_confirm_text(self) -> str:
-        return "等待确认" if self.lang == "zh" else "Waiting for confirmation"
+        return file_waiting_confirm_text(self.lang)
 
     def _file_accepted_text(self) -> str:
-        return "已接受，等待传输开始" if self.lang == "zh" else "Accepted, waiting for transfer to start"
+        return file_accepted_text(self.lang)
 
     def _file_rejected_local_text(self) -> str:
-        return "已拒绝" if self.lang == "zh" else "Rejected"
+        return file_rejected_local_text(self.lang)
 
     def _file_rejected_by_peer_text(self) -> str:
-        return "对方拒绝接收文件" if self.lang == "zh" else "The receiver rejected this file"
+        return file_rejected_by_peer_text(self.lang)
 
     def _file_completed_text(self) -> str:
-        return "已完成" if self.lang == "zh" else "Completed"
+        return file_completed_text(self.lang)
 
     def _file_failed_text(self, reason: object = "") -> str:
-        detail = str(reason or "").strip()
-        if self.lang == "zh":
-            return "失败" + (f"：{detail}" if detail else "")
-        return "Failed" + (f": {detail}" if detail else "")
+        return file_failed_text(reason, self.lang)
 
     def _file_error_message(self, code: str = "", detail: str = "") -> str:
-        if str(code or "") in ("receiver_rejected", "user_rejected", "file_exists_cancelled"):
-            return self._file_rejected_by_peer_text()
-        key = localized_error_key(code)
-        if key == "transfer_failed":
-            return self.t("transfer_failed", reason=(detail or code or self.t("unknown")))
-        msg = self.t(key)
-        if detail:
-            msg = msg + " " + str(detail)
-        return msg
+        return file_error_message(code, detail, lang=self.lang, translate=self.t)
 
     def _file_resume_text(self, offset: int = 0) -> str:
-        if int(offset or 0) > 0:
-            return ("续传可用：" if self.lang == "zh" else "Resume available: ") + format_file_size(int(offset or 0))
-        return "续传可用" if self.lang == "zh" else "Resume available"
+        return file_resume_text(offset, self.lang)
 
     def _file_size_detail(self, size: int = 0, *, peer_label: str = "", path: str = "", prefix: str = "") -> str:
-        parts = []
-        if prefix:
-            parts.append(str(prefix))
-        if peer_label:
-            parts.append(("对象: " if self.lang == "zh" else "Peer: ") + str(peer_label))
-        if int(size or 0) > 0:
-            parts.append(("大小: " if self.lang == "zh" else "Size: ") + format_file_size(int(size or 0)))
-        if path:
-            parts.append(("保存路径: " if self.lang == "zh" else "Saved: ") + str(path))
-        return "  ".join(parts)
+        return file_size_detail(size, peer_label=peer_label, path=path, prefix=prefix, lang=self.lang)
 
     def _add_file_offer_chat_card(
         self,
@@ -3189,40 +3118,30 @@ class RUDPTransferRoot(BoxLayout):
             display_name = self._multi_file_summary(package_count)
         total = int(total or size or 0)
         status_text = str(status or "").strip() or "Transferring"
-        parts = []
-        if total > 0:
-            parts.append(f"{float(pct or 0.0):.1f}%")
-            parts.append(f"{format_file_size(int(transferred or 0))} / {format_file_size(total)}")
-        elif transferred:
-            parts.append(format_file_size(int(transferred or 0)))
-        if detail:
-            parts.append(str(detail))
-        if avg:
-            parts.append(f"{float(avg):.2f} Mbps")
-        if eta and eta != "unknown":
-            parts.append(f"ETA {eta}")
-        if saved_path:
-            parts.append(("保存路径: " if self.lang == "zh" else "Saved: ") + str(saved_path))
-        if error:
-            parts.append(str(error))
-        if not parts:
-            parts.append("Waiting")
-        if display_name != name:
-            parts.append(f"name: {name}")
+        detail_text = file_transfer_card_detail(
+            lang=self.lang,
+            transferred=transferred,
+            total=total,
+            pct=pct,
+            avg=avg,
+            eta=eta,
+            detail=detail,
+            saved_path=saved_path,
+            error=error,
+            display_name=display_name,
+            original_name=name,
+        )
         card_actions = list(actions or [])
         if saved_path:
             card_actions.append({"label": "打开所在文件夹" if self.lang == "zh" else "Open folder", "action": f"open_folder:{saved_path}", "style": "secondary"})
-        status_lower = str(status_text).lower()
-        failed_prefix = str(self.cu("failed")).lower()
-        failed_zh = "失败"
-        if direction == "outgoing" and message_id and (status_lower in ("failed", failed_prefix) or status_lower.startswith(failed_prefix) or str(status_text).startswith(failed_zh)):
+        if direction == "outgoing" and message_id and is_failed_status(status_text, failed_label=self.cu("failed"), lang=self.lang):
             card_actions.append({"label": "继续传输" if self.lang == "zh" else "Resume", "action": f"retry_file:{message_id}", "style": "danger"})
         card = make_card(
             CARD_FILE_TRANSFER,
             title=title_text,
             subtitle=display_name,
             status=status_text,
-            detail="  ".join(parts) or ("Incoming" if direction == "incoming" else "Outgoing"),
+            detail=detail_text or ("Incoming" if direction == "incoming" else "Outgoing"),
             direction=direction,
             side=direction,
             actions=card_actions,
@@ -3270,35 +3189,25 @@ class RUDPTransferRoot(BoxLayout):
         self._schedule_force_chat_refresh(0.0)
 
     def _screen_detail_text(self, profile: object = "", port: object = "") -> str:
-        parts = []
-        profile_text = str(profile or "").strip()
-        port_text = "" if port in (None, "") else str(port)
-        if profile_text:
-            parts.append(f"profile: {profile_text}")
-        if port_text:
-            parts.append(f"port: {port_text}")
-        return "  ".join(parts)
+        return screen_detail_text(profile, port)
 
     def _screen_start_failed_text(self, reason: object) -> str:
-        detail = str(reason or "").strip() or "unknown"
-        return f"启动失败：{detail}" if self.lang == "zh" else f"Start failed: {detail}"
+        return screen_start_failed_text(reason, self.lang)
 
     def _screen_stop_failed_text(self, reason: object) -> str:
-        detail = str(reason or "").strip() or "unknown"
-        return f"停止失败：{detail}" if self.lang == "zh" else f"Stop failed: {detail}"
+        return screen_stop_failed_text(reason, self.lang)
 
     def _screen_stopped_text(self) -> str:
-        return "投屏已停止" if self.lang == "zh" else "Screen sharing stopped"
+        return screen_stopped_text(self.lang)
 
     def _screen_rejected_by_peer_text(self, peer_label: str) -> str:
-        name = str(peer_label or "").strip() or ("对方" if self.lang == "zh" else "Remote")
-        return f"{name} 拒绝投屏" if self.lang == "zh" else f"{name} rejected screen sharing"
+        return screen_rejected_by_peer_text(peer_label, self.lang)
 
     def _screen_rejected_local_text(self) -> str:
-        return "已拒绝投屏" if self.lang == "zh" else "Screen sharing rejected"
+        return screen_rejected_local_text(self.lang)
 
     def _screen_offer_title(self) -> str:
-        return "投屏邀请" if self.lang == "zh" else "Screen share invitation"
+        return screen_offer_title(self.lang)
 
     def handle_chat_card_action(self, card_id: str, action_id: str) -> None:
         try:
@@ -4429,7 +4338,7 @@ class RUDPTransferRoot(BoxLayout):
     def _chat_diagnostic_summary(self) -> Dict[str, object]:
         summary: Dict[str, object] = {
             "app": APP_NAME,
-            "release": "v0.0.4",
+            "release": APP_VERSION,
             "python": sys.version,
             "platform": sys.platform,
             "frozen": FROZEN,
@@ -4644,12 +4553,10 @@ class RUDPTransferRoot(BoxLayout):
         Clock.schedule_once(lambda _dt: self._refresh_screen_runtime_status(status_label), 0)
 
     def _screen_share_button_text(self, active: bool) -> str:
-        if active:
-            return "停止投屏" if self.lang == "zh" else "Stop Share"
-        return "投屏" if self.lang == "zh" else "Share"
+        return screen_share_button_text(active, self.lang)
 
     def _screen_share_active_states(self) -> set:
-        return {"pending_offer", "pending_accept", "sending", "receiving"}
+        return screen_share_active_states()
 
     def _screen_share_status_text(
         self,
@@ -4663,47 +4570,14 @@ class RUDPTransferRoot(BoxLayout):
         name = str(peer_label or "").strip() or self._current_screen_peer_label()
         profile_text = str(profile or "").strip() or self._current_screen_profile_name() or "-"
         port_text = str(port or "").strip() or self._current_screen_port_text() or "-"
-        detail = str(detail or "").strip()
-        key = str(key or "")
-        if self.lang == "zh":
-            if key == "idle":
-                return "空闲"
-            if key == "pending_offer":
-                return f"等待 {name} 接受投屏"
-            if key == "pending_accept":
-                return f"{name} 已接受，正在启动投屏"
-            if key == "sending":
-                return f"正在投屏给 {name}（profile: {profile_text}，port: {port_text}）"
-            if key == "receiving":
-                return f"正在观看 {name} 的屏幕（profile: {profile_text}，port: {port_text}）"
-            if key == "remote_rejected":
-                return f"{name} 拒绝投屏" + (f"：{detail}" if detail else "")
-            if key == "remote_stopped":
-                return f"{name} 已停止投屏"
-            if key == "startup_failed":
-                return "启动失败" + (f"：{detail}" if detail else "")
-            if key == "stop_failed":
-                return "停止失败" + (f"：{detail}" if detail else "")
-            return key + (f"：{detail}" if detail else "")
-        if key == "idle":
-            return "Idle"
-        if key == "pending_offer":
-            return f"Waiting for {name} to accept screen sharing"
-        if key == "pending_accept":
-            return f"{name} accepted, starting screen sharing"
-        if key == "sending":
-            return f"Sharing screen with {name} (profile: {profile_text}, port: {port_text})"
-        if key == "receiving":
-            return f"Watching {name}'s screen (profile: {profile_text}, port: {port_text})"
-        if key == "remote_rejected":
-            return f"{name} rejected screen sharing" + (f": {detail}" if detail else "")
-        if key == "remote_stopped":
-            return f"{name} stopped screen sharing"
-        if key == "startup_failed":
-            return "Start failed" + (f": {detail}" if detail else "")
-        if key == "stop_failed":
-            return "Stop failed" + (f": {detail}" if detail else "")
-        return key + (f": {detail}" if detail else "")
+        return screen_share_status_text(
+            key,
+            detail,
+            lang=self.lang,
+            peer_label=name,
+            profile=profile_text,
+            port=port_text,
+        )
 
     def _screen_share_button_active(self) -> bool:
         ui_state = str(getattr(self, "screen_share_ui_state", "idle") or "idle")
@@ -7499,7 +7373,7 @@ class RUDPTransferRoot(BoxLayout):
                         self.file_transfer_service.mark_failed(chat_message_id, peer_id=peer_id, direction='outgoing', error='file_send_failed')
             if delete_after_success and all_ok:
                 try:
-                    package_root = (user_data_dir() / "temp").resolve()
+                    package_root = temp_dir().resolve()
                     target = Path(path).resolve()
                     if package_root in target.parents and target.suffix.lower() == ".zip":
                         target.unlink(missing_ok=True)
@@ -7708,13 +7582,7 @@ class RUDPTransferRoot(BoxLayout):
             self.receiver_log_box.append(f"Failed to start firewall helper: {exc}\n")
 
     def _display_user_error(self, code: str, detail: str = "", target: str = "sender") -> None:
-        key = localized_error_key(code)
-        if key == "transfer_failed":
-            msg = self.t("transfer_failed", reason=(detail or code or self.t("unknown")))
-        else:
-            msg = self.t(key)
-            if detail:
-                msg = msg + "\n" + detail
+        msg = file_error_message(code, detail, lang=self.lang, translate=self.t, detail_separator="\n")
         if target == "receiver":
             self.receiver_log_box.append(msg + "\n")
         else:
@@ -8402,10 +8270,10 @@ class RUDPTransferRoot(BoxLayout):
             return True
 
         state_map = {
-            "started": self._file_accepted_text(),
-            "transferring": self.cu("receiving") if direction == "incoming" else self.cu("sending"),
-            "received": self._file_completed_text(),
-            "completed": self._file_completed_text(),
+            "started": transfer_status_label("started", direction=direction, lang=self.lang, translate=self.cu),
+            "transferring": transfer_status_label("transferring", direction=direction, lang=self.lang, translate=self.cu),
+            "received": transfer_status_label("received", direction=direction, lang=self.lang, translate=self.cu),
+            "completed": transfer_status_label("completed", direction=direction, lang=self.lang, translate=self.cu),
             "failed": self._file_failed_text(str(obj.get("error") or obj.get("reason") or "")),
         }
         latest = {
