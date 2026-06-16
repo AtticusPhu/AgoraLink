@@ -20,7 +20,6 @@ import subprocess
 import sys
 import threading
 import time
-import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -322,8 +321,9 @@ from screen_profile import (
     profile_id_from_info,
     profile_info,
 )
-from screen_runtime import ScreenRuntime
+from screen_runtime import ScreenRuntime, popen_no_console, run_no_console
 from diagnostic_export import export_diagnostic_bundle
+from file_packaging import package_files_to_zip
 from port_utils import find_available_udp_port, udp_port_status, udp_ports_status
 from chat_cards import (
     CARD_FILE_OFFER,
@@ -1005,7 +1005,7 @@ class WorkerProcess:
         )
         if IS_WINDOWS:
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        self.proc = subprocess.Popen(cmd, **kwargs)
+        self.proc = popen_no_console(cmd, **kwargs)
         self.reader_thread = threading.Thread(target=self._reader, daemon=True)
         self.reader_thread.start()
 
@@ -1187,7 +1187,10 @@ class MixedPickerRow(RecycleDataViewBehavior, BoxLayout):
         bind_label_wrap(self.preview_label)
         self.preview_box.add_widget(self.preview_img)
         self.preview_box.add_widget(self.preview_label)
-        self.name_btn = make_button("secondary", text="", halign="left")
+        self.name_btn = make_label(text="", halign="left", valign="middle", size_hint_x=1, color=THEME["text"])
+        self.name_btn.shorten = True
+        self.name_btn.shorten_from = "right"
+        self.name_btn.bind(width=lambda inst, _val: setattr(inst, "text_size", (max(1, inst.width - dp(12)), None)))
         self.size_label = make_label(text="", size_hint_x=None, width=dp(92), halign="right", valign="middle", color=THEME["muted_text"])
         self.type_label = make_label(text="", size_hint_x=None, width=dp(88), halign="left", valign="middle", color=THEME["muted_text"])
         self.modified_label = make_label(text="", size_hint_x=None, width=dp(138), halign="left", valign="middle", color=THEME["muted_text"])
@@ -1198,7 +1201,7 @@ class MixedPickerRow(RecycleDataViewBehavior, BoxLayout):
             bind_label_wrap(lab)
         self.preview_box.bind(pos=lambda *_: self._layout_preview(), size=lambda *_: self._layout_preview())
         self.select_btn.bind(on_release=lambda *_: self._toggle())
-        self.name_btn.bind(on_release=lambda *_: self._toggle())
+        self.name_btn.bind(on_touch_down=self._touch_name)
         self.open_btn.bind(on_release=lambda *_: self._open())
         self.preview_btn.bind(on_release=lambda *_: self._preview())
         self.add_widget(self.select_btn)
@@ -1231,8 +1234,10 @@ class MixedPickerRow(RecycleDataViewBehavior, BoxLayout):
         try:
             self.select_btn.text = "已选" if self.selected else "选择"
             style_button(self.select_btn, "primary" if self.selected else "secondary")
-            prefix = "" if self.display_name == ".." else ("[文件夹] " if self.is_dir else "")
-            self.name_btn.text = prefix + str(self.display_name or "")
+            raw_name = str(self.display_name or "")
+            prefix = "" if raw_name == ".." else ("[文件夹] " if self.is_dir else "")
+            self.name_btn.text = prefix + truncate_filename(raw_name, 72)
+            self.name_btn.text_size = (max(1, self.name_btn.width - dp(12)), None)
             self.type_label.text = str(self.type_text or ("文件夹" if self.is_dir else "文件"))
             self.size_label.text = str(self.size_text or "")
             self.modified_label.text = str(self.modified_text or "")
@@ -1271,6 +1276,15 @@ class MixedPickerRow(RecycleDataViewBehavior, BoxLayout):
         if callable(cb):
             cb(str(self.full_path or ""))
 
+    def _touch_name(self, _inst, touch):
+        try:
+            if self.name_btn.collide_point(*touch.pos):
+                self._toggle()
+                return True
+        except Exception:
+            pass
+        return False
+
     def _open(self):
         cb = self.on_open
         if callable(cb):
@@ -1291,6 +1305,7 @@ class ChatMessageBox(BoxLayout):
         self.inner.bind(minimum_height=self.inner.setter("height"))
         self.scroll.add_widget(self.inner)
         self.add_widget(self.scroll)
+        self.card_widgets: Dict[str, Dict[str, object]] = {}
 
     def _cu(self, key: str, **kwargs) -> str:
         owner = getattr(self, "root_owner", None)
@@ -1314,6 +1329,81 @@ class ChatMessageBox(BoxLayout):
 
     def clear(self) -> None:
         self.inner.clear_widgets()
+        self.card_widgets.clear()
+
+    def _card_body_text(self, status: str, detail: str) -> str:
+        return "  ".join([part for part in (status, detail) if part]) or status or detail or "-"
+
+    def _card_side(self, data: Dict[str, object]) -> str:
+        meta = dict((data or {}).get("meta") or {})
+        raw = str(
+            data.get("side")
+            or data.get("direction")
+            or meta.get("side")
+            or meta.get("direction")
+            or ""
+        ).strip().lower()
+        if raw in ("outgoing", "right", "mine", "sent"):
+            return "outgoing"
+        if raw in ("system", "center", "middle"):
+            return "system"
+        return "incoming"
+
+    def _populate_card_actions(self, action_row: BoxLayout, actions: List[Dict[str, object]], card_id: str) -> None:
+        action_row.clear_widgets()
+        owner = getattr(self, "root_owner", None)
+        for action in actions[:3]:
+            label = str(action.get("label") or "")
+            style = str(action.get("style") or "secondary")
+            action_id = str(action.get("action") or "")
+            btn = make_button(style, text=label, size_hint_y=None, height=dp(28))
+            btn.disabled = not bool(action_id)
+            if owner is not None and hasattr(owner, "handle_chat_card_action") and action_id:
+                btn.bind(on_release=lambda _btn, cid=card_id, aid=action_id: owner.handle_chat_card_action(cid, aid))
+            action_row.add_widget(btn)
+
+    def update_card(self, card: Dict[str, object]) -> None:
+        data = dict(card or {})
+        card_id = str(data.get("card_id") or "")
+        widgets = self.card_widgets.get(card_id)
+        if not card_id or not widgets:
+            self.add_card(data)
+            return
+        title = str(data.get("title") or "")
+        subtitle = str(data.get("subtitle") or "")
+        status = str(data.get("status") or "")
+        detail = str(data.get("detail") or "")
+        actions = [dict(item) for item in (data.get("actions") or []) if isinstance(item, dict)]
+        title_lab = widgets.get("title")
+        subtitle_lab = widgets.get("subtitle")
+        body_lab = widgets.get("body")
+        if title_lab is not None:
+            title_lab.text = shorten_middle(title or str(widgets.get("badge") or "INFO"), 44)
+        if subtitle_lab is not None:
+            subtitle_lab.text = shorten_middle(subtitle, 58)
+            subtitle_lab.opacity = 1.0 if subtitle else 0.0
+        if body_lab is not None:
+            body_lab.text = shorten_middle(self._card_body_text(status, detail), 76)
+        line = widgets.get("line")
+        card_box = widgets.get("card_box")
+        action_row = widgets.get("action_row")
+        has_actions = bool(actions)
+        if line is not None:
+            line.height = dp(132 if has_actions else 106)
+        if action_row is not None and card_box is not None:
+            if has_actions:
+                self._populate_card_actions(action_row, actions, card_id)
+                if getattr(action_row, "parent", None) is None:
+                    card_box.add_widget(action_row)
+            elif getattr(action_row, "parent", None) is not None:
+                card_box.remove_widget(action_row)
+
+    def remove_card(self, card_id: str) -> None:
+        cid = str(card_id or "")
+        widgets = self.card_widgets.pop(cid, None)
+        line = widgets.get("line") if widgets else None
+        if line is not None and getattr(line, "parent", None) is self.inner:
+            self.inner.remove_widget(line)
 
     def add_date_separator(self, label: str) -> None:
         line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(30), padding=(0, dp(4), 0, dp(4)))
@@ -1335,6 +1425,7 @@ class ChatMessageBox(BoxLayout):
         status = str(data.get("status") or "")
         detail = str(data.get("detail") or "")
         actions = [dict(item) for item in (data.get("actions") or []) if isinstance(item, dict)]
+        card_id = str(data.get("card_id") or "")
 
         if card_type == CARD_SYSTEM:
             text = detail or title or subtitle or status
@@ -1354,8 +1445,14 @@ class ChatMessageBox(BoxLayout):
 
         has_actions = bool(actions)
         height = 132 if has_actions else 106
+        side = self._card_side(data)
         line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(height), padding=(0, dp(5), 0, dp(5)))
-        line.add_widget(BoxLayout(size_hint_x=None, width=dp(8)))
+        if side == "outgoing":
+            line.add_widget(BoxLayout(size_hint_x=1))
+        elif side == "system":
+            line.add_widget(BoxLayout(size_hint_x=1))
+        else:
+            line.add_widget(BoxLayout(size_hint_x=None, width=dp(8)))
         card_box = BoxLayout(orientation="vertical", spacing=dp(5), padding=(dp(14), dp(10), dp(14), dp(10)), size_hint_x=None, width=dp(430))
         bg_style = "panel_bg" if card_type in (CARD_FILE_OFFER, CARD_FILE_TRANSFER) else "secondary"
         apply_card_background(card_box, bg_style, radius=12)
@@ -1373,31 +1470,37 @@ class ChatMessageBox(BoxLayout):
         title_lab.text_size = (dp(330), None)
         title_line.add_widget(title_lab)
         card_box.add_widget(title_line)
+        sub_lab = None
         if subtitle:
             sub_lab = make_label(text=shorten_middle(subtitle, 58), size_hint_y=None, height=dp(20), halign="left", valign="middle", color=THEME["muted_text"])
             sub_lab.text_size = (dp(392), None)
             card_box.add_widget(sub_lab)
-        body = "  ".join([part for part in (status, detail) if part])
-        body_lab = make_label(text=shorten_middle(body or status or detail or "-", 76), size_hint_y=None, height=dp(28), halign="left", valign="middle", color=THEME["text"])
+        body_lab = make_label(text=shorten_middle(self._card_body_text(status, detail), 76), size_hint_y=None, height=dp(28), halign="left", valign="middle", color=THEME["text"])
         body_lab.text_size = (dp(392), None)
         card_box.add_widget(body_lab)
+        action_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(28), spacing=dp(6))
         if has_actions:
-            owner = getattr(self, "root_owner", None)
-            action_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(28), spacing=dp(6))
-            for action in actions[:3]:
-                label = str(action.get("label") or "")
-                style = str(action.get("style") or "secondary")
-                action_id = str(action.get("action") or "")
-                btn = make_button(style, text=label, size_hint_y=None, height=dp(28))
-                if owner is not None and hasattr(owner, "handle_chat_card_action"):
-                    btn.bind(on_release=lambda _btn, cid=str(data.get("card_id") or ""), aid=action_id: owner.handle_chat_card_action(cid, aid))
-                else:
-                    btn.disabled = True
-                action_row.add_widget(btn)
+            self._populate_card_actions(action_row, actions, card_id)
             card_box.add_widget(action_row)
         line.add_widget(card_box)
-        line.add_widget(BoxLayout(size_hint_x=1))
+        if side == "outgoing":
+            line.add_widget(BoxLayout(size_hint_x=None, width=dp(8)))
+        elif side == "system":
+            line.add_widget(BoxLayout(size_hint_x=1))
+        else:
+            line.add_widget(BoxLayout(size_hint_x=1))
         self.inner.add_widget(line)
+        if card_id:
+            self.card_widgets[card_id] = {
+                "line": line,
+                "card_box": card_box,
+                "title": title_lab,
+                "subtitle": sub_lab,
+                "body": body_lab,
+                "action_row": action_row,
+                "badge": badge_text,
+                "side": side,
+            }
         self.scroll.scroll_y = 0
 
     def _status_state(self, summary: str, mine: bool) -> tuple[str, tuple]:
@@ -1665,6 +1768,8 @@ class RUDPTransferRoot(BoxLayout):
         self.chat_runtime_cards: List[Dict[str, object]] = []
         self.pending_transfer_requests: Dict[int, Dict[str, object]] = {}
         self.pending_transfer_popups: Dict[int, Popup] = {}
+        self.pending_transfer_decisions: Dict[int, str] = {}
+        self.file_packaging_busy = False
         self.live_message_cache: Dict[str, List[Dict[str, object]]] = {}
         self.debug_protocol_lines: List[str] = []
         self.debug_runtime_lines: List[str] = []
@@ -2570,7 +2675,7 @@ class RUDPTransferRoot(BoxLayout):
         cmd = ([sys.executable] + args) if FROZEN else ([sys.executable, str(Path(__file__).resolve())] + args)
         def _run():
             try:
-                proc = subprocess.run(cmd, cwd=str(APP_DIR), capture_output=True, text=True, timeout=20)
+                proc = run_no_console(cmd, cwd=str(APP_DIR), capture_output=True, text=True, timeout=20)
                 combined = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
                 if combined.strip():
                     Clock.schedule_once(lambda _dt, s=combined[-2000:]: self.sender_log_box.append(s + ("\n" if not s.endswith("\n") else "")), 0)
@@ -2752,6 +2857,39 @@ class RUDPTransferRoot(BoxLayout):
                     return False
         return False
 
+    def _runtime_file_card(self, message_id: str) -> Dict[str, object]:
+        card_id = f"file_transfer:{str(message_id or '').strip()}"
+        if not card_id.endswith(":"):
+            for card in self.chat_runtime_cards or []:
+                if str(card.get("card_id") or "") == card_id:
+                    return dict(card)
+        return {}
+
+    def _has_runtime_file_card(self, message_id: str) -> bool:
+        return bool(self._runtime_file_card(message_id))
+
+    def _file_card_direction(self, message_id: str = "", requested: str = "") -> str:
+        req = str(requested or "").strip().lower()
+        existing = self._runtime_file_card(message_id)
+        if existing:
+            meta = dict(existing.get("meta") or {})
+            old = str(existing.get("direction") or existing.get("side") or meta.get("direction") or meta.get("side") or "").strip().lower()
+            if old in ("incoming", "outgoing", "system"):
+                return old
+        mid = str(message_id or "").strip()
+        if mid and self.message_service is not None:
+            try:
+                msg = self.message_service.get_message(mid) or {}
+            except Exception:
+                msg = {}
+            sender = str(msg.get("sender_peer_id") or "").strip()
+            local = str(getattr(self, "chat_local_peer_id", "") or "").strip()
+            if sender and local:
+                return "outgoing" if sender == local else "incoming"
+        if req in ("outgoing", "incoming", "system"):
+            return req
+        return "incoming"
+
     def _add_runtime_chat_card(
         self,
         card: Dict[str, object],
@@ -2774,6 +2912,15 @@ class RUDPTransferRoot(BoxLayout):
         data["meta"] = meta
         card_type = str(data.get("card_type") or data.get("type") or CARD_SYSTEM)
         data["card_type"] = card_type
+        if card_type in (CARD_FILE_OFFER, CARD_FILE_TRANSFER):
+            direction = str(data.get("direction") or meta.get("direction") or "").strip().lower()
+            if direction not in ("incoming", "outgoing", "system"):
+                direction = self._file_card_direction(str(message_id or meta.get("message_id") or ""), direction)
+            data["direction"] = direction
+            data["side"] = direction
+            meta["direction"] = direction
+            meta["side"] = direction
+        should_update_widget = card_type not in (CARD_FILE_OFFER, CARD_FILE_TRANSFER)
         try:
             ts = float(data.get("timestamp") or 0.0)
         except Exception:
@@ -2788,12 +2935,43 @@ class RUDPTransferRoot(BoxLayout):
         if replace and card_id:
             for idx, old in enumerate(list(self.chat_runtime_cards)):
                 if str(old.get("card_id") or "") == card_id:
+                    old_meta = dict(old.get("meta") or {})
+                    old_direction = str(old.get("direction") or old.get("side") or old_meta.get("direction") or old_meta.get("side") or "").strip().lower()
+                    if card_type in (CARD_FILE_OFFER, CARD_FILE_TRANSFER) and old_direction in ("incoming", "outgoing", "system"):
+                        data["direction"] = old_direction
+                        data["side"] = old_direction
+                        meta["direction"] = old_direction
+                        meta["side"] = old_direction
+                        data["meta"] = meta
                     self.chat_runtime_cards[idx] = data
+                    if should_update_widget:
+                        self._update_runtime_chat_card_widget(data)
                     return data
         self.chat_runtime_cards.append(data)
         if len(self.chat_runtime_cards) > 160:
             self.chat_runtime_cards = self.chat_runtime_cards[-160:]
+        if should_update_widget:
+            self._update_runtime_chat_card_widget(data)
         return data
+
+    def _update_runtime_chat_card_widget(self, card: Dict[str, object]) -> None:
+        try:
+            data = dict(card or {})
+            if not self._chat_card_matches_current(data):
+                return
+            Clock.schedule_once(lambda _dt, item=data: self.main_messages_box.update_card(item), 0)
+        except Exception:
+            pass
+
+    def _remove_runtime_chat_card(self, card_id: str) -> None:
+        cid = str(card_id or "")
+        if not cid:
+            return
+        self.chat_runtime_cards = [card for card in self.chat_runtime_cards if str(card.get("card_id") or "") != cid]
+        try:
+            Clock.schedule_once(lambda _dt, item=cid: self.main_messages_box.remove_card(item), 0)
+        except Exception:
+            pass
 
     def _render_runtime_chat_cards(self) -> None:
         try:
@@ -2806,6 +2984,20 @@ class RUDPTransferRoot(BoxLayout):
         except Exception as exc:
             try:
                 self.sender_log_box.append(f"chat card render failed: {exc}\n")
+            except Exception:
+                pass
+
+    def _sync_runtime_chat_cards(self) -> None:
+        try:
+            cards = sorted(
+                [dict(card) for card in self.chat_runtime_cards if self._chat_card_matches_current(dict(card))],
+                key=lambda item: float(item.get("timestamp") or 0.0),
+            )
+            for card in cards:
+                self.main_messages_box.update_card(card)
+        except Exception as exc:
+            try:
+                self.sender_log_box.append(f"chat card update failed: {exc}\n")
             except Exception:
                 pass
 
@@ -2841,7 +3033,7 @@ class RUDPTransferRoot(BoxLayout):
                         path = text
         if not name and path:
             name = os.path.basename(path)
-        return name or "File", path, size
+        return name or ("未命名文件" if self.lang == "zh" else "Unnamed file"), path, size
 
     def _file_peer_label(self, peer_id: str = "", fallback: str = "") -> str:
         peer = str(peer_id or "").strip()
@@ -2854,6 +3046,15 @@ class RUDPTransferRoot(BoxLayout):
     def _file_card_title(self) -> str:
         return "文件传输" if self.lang == "zh" else "File transfer"
 
+    def _multi_file_card_title(self) -> str:
+        return "多个文件" if self.lang == "zh" else "Multiple files"
+
+    def _multi_file_summary(self, count: int) -> str:
+        return f"共 {int(count or 0)} 个文件，打包后发送" if self.lang == "zh" else f"{int(count or 0)} files, sent as one ZIP"
+
+    def _folder_not_supported_text(self) -> str:
+        return "不支持文件夹，请选择文件" if self.lang == "zh" else "Folders are not supported. Please select files."
+
     def _file_offer_title(self) -> str:
         return "文件邀请" if self.lang == "zh" else "File invitation"
 
@@ -2864,6 +3065,9 @@ class RUDPTransferRoot(BoxLayout):
     def _file_incoming_text(self, peer_label: str = "") -> str:
         name = str(peer_label or "").strip() or ("对方" if self.lang == "zh" else "remote")
         return f"来自 {name} 的文件邀请" if self.lang == "zh" else f"File invitation from {name}"
+
+    def _file_waiting_confirm_text(self) -> str:
+        return "等待确认" if self.lang == "zh" else "Waiting for confirmation"
 
     def _file_accepted_text(self) -> str:
         return "已接受，等待传输开始" if self.lang == "zh" else "Accepted, waiting for transfer to start"
@@ -2924,7 +3128,9 @@ class RUDPTransferRoot(BoxLayout):
         status: str = "Waiting",
         detail: str = "",
         actions: Optional[List[Dict[str, object]]] = None,
+        direction: str = "incoming",
     ) -> None:
+        direction = self._file_card_direction(message_id, direction)
         name, _path, size = self._file_card_info(
             message_id,
             fallback_name=file_name,
@@ -2941,8 +3147,11 @@ class RUDPTransferRoot(BoxLayout):
             subtitle=display_name,
             status=status,
             detail=detail_text,
+            direction=direction,
+            side=direction,
             actions=actions or [],
             card_id=f"file_transfer:{message_id or name}",
+            meta={"direction": direction, "side": direction},
         )
         self._add_runtime_chat_card(card, message_id=message_id, peer_id=peer_id, group_id=group_id, conversation_id=conversation_id)
 
@@ -2964,9 +3173,20 @@ class RUDPTransferRoot(BoxLayout):
         saved_path: str = "",
         detail: str = "",
         actions: Optional[List[Dict[str, object]]] = None,
+        package_count: int = 0,
     ) -> None:
+        direction = self._file_card_direction(message_id, direction)
         name, _path, size = self._file_card_info(message_id, fallback_size=total)
         display_name = truncate_filename(name, 48)
+        try:
+            ctx = dict(self.file_message_tasks.get(str(message_id or ""), {}) or {})
+            package_count = int(package_count or ctx.get("package_file_count") or 0)
+        except Exception:
+            package_count = int(package_count or 0)
+        title_text = self._file_card_title()
+        if package_count > 1:
+            title_text = self._multi_file_card_title()
+            display_name = self._multi_file_summary(package_count)
         total = int(total or size or 0)
         status_text = str(status or "").strip() or "Transferring"
         parts = []
@@ -2995,16 +3215,19 @@ class RUDPTransferRoot(BoxLayout):
         status_lower = str(status_text).lower()
         failed_prefix = str(self.cu("failed")).lower()
         failed_zh = "失败"
-        if direction != "incoming" and message_id and (status_lower in ("failed", failed_prefix) or status_lower.startswith(failed_prefix) or str(status_text).startswith(failed_zh)):
+        if direction == "outgoing" and message_id and (status_lower in ("failed", failed_prefix) or status_lower.startswith(failed_prefix) or str(status_text).startswith(failed_zh)):
             card_actions.append({"label": "继续传输" if self.lang == "zh" else "Resume", "action": f"retry_file:{message_id}", "style": "danger"})
         card = make_card(
             CARD_FILE_TRANSFER,
-            title=self._file_card_title(),
+            title=title_text,
             subtitle=display_name,
             status=status_text,
             detail="  ".join(parts) or ("Incoming" if direction == "incoming" else "Outgoing"),
+            direction=direction,
+            side=direction,
             actions=card_actions,
             card_id=f"file_transfer:{message_id}",
+            meta={"direction": direction, "side": direction},
         )
         self._add_runtime_chat_card(card, message_id=message_id, peer_id=peer_id, group_id=group_id, conversation_id=conversation_id)
 
@@ -3141,6 +3364,12 @@ class RUDPTransferRoot(BoxLayout):
         if conn <= 0:
             return
         req = dict(self.pending_transfer_requests.get(conn) or {})
+        if not req:
+            return
+        current_decision = str(self.pending_transfer_decisions.get(conn) or "pending")
+        if current_decision in ("accepted", "rejected"):
+            return
+        self.pending_transfer_decisions[conn] = "accepted" if accepted else "rejected"
         selected_policy = str(policy or self._default_transfer_policy(req) or "overwrite")
         if accepted and selected_policy == "cancel":
             accepted = False
@@ -3161,6 +3390,7 @@ class RUDPTransferRoot(BoxLayout):
             self.seen_request_files.discard(str(request_path))
             self.receiver_log_box.append(("Accepted" if accepted else "Rejected") + f" transfer request conn_id={conn}\n")
         except Exception as exc:
+            self.pending_transfer_decisions[conn] = "pending"
             self.receiver_log_box.append(f"Failed to write approval file: {exc}\n")
             return
 
@@ -3208,6 +3438,7 @@ class RUDPTransferRoot(BoxLayout):
             )
         self.pending_request_popups.discard(conn)
         self.pending_transfer_requests.pop(conn, None)
+        self.pending_transfer_decisions.pop(conn, None)
         pop = self.pending_transfer_popups.pop(conn, None)
         if pop is not None:
             try:
@@ -3228,11 +3459,19 @@ class RUDPTransferRoot(BoxLayout):
         peer_label = self._file_peer_label(peer_id, str(data.get("sender") or ""))
         if conn > 0:
             self.pending_transfer_requests[conn] = data
+            self.pending_transfer_decisions.setdefault(conn, "pending")
         detail_prefix = ""
         if bool(data.get("resume_available")):
             detail_prefix = self._file_resume_text(int(data.get("resume_offset") or 0))
         elif bool(data.get("conflict")):
             detail_prefix = "文件已存在" if self.lang == "zh" else "File exists"
+        decision = str(self.pending_transfer_decisions.get(conn) or "pending")
+        actions = []
+        if conn > 0 and decision == "pending":
+            actions = [
+                {"label": self.t("accept"), "action": f"file_accept:{conn}", "style": "success"},
+                {"label": self.t("reject"), "action": f"file_reject:{conn}", "style": "danger"},
+            ]
         self._add_file_offer_chat_card(
             message_id=mid,
             peer_id=peer_id,
@@ -3241,9 +3480,9 @@ class RUDPTransferRoot(BoxLayout):
             file_name=str(data.get("name") or ""),
             file_path=str(data.get("save_path") or ""),
             total_size=total,
-            status=self._file_incoming_text(peer_label),
+            status=self._file_waiting_confirm_text(),
             detail=self._file_size_detail(total, peer_label=peer_label, prefix=detail_prefix),
-            actions=[],
+            actions=actions,
         )
 
     def _latest_outgoing_file_message_id(self) -> str:
@@ -3533,6 +3772,10 @@ class RUDPTransferRoot(BoxLayout):
                     progress_text = self._file_progress_text(mid, total_size, summary) if body_type == 'file' else ''
                     if body_type == 'file':
                         file_cards.append((text, file_path, total_size, ts))
+                        if self._has_runtime_file_card(mid):
+                            if mid:
+                                seen_message_ids.add(mid)
+                            continue
                     sender_id = str(msg.get('sender_peer_id') or '')
                     compact = (sender_id == last_sender and (msg_created_ts - last_ts_for_grouping) <= 300 and body_type != 'file')
                     sender_name = self._display_name_for_peer(sender_id, members)
@@ -3560,6 +3803,8 @@ class RUDPTransferRoot(BoxLayout):
                         except Exception:
                             pass
                     progress_text = self._file_progress_text(mid, total_size, "") if body_type == "file" else ""
+                    if body_type == "file" and self._has_runtime_file_card(mid):
+                        continue
                     live_sender_id = str(live.get("sender_peer_id") or "")
                     self.main_messages_box.add_message(mine=False, sender=self._display_name_for_peer(live_sender_id, members), text=text_live, timestamp=ts, summary="", body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size, show_sender=True)
                 self._render_runtime_chat_cards()
@@ -3629,6 +3874,10 @@ class RUDPTransferRoot(BoxLayout):
                     progress_text = self._file_progress_text(mid, total_size, summary) if body_type == 'file' else ''
                     if body_type == 'file':
                         file_cards.append((text, file_path, total_size, ts))
+                        if self._has_runtime_file_card(mid):
+                            if mid:
+                                seen_message_ids.add(mid)
+                            continue
                     sender_id = str(msg.get('sender_peer_id') or '')
                     compact = (sender_id == last_sender and (msg_created_ts - last_ts_for_grouping) <= 300 and body_type != 'file')
                     if mid:
@@ -3657,6 +3906,8 @@ class RUDPTransferRoot(BoxLayout):
                         except Exception:
                             pass
                     progress_text = self._file_progress_text(mid, total_size, "") if body_type == "file" else ""
+                    if body_type == "file" and self._has_runtime_file_card(mid):
+                        continue
                     self.main_messages_box.add_message(mine=False, sender=str(live.get("sender_peer_id") or ""), text=text_live, timestamp=ts, summary="", body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size)
                 self._render_runtime_chat_cards()
                 contact_text = ""
@@ -5795,7 +6046,7 @@ class RUDPTransferRoot(BoxLayout):
                 ]
                 try:
                     cmd = ([sys.executable] + args) if FROZEN else ([sys.executable, str(Path(__file__).resolve())] + args)
-                    proc = subprocess.run(cmd, cwd=str(APP_DIR), capture_output=True, text=True, timeout=60)
+                    proc = run_no_console(cmd, cwd=str(APP_DIR), capture_output=True, text=True, timeout=60)
                     if proc.returncode == 0:
                         self.message_service.mark_delivered(str(msg["message_id"]), peer_id)
                         Clock.schedule_once(lambda _dt, pid=peer_id: self.chat_messages_box.append(f"Delivered to {pid}\n"), 0)
@@ -6081,7 +6332,7 @@ class RUDPTransferRoot(BoxLayout):
             "--final-ack-timeout", "20",
         ]
         cmd = ([sys.executable] + args) if FROZEN else ([sys.executable, str(Path(__file__).resolve())] + args)
-        proc = subprocess.run(cmd, cwd=str(APP_DIR), capture_output=True, text=True, timeout=60)
+        proc = run_no_console(cmd, cwd=str(APP_DIR), capture_output=True, text=True, timeout=60)
         combined = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
         if combined.strip():
             # Keep the subprocess log available in the debug sender log; this is
@@ -6267,7 +6518,7 @@ class RUDPTransferRoot(BoxLayout):
             except Exception:
                 pass
 
-            proc = subprocess.Popen(
+            proc = popen_no_console(
                 cmd,
                 cwd=str(APP_DIR),
                 stdout=subprocess.PIPE,
@@ -6781,34 +7032,28 @@ class RUDPTransferRoot(BoxLayout):
     def _handle_mixed_selected_paths(self, paths: List[str]) -> None:
         items = []
         seen = set()
+        has_folder = False
         for p in paths or []:
             sp = str(p or "")
             if not sp or not (os.path.isfile(sp) or os.path.isdir(sp)):
+                continue
+            if os.path.isdir(sp):
+                has_folder = True
                 continue
             key = os.path.normcase(os.path.abspath(sp))
             if key in seen:
                 continue
             seen.add(key)
             items.append(sp)
+        if has_folder:
+            self.main_messages_box.append(self._folder_not_supported_text() + "\n")
+            return
         if not items:
             return
         if len(items) == 1:
-            p = items[0]
-            if os.path.isdir(p):
-                self._package_paths_and_send([p], suggested_name=Path(p).name)
-            else:
-                self._send_file_path_to_current_chat(p)
+            self._send_file_path_to_current_chat(items[0])
             return
-
-        if bool(getattr(self, "auto_package_multi_selection", True)):
-            self._package_paths_and_send(items)
-            return
-
-        for p in items:
-            if os.path.isdir(p):
-                self._package_paths_and_send([p], suggested_name=Path(p).name)
-            else:
-                self._send_file_path_to_current_chat(p)
+        self._package_paths_and_send(items)
 
     def _native_multi_file_dialog(self, callback) -> None:
         """Open a native multi-file picker, with a Kivy fallback."""
@@ -6941,46 +7186,7 @@ class RUDPTransferRoot(BoxLayout):
         popup.open()
 
     def _handle_selected_folder_paths(self, paths: List[str]) -> None:
-        folders = []
-        seen = set()
-        for p in paths or []:
-            sp = str(p or "")
-            if not sp or not os.path.isdir(sp):
-                continue
-            key = os.path.normcase(os.path.abspath(sp))
-            if key in seen:
-                continue
-            seen.add(key)
-            folders.append(sp)
-        if not folders:
-            return
-        if len(folders) == 1:
-            self._package_paths_and_send(folders, suggested_name=Path(folders[0]).name)
-            return
-
-        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
-        content.add_widget(make_label(text=self.cu("multi_folder_send_mode", n=len(folders)), size_hint_y=None, height=dp(46), halign="left", valign="middle"))
-        btn_sep = make_button("secondary", text=self.cu("send_separately"), size_hint_y=None, height=dp(44))
-        btn_zip = make_button("primary", text=self.cu("package_send"), size_hint_y=None, height=dp(44))
-        btn_cancel = make_button("secondary", text=self.cu("cancel"), size_hint_y=None, height=dp(40))
-        content.add_widget(btn_zip)
-        content.add_widget(btn_sep)
-        content.add_widget(btn_cancel)
-        popup = Popup(title=self.cu("send_file"), content=content, size_hint=(None, None), size=(dp(460), dp(270)))
-
-        def _send_zip(*_):
-            popup.dismiss()
-            self._package_paths_and_send(folders)
-
-        def _send_sep(*_):
-            popup.dismiss()
-            for p in folders:
-                self._package_paths_and_send([p], suggested_name=Path(p).name)
-
-        btn_zip.bind(on_release=_send_zip)
-        btn_sep.bind(on_release=_send_sep)
-        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
-        popup.open()
+        self.main_messages_box.append(self._folder_not_supported_text() + "\n")
 
     def _handle_selected_file_paths(self, paths: List[str]) -> None:
         files = []
@@ -6999,115 +7205,92 @@ class RUDPTransferRoot(BoxLayout):
         if len(files) == 1:
             self._send_file_path_to_current_chat(files[0])
             return
-
-        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
-        content.add_widget(make_label(text=self.cu("multi_file_send_mode", n=len(files)), size_hint_y=None, height=dp(46), halign="left", valign="middle"))
-        btn_sep = make_button("secondary", text=self.cu("send_separately"), size_hint_y=None, height=dp(44))
-        btn_zip = make_button("primary", text=self.cu("package_send"), size_hint_y=None, height=dp(44))
-        btn_cancel = make_button("secondary", text=self.cu("cancel"), size_hint_y=None, height=dp(40))
-        content.add_widget(btn_zip)
-        content.add_widget(btn_sep)
-        content.add_widget(btn_cancel)
-        popup = Popup(title=self.cu("send_file"), content=content, size_hint=(None, None), size=(dp(460), dp(270)))
-
-        def _send_zip(*_):
-            popup.dismiss()
-            self._package_paths_and_send(files)
-
-        def _send_sep(*_):
-            popup.dismiss()
-            for p in files:
-                self._send_file_path_to_current_chat(p)
-
-        btn_zip.bind(on_release=_send_zip)
-        btn_sep.bind(on_release=_send_sep)
-        btn_cancel.bind(on_release=lambda *_: popup.dismiss())
-        popup.open()
-
-    def _safe_package_name(self, name: str) -> str:
-        raw = str(name or "").strip() or time.strftime("AgoraLink_%Y%m%d_%H%M%S")
-        raw = re.sub(r'[\\/:*?"<>|]+', "_", raw).strip(" ._") or "AgoraLink_package"
-        if not raw.lower().endswith(".zip"):
-            raw += ".zip"
-        return raw
-
-    def _unique_zip_arcname(self, used: set, arcname: str) -> str:
-        arc = str(arcname or "").replace("\\", "/").strip("/")
-        arc = arc or "item"
-        if arc not in used:
-            used.add(arc)
-            return arc
-        base, ext = os.path.splitext(arc)
-        idx = 2
-        while True:
-            candidate = f"{base}_{idx}{ext}"
-            if candidate not in used:
-                used.add(candidate)
-                return candidate
-            idx += 1
-
-    def _create_uncompressed_zip(self, paths: List[str], suggested_name: str = "") -> str:
-        package_dir = user_data_dir() / "temp_packages"
-        package_dir.mkdir(parents=True, exist_ok=True)
-        out_name = self._safe_package_name(suggested_name or time.strftime("AgoraLink_%Y%m%d_%H%M%S"))
-        out_path = package_dir / out_name
-        if out_path.exists():
-            stem, suffix = out_path.stem, out_path.suffix
-            idx = 2
-            while out_path.exists():
-                out_path = package_dir / f"{stem}_{idx}{suffix}"
-                idx += 1
-
-        used = set()
-        with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
-            for raw in paths or []:
-                p = Path(str(raw or "")).resolve()
-                if p.is_file():
-                    arc = self._unique_zip_arcname(used, p.name)
-                    zf.write(str(p), arc)
-                elif p.is_dir():
-                    root_name = self._safe_package_name(p.name).removesuffix(".zip")
-                    for dirpath, dirnames, filenames in os.walk(p, followlinks=False):
-                        dirnames[:] = [d for d in dirnames if not Path(dirpath, d).is_symlink()]
-                        rel_dir = Path(dirpath).resolve().relative_to(p)
-                        if not filenames and not dirnames:
-                            arc_dir = str(Path(root_name) / rel_dir).replace("\\", "/").strip("/") + "/"
-                            if arc_dir not in used:
-                                used.add(arc_dir)
-                                zf.writestr(arc_dir, b"")
-                        for fn in filenames:
-                            fp = Path(dirpath) / fn
-                            if fp.is_symlink() or not fp.is_file():
-                                continue
-                            rel = Path(root_name) / rel_dir / fn
-                            arc = self._unique_zip_arcname(used, str(rel).replace("\\", "/"))
-                            zf.write(str(fp), arc)
-        return str(out_path)
+        self._package_paths_and_send(files)
 
     def _package_paths_and_send(self, paths: List[str], suggested_name: str = "") -> None:
-        valid = [str(p) for p in (paths or []) if p and (os.path.isfile(str(p)) or os.path.isdir(str(p)))]
+        valid = [str(p) for p in (paths or []) if p and os.path.isfile(str(p))]
+        if any(p and os.path.isdir(str(p)) for p in (paths or [])):
+            self.main_messages_box.append(self._folder_not_supported_text() + "\n")
+            return
         if not valid:
             return
-        self.main_messages_box.append(self.cu("packaging_files", n=len(valid)) + "\n")
+        if self.file_packaging_busy:
+            self.main_messages_box.append(self.cu("packaging_files", n=len(valid)) + "\n")
+            return
+        self.file_packaging_busy = True
+        package_id = f"package:{int(time.time() * 1000)}"
+        card_id = f"file_transfer:{package_id}"
+        card = make_card(
+            CARD_FILE_TRANSFER,
+            title=self._multi_file_card_title(),
+            subtitle=self._multi_file_summary(len(valid)),
+            status=self.cu("packaging_files", n=len(valid)),
+            detail="",
+            direction="system",
+            side="system",
+            actions=[],
+            card_id=card_id,
+        )
+        self._add_runtime_chat_card(
+            card,
+            peer_id=self.current_peer_id,
+            group_id=self.current_group_id if self.current_chat_mode == "group" else "",
+        )
+        self._schedule_transfer_card_refresh(force=True)
 
         def _run_package():
-            try:
-                zip_path = self._create_uncompressed_zip(valid, suggested_name=suggested_name)
-                Clock.schedule_once(lambda _dt, zp=zip_path: (
-                    self.main_messages_box.append(self.cu("package_created", name=os.path.basename(zp)) + "\n"),
-                    self._send_file_path_to_current_chat(zp, delete_after_success=True)
-                ), 0)
-            except Exception as exc:
-                Clock.schedule_once(lambda _dt, e=str(exc): self.main_messages_box.append(self.cu("package_failed", error=e) + "\n"), 0)
+            result = package_files_to_zip(valid)
+
+            def _finish(_dt):
+                self.file_packaging_busy = False
+                if result.get("ok"):
+                    zip_path = str(result.get("zip_path") or "")
+                    count = int(result.get("file_count") or len(valid))
+                    self._remove_runtime_chat_card(card_id)
+                    ok = self._send_file_path_to_current_chat(
+                        zip_path,
+                        delete_after_success=True,
+                        package_file_count=count,
+                    )
+                    if not ok:
+                        fail_card = make_card(
+                            CARD_FILE_TRANSFER,
+                            title=self._multi_file_card_title(),
+                            subtitle=self._multi_file_summary(count),
+                            status=self.cu("package_failed", error="send failed"),
+                            detail=str(zip_path or ""),
+                            direction="system",
+                            side="system",
+                            actions=[],
+                            card_id=card_id,
+                        )
+                        self._add_runtime_chat_card(fail_card, peer_id=self.current_peer_id, group_id=self.current_group_id if self.current_chat_mode == "group" else "")
+                    return
+                error = str(result.get("error") or "unknown")
+                fail_card = make_card(
+                    CARD_FILE_TRANSFER,
+                    title=self._multi_file_card_title(),
+                    subtitle=self._multi_file_summary(len(valid)),
+                    status=self.cu("package_failed", error=error),
+                    detail=error,
+                    direction="system",
+                    side="system",
+                    actions=[],
+                    card_id=card_id,
+                )
+                self._add_runtime_chat_card(fail_card, peer_id=self.current_peer_id, group_id=self.current_group_id if self.current_chat_mode == "group" else "")
+                self._schedule_transfer_card_refresh(force=True)
+
+            Clock.schedule_once(_finish, 0)
 
         threading.Thread(target=_run_package, daemon=True).start()
 
-    def _send_file_path_to_current_chat(self, path: str, delete_after_success: bool = False) -> None:
+    def _send_file_path_to_current_chat(self, path: str, delete_after_success: bool = False, package_file_count: int = 0) -> bool:
         if not path or not os.path.isfile(path):
-            return
+            return False
         if self.message_service is None:
             self.main_messages_box.append("请先解锁聊天数据库。\n")
-            return
+            return False
         recipients = []
         msg = None
         if self.current_chat_mode == "direct" and self.current_peer_id:
@@ -7116,24 +7299,30 @@ class RUDPTransferRoot(BoxLayout):
                 recipients = [contact]
             except Exception as exc:
                 self.main_messages_box.append(f"文件消息创建失败: {exc}\n")
-                return
+                return False
         elif self.current_chat_mode == "group" and self.current_group_id:
             if not self._is_local_active_group_member(self.current_group_id):
                 self.main_messages_box.append("你已不在此群，不能发送文件。\n")
-                return
+                return False
             try:
                 msg, recipients = self.message_service.create_group_file(self.current_group_id, path)
             except Exception as exc:
                 self.main_messages_box.append(f"文件消息创建失败: {exc}\n")
-                return
+                return False
         if not recipients:
             self.main_messages_box.append("没有可发送文件的接收对象。\n")
-            return
-        self.render_current_chat()
-        self._start_file_transfer_for_message(msg=msg, recipients=recipients, path=path, delete_after_success=delete_after_success)
+            return False
+        self._start_file_transfer_for_message(
+            msg=msg,
+            recipients=recipients,
+            path=path,
+            delete_after_success=delete_after_success,
+            package_file_count=package_file_count,
+        )
+        return True
 
 
-    def _start_file_transfer_for_message(self, *, msg: Dict[str, object], recipients: List[Dict[str, object]], path: str, delete_after_success: bool = False) -> None:
+    def _start_file_transfer_for_message(self, *, msg: Dict[str, object], recipients: List[Dict[str, object]], path: str, delete_after_success: bool = False, package_file_count: int = 0) -> None:
         if self.message_service is None or not msg:
             return
         if not path or not os.path.isfile(path):
@@ -7161,6 +7350,7 @@ class RUDPTransferRoot(BoxLayout):
             pct=0.0,
             status=self._file_waiting_text(first_peer_label),
             detail=self._file_size_detail(file_total, peer_label=first_peer_label),
+            package_count=package_file_count,
         )
         self._schedule_transfer_card_refresh(force=True)
 
@@ -7184,6 +7374,8 @@ class RUDPTransferRoot(BoxLayout):
                 conversation_id=chat_conversation_id,
                 group_id=chat_group_id,
             )
+            if int(package_file_count or 0) > 1:
+                self.file_message_tasks.setdefault(chat_message_id, {})["package_file_count"] = int(package_file_count or 0)
         else:
             self.file_message_tasks[chat_message_id] = {
                 "message_id": chat_message_id,
@@ -7194,6 +7386,7 @@ class RUDPTransferRoot(BoxLayout):
                 "sender_peer_id": chat_sender_peer_id,
                 "created_at": created_at,
                 "total": file_total,
+                "package_file_count": int(package_file_count or 0),
             }
 
         def _mark_sent(pid: str) -> None:
@@ -7306,7 +7499,7 @@ class RUDPTransferRoot(BoxLayout):
                         self.file_transfer_service.mark_failed(chat_message_id, peer_id=peer_id, direction='outgoing', error='file_send_failed')
             if delete_after_success and all_ok:
                 try:
-                    package_root = (user_data_dir() / "temp_packages").resolve()
+                    package_root = (user_data_dir() / "temp").resolve()
                     target = Path(path).resolve()
                     if package_root in target.parents and target.suffix.lower() == ".zip":
                         target.unlink(missing_ok=True)
@@ -8133,8 +8326,7 @@ class RUDPTransferRoot(BoxLayout):
             try:
                 self._transfer_refresh_scheduled = False
                 self._last_transfer_card_refresh_ts = time.time()
-                self._chat_render_sig = None
-                self.render_current_chat()
+                self._sync_runtime_chat_cards()
             except Exception:
                 pass
 
@@ -8183,7 +8375,10 @@ class RUDPTransferRoot(BoxLayout):
             if source == "receiver":
                 self.current_receiving_file_message_id = mid
 
-        direction = str(obj.get("direction") or ("incoming" if source == "receiver" else "outgoing"))
+        direction = self._file_card_direction(
+            mid,
+            str(obj.get("direction") or ("incoming" if source == "receiver" else "outgoing")),
+        )
         peer_id = str(obj.get("peer_id") or "")
         transferred = int(obj.get("transferred_bytes") or obj.get("bytes_recv") or obj.get("bytes_sent") or 0)
         total = int(obj.get("total_bytes") or obj.get("size") or 0)
@@ -8286,6 +8481,8 @@ class RUDPTransferRoot(BoxLayout):
         if status in ("received", "completed", "failed"):
             if conn > 0:
                 self.pending_request_popups.discard(conn)
+                self.pending_transfer_requests.pop(conn, None)
+                self.pending_transfer_decisions.pop(conn, None)
                 pop = self.pending_transfer_popups.pop(conn, None)
                 if pop is not None:
                     try:
@@ -8338,6 +8535,16 @@ class RUDPTransferRoot(BoxLayout):
             except Exception as exc:
                 try:
                     self.receiver_log_box.append(f"Failed to parse CHAT_MESSAGE_JSON: {exc}\n")
+                except Exception:
+                    pass
+        if TRANSFER_REQUEST_LOG_PREFIX in text:
+            try:
+                payload = text.split(TRANSFER_REQUEST_LOG_PREFIX, 1)[1].strip()
+                req = json.loads(payload)
+                Clock.schedule_once(lambda _dt, data=req: self.show_transfer_request(data), 0)
+            except Exception as exc:
+                try:
+                    self.receiver_log_box.append(f"Failed to parse TRANSFER_REQUEST_JSON: {exc}\n")
                 except Exception:
                     pass
         # Do not parse "Chat from ..." as a message. That line is a human-readable
@@ -8396,6 +8603,8 @@ class RUDPTransferRoot(BoxLayout):
                             self.file_transfer_service.bind_saved_path(mid, saved_path)
                     self.receiving_file_message_by_conn.pop(conn, None)
                     self.pending_request_popups.discard(conn)
+                    self.pending_transfer_requests.pop(conn, None)
+                    self.pending_transfer_decisions.pop(conn, None)
                     pop = self.pending_transfer_popups.pop(conn, None)
                     if pop is not None:
                         try:
@@ -8438,83 +8647,18 @@ class RUDPTransferRoot(BoxLayout):
                         total_bytes=total,
                         status="offered",
                     )
-                Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+                self._schedule_transfer_card_refresh(force=True)
         except Exception:
             pass
-        if conn_id in self.pending_request_popups:
-            return
-        self.pending_request_popups.add(conn_id)
-        approval_dir = self.approval_dir
-        approval_dir.mkdir(parents=True, exist_ok=True)
-        request_path = approval_dir / f"{conn_id}.request.json"
-
-        message = self.t(
-            "incoming_request",
-            sender=str(req.get("sender") or ""),
-            name=str(req.get("name") or ""),
-            size=format_file_size(int(req.get("size") or 0)),
-            path=str(req.get("save_path") or ""),
-            sha256=str(req.get("sha256") or ""),
-        )
-        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
-        lbl = make_label(text=message, halign="left", valign="top")
-        bind_label_wrap(lbl)
-        content.add_widget(lbl)
-        policy_spinner = None
-        resume_available = bool(req.get("resume_available"))
-        if resume_available:
-            resume_offset = int(req.get("resume_offset") or 0)
-            total_size = int(req.get("size") or 0)
-            resume_pct = float(req.get("resume_pct") or ((resume_offset * 100.0 / max(total_size, 1)) if total_size > 0 else 0.0))
-            content.add_widget(make_label(
-                text=self.t("resume_detected", done=format_file_size(resume_offset), total=format_file_size(total_size), pct=resume_pct),
-                size_hint_y=None, height=dp(42), halign="left", valign="middle", color=THEME["muted_text"]
-            ))
-            policy_spinner = style_spinner(Spinner(
-                text=self.t("policy_resume"),
-                values=[self.t("policy_resume"), self.t("policy_overwrite"), self.t("policy_cancel")],
-                font_name=UI_FONT,
-                size_hint_y=None,
-                height=dp(38),
-            ))
-            content.add_widget(policy_spinner)
-        elif bool(req.get("conflict")):
-            content.add_widget(make_label(text=self.t("file_conflict"), size_hint_y=None, height=dp(28), halign="left", valign="middle", color=THEME["muted_text"]))
-            policy_spinner = style_spinner(Spinner(
-                text=self.t("policy_rename"),
-                values=[self.t("policy_rename"), self.t("policy_overwrite"), self.t("policy_cancel")],
-                font_name=UI_FONT,
-                size_hint_y=None,
-                height=dp(38),
-            ))
-            content.add_widget(policy_spinner)
-        buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
-        popup = style_popup(Popup(title=self.t("incoming_request_title"), title_font=UI_FONT, content=content, size_hint=(0.72, 0.60), auto_dismiss=False))
         if conn_id > 0:
-            self.pending_transfer_requests[conn_id] = dict(req)
-            self.pending_transfer_popups[conn_id] = popup
-
-        def _selected_policy() -> str:
-            if policy_spinner is None:
-                return "overwrite"
-            txt = str(policy_spinner.text or "")
-            if txt == self.t("policy_resume"):
-                return "resume"
-            if txt == self.t("policy_overwrite"):
-                return "overwrite"
-            if txt == self.t("policy_cancel"):
-                return "cancel"
-            return "rename"
-
-        def _decision(accepted: bool):
-            self._decide_transfer_request(conn_id, accepted, _selected_policy())
-
-        buttons.add_widget(make_button("success", text=self.t("accept"), on_release=lambda *_: _decision(True)))
-        buttons.add_widget(make_button("danger", text=self.t("reject"), on_release=lambda *_: _decision(False)))
-        content.add_widget(buttons)
-        apply_ui_font(content)
-        popup.bind(on_dismiss=lambda *_: (self.pending_request_popups.discard(conn_id), self.pending_transfer_popups.pop(conn_id, None)))
-        popup.open()
+            pop = self.pending_transfer_popups.pop(conn_id, None)
+            if pop is not None:
+                try:
+                    pop.dismiss()
+                except Exception:
+                    pass
+            self.pending_request_popups.discard(conn_id)
+        return
 
     def sender_exit(self, rc) -> None:
         self.sender_log_box.append(f"Process exited, rc={rc}\n")

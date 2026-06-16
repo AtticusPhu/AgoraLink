@@ -46,6 +46,8 @@ class ChatCard:
     subtitle: str = ""
     status: str = ""
     detail: str = ""
+    direction: str = ""
+    side: str = ""
     actions: List[Dict[str, object]] = field(default_factory=list)
     card_id: str = ""
     timestamp: float = 0.0
@@ -61,7 +63,9 @@ def _clean_text(value: object) -> str:
 
 def truncate_filename(name: object, max_chars: int = 48) -> str:
     """Return a UI-safe filename that preserves the extension when possible."""
-    text = _clean_text(name)
+    text = " ".join(_clean_text(name).split())
+    if not text:
+        text = "未命名文件"
     try:
         limit = max(8, int(max_chars or 48))
     except Exception:
@@ -69,10 +73,15 @@ def truncate_filename(name: object, max_chars: int = 48) -> str:
     if len(text) <= limit:
         return text
     dot = text.rfind(".")
-    if dot > 0 and len(text) - dot <= 12:
+    if dot > 0 and len(text) - dot <= 16:
+        stem = text[:dot]
         ext = text[dot:]
-        stem_limit = max(4, limit - len(ext) - 3)
-        return text[:stem_limit] + "..." + ext
+        stem_budget = max(8, limit - len(ext) - 3)
+        head = max(4, int(stem_budget * 0.6))
+        tail = max(4, stem_budget - head)
+        if head + tail < len(stem):
+            return stem[:head] + "..." + stem[-tail:] + ext
+        return text[: max(1, limit - 3)] + "..."
     head = max(4, (limit - 3) // 2)
     tail = max(4, limit - 3 - head)
     return text[:head] + "..." + text[-tail:]
@@ -101,6 +110,8 @@ def make_card(
     subtitle: object = "",
     status: object = "",
     detail: object = "",
+    direction: object = "",
+    side: object = "",
     actions: Optional[Iterable[object]] = None,
     card_id: object = "",
     timestamp: object = 0.0,
@@ -119,6 +130,8 @@ def make_card(
         subtitle=_clean_text(subtitle),
         status=_clean_text(status),
         detail=_clean_text(detail),
+        direction=_clean_text(direction),
+        side=_clean_text(side),
         actions=_clean_actions(actions),
         card_id=_clean_text(card_id),
         timestamp=ts,

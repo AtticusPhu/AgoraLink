@@ -34,6 +34,57 @@ FFMPEG_MISSING_MESSAGE = (
     f"安装命令：{FFMPEG_INSTALL_HINT}"
 )
 
+def make_no_window_startupinfo() -> Optional[subprocess.STARTUPINFO]:
+    """Build Windows startupinfo that hides console windows only."""
+    if os.name != "nt":
+        return None
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    return startupinfo
+
+
+def get_no_window_creationflags() -> int:
+    if os.name != "nt":
+        return 0
+    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+
+
+def _apply_no_window_kwargs(kwargs: Dict[str, object]) -> Dict[str, object]:
+    if os.name != "nt":
+        return kwargs
+    fixed = dict(kwargs)
+    fixed["creationflags"] = int(fixed.get("creationflags") or 0) | get_no_window_creationflags()
+    startupinfo = fixed.get("startupinfo") or make_no_window_startupinfo()
+    if startupinfo is not None:
+        try:
+            startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+            startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        except Exception:
+            pass
+        fixed["startupinfo"] = startupinfo
+    return fixed
+
+
+def popen_no_console(
+    cmd,
+    *args,
+    popen_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+    **kwargs,
+):
+    """Start a child process without creating a console window on Windows."""
+    return popen_factory(cmd, *args, **_apply_no_window_kwargs(kwargs))
+
+
+def run_no_console(
+    cmd,
+    *args,
+    run_factory: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    **kwargs,
+):
+    """Run a child process without creating a console window on Windows."""
+    return run_factory(cmd, *args, **_apply_no_window_kwargs(kwargs))
+
 
 class ScreenRuntime:
     def __init__(
@@ -51,6 +102,7 @@ class ScreenRuntime:
         self._tool_finder = tool_finder
         self.stop_timeout = float(stop_timeout)
         self._process: Optional[subprocess.Popen[bytes]] = None
+        self._process_log_file = None
         self._state = STATE_IDLE
         self.last_error = ""
         self.last_returncode: Optional[int] = None
@@ -87,7 +139,7 @@ class ScreenRuntime:
                 return self._set_error(self._missing_tool_error(["ffplay"]))
             cmd = self._build_receiver_command(port, ffplay_path=ffplay, peer_label=peer_label_text)
             self.last_command = list(cmd)
-            self._process = self._popen_factory(cmd, cwd=str(self.script_dir), stdin=subprocess.PIPE)
+            self._process = self._start_process_no_console(cmd, "ffplay")
         except Exception as exc:
             return self._set_error(str(exc))
 
@@ -129,7 +181,7 @@ class ScreenRuntime:
                 return self._set_error(self._missing_tool_error(["ffmpeg"]))
             cmd = self._build_sender_command(host=host, port=port, profile_name=profile, ffmpeg_path=ffmpeg)
             self.last_command = list(cmd)
-            self._process = self._popen_factory(cmd, cwd=str(self.script_dir), stdin=subprocess.PIPE)
+            self._process = self._start_process_no_console(cmd, "ffmpeg")
         except Exception as exc:
             return self._set_error(str(exc))
 
@@ -146,6 +198,7 @@ class ScreenRuntime:
     def stop(self) -> Dict[str, object]:
         if not self._has_running_process():
             self._process = None
+            self._close_process_log_file()
             self._state = STATE_IDLE
             self.last_error = ""
             self._clear_current_session()
@@ -162,6 +215,7 @@ class ScreenRuntime:
             return self._set_error(str(exc))
         finally:
             self._process = None
+            self._close_process_log_file()
 
         self._state = STATE_IDLE
         self.last_error = ""
@@ -175,6 +229,52 @@ class ScreenRuntime:
         self._refresh_process()
         return self._snapshot()
 
+    def _debug_log_dir(self) -> Path:
+        if os.name == "nt":
+            base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+            path = Path(base) / "AgoraLink" / "debug"
+        else:
+            path = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "AgoraLink" / "debug"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _open_process_log_file(self, tool_name: str):
+        if self._popen_factory is not subprocess.Popen:
+            return None
+        path = self._debug_log_dir() / f"screen_{str(tool_name or 'process')}.log"
+        return path.open("a", encoding="utf-8", errors="replace")
+
+    def _close_process_log_file(self) -> None:
+        handle = self._process_log_file
+        self._process_log_file = None
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+    def _start_process_no_console(self, cmd: List[str], tool_name: str) -> subprocess.Popen[bytes]:
+        self._close_process_log_file()
+        log_file = self._open_process_log_file(tool_name)
+        try:
+            proc = popen_no_console(
+                cmd,
+                cwd=str(self.script_dir),
+                stdin=subprocess.PIPE,
+                stdout=log_file if log_file is not None else subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                popen_factory=self._popen_factory,
+            )
+        except Exception:
+            if log_file is not None:
+                try:
+                    log_file.close()
+                except Exception:
+                    pass
+            raise
+        self._process_log_file = log_file
+        return proc
+
     def _has_running_process(self) -> bool:
         self._refresh_process()
         return self._process is not None and self._process.poll() is None
@@ -187,6 +287,7 @@ class ScreenRuntime:
             return
         self.last_returncode = int(returncode)
         self._process = None
+        self._close_process_log_file()
         if self._state == STATE_STOPPING or returncode == 0:
             self._state = STATE_IDLE
             self.last_error = ""
@@ -441,12 +542,13 @@ class ScreenRuntime:
             self._stop_portable_process(proc)
             return
         try:
-            completed = self._taskkill_runner(
+            completed = run_no_console(
                 ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 timeout=max(5.0, self.stop_timeout),
+                run_factory=self._taskkill_runner,
             )
             if int(getattr(completed, "returncode", 0) or 0) != 0:
                 stderr = str(getattr(completed, "stderr", "") or "").strip()
