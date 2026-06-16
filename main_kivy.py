@@ -333,6 +333,7 @@ from chat_cards import (
     CARD_SYSTEM,
     make_card,
     system_card,
+    truncate_filename,
 )
 
 SCREEN_CONTROL_TEXT_PREFIX = "__AGORALINK_SCREEN_CONTROL__:"
@@ -2930,12 +2931,16 @@ class RUDPTransferRoot(BoxLayout):
             fallback_path=file_path,
             fallback_size=total_size,
         )
+        display_name = truncate_filename(name, 48)
+        detail_text = detail or self._file_size_detail(size)
+        if display_name != name:
+            detail_text = (detail_text + "  " if detail_text else "") + f"name: {name}"
         card = make_card(
             CARD_FILE_OFFER,
             title=self._file_offer_title(),
-            subtitle=name,
+            subtitle=display_name,
             status=status,
-            detail=detail or self._file_size_detail(size),
+            detail=detail_text,
             actions=actions or [],
             card_id=f"file_transfer:{message_id or name}",
         )
@@ -2961,6 +2966,7 @@ class RUDPTransferRoot(BoxLayout):
         actions: Optional[List[Dict[str, object]]] = None,
     ) -> None:
         name, _path, size = self._file_card_info(message_id, fallback_size=total)
+        display_name = truncate_filename(name, 48)
         total = int(total or size or 0)
         status_text = str(status or "").strip() or "Transferring"
         parts = []
@@ -2979,6 +2985,10 @@ class RUDPTransferRoot(BoxLayout):
             parts.append(("保存路径: " if self.lang == "zh" else "Saved: ") + str(saved_path))
         if error:
             parts.append(str(error))
+        if not parts:
+            parts.append("Waiting")
+        if display_name != name:
+            parts.append(f"name: {name}")
         card_actions = list(actions or [])
         if saved_path:
             card_actions.append({"label": "打开所在文件夹" if self.lang == "zh" else "Open folder", "action": f"open_folder:{saved_path}", "style": "secondary"})
@@ -2990,7 +3000,7 @@ class RUDPTransferRoot(BoxLayout):
         card = make_card(
             CARD_FILE_TRANSFER,
             title=self._file_card_title(),
-            subtitle=name,
+            subtitle=display_name,
             status=status_text,
             detail="  ".join(parts) or ("Incoming" if direction == "incoming" else "Outgoing"),
             actions=card_actions,
@@ -3223,12 +3233,6 @@ class RUDPTransferRoot(BoxLayout):
             detail_prefix = self._file_resume_text(int(data.get("resume_offset") or 0))
         elif bool(data.get("conflict")):
             detail_prefix = "文件已存在" if self.lang == "zh" else "File exists"
-        actions = []
-        if conn > 0:
-            actions = [
-                {"label": "接受" if self.lang == "zh" else "Accept", "action": f"file_accept:{conn}", "style": "success"},
-                {"label": "拒绝" if self.lang == "zh" else "Reject", "action": f"file_reject:{conn}", "style": "danger"},
-            ]
         self._add_file_offer_chat_card(
             message_id=mid,
             peer_id=peer_id,
@@ -3239,7 +3243,7 @@ class RUDPTransferRoot(BoxLayout):
             total_size=total,
             status=self._file_incoming_text(peer_label),
             detail=self._file_size_detail(total, peer_label=peer_label, prefix=detail_prefix),
-            actions=actions,
+            actions=[],
         )
 
     def _latest_outgoing_file_message_id(self) -> str:
@@ -5033,7 +5037,6 @@ class RUDPTransferRoot(BoxLayout):
                     ],
                 )
                 self._set_screen_share_status(status_text)
-                self._show_screen_offer_popup(control)
             elif message_type == SCREEN_SHARE_ACCEPT:
                 self._handle_screen_accept(control)
             elif message_type == SCREEN_SHARE_REJECT:
@@ -8130,21 +8133,23 @@ class RUDPTransferRoot(BoxLayout):
             try:
                 self._transfer_refresh_scheduled = False
                 self._last_transfer_card_refresh_ts = time.time()
-                self._force_chat_refresh()
+                self._chat_render_sig = None
+                self.render_current_chat()
             except Exception:
                 pass
 
+        min_interval = 0.75
         if force:
             # This method is often called from worker threads. All Kivy widget
             # and canvas updates must be marshalled back to the main thread.
             self._transfer_refresh_scheduled = False
-            Clock.schedule_once(_refresh, 0)
+            Clock.schedule_once(_refresh, 0.05)
             return
 
         if self._transfer_refresh_scheduled:
             return
         now = time.time()
-        delay = max(0.0, 0.5 - (now - float(self._last_transfer_card_refresh_ts or 0.0)))
+        delay = max(0.0, min_interval - (now - float(self._last_transfer_card_refresh_ts or 0.0)))
         self._transfer_refresh_scheduled = True
         Clock.schedule_once(_refresh, delay)
 
@@ -8279,6 +8284,14 @@ class RUDPTransferRoot(BoxLayout):
                 self._append_debug_line(f"transfer saved-path bind failed: {exc}", protocol=True)
 
         if status in ("received", "completed", "failed"):
+            if conn > 0:
+                self.pending_request_popups.discard(conn)
+                pop = self.pending_transfer_popups.pop(conn, None)
+                if pop is not None:
+                    try:
+                        pop.dismiss()
+                    except Exception:
+                        pass
             self._schedule_transfer_card_refresh(force=True)
             self._schedule_force_chat_refresh(0.5)
         else:
@@ -8325,20 +8338,6 @@ class RUDPTransferRoot(BoxLayout):
             except Exception as exc:
                 try:
                     self.receiver_log_box.append(f"Failed to parse CHAT_MESSAGE_JSON: {exc}\n")
-                except Exception:
-                    pass
-        if TRANSFER_REQUEST_LOG_PREFIX in text:
-            try:
-                payload = text.split(TRANSFER_REQUEST_LOG_PREFIX, 1)[1].strip()
-                req = json.loads(payload)
-                try:
-                    self.seen_request_files.add(str(self.approval_dir / f"{int(req.get('conn_id') or 0)}.request.json"))
-                except Exception:
-                    pass
-                Clock.schedule_once(lambda _dt, data=req: self._handle_transfer_request_ui(data), 0)
-            except Exception as exc:
-                try:
-                    self.receiver_log_box.append(f"Failed to parse TRANSFER_REQUEST_JSON: {exc}\n")
                 except Exception:
                     pass
         # Do not parse "Chat from ..." as a message. That line is a human-readable
@@ -8396,6 +8395,13 @@ class RUDPTransferRoot(BoxLayout):
                         if self.file_transfer_service is not None:
                             self.file_transfer_service.bind_saved_path(mid, saved_path)
                     self.receiving_file_message_by_conn.pop(conn, None)
+                    self.pending_request_popups.discard(conn)
+                    pop = self.pending_transfer_popups.pop(conn, None)
+                    if pop is not None:
+                        try:
+                            pop.dismiss()
+                        except Exception:
+                            pass
                     if self.current_receiving_file_message_id == mid:
                         self.current_receiving_file_message_id = ""
                     self._schedule_transfer_card_refresh(force=True)

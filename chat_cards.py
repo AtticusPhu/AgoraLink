@@ -59,6 +59,25 @@ def _clean_text(value: object) -> str:
     return str(value or "").strip()
 
 
+def truncate_filename(name: object, max_chars: int = 48) -> str:
+    """Return a UI-safe filename that preserves the extension when possible."""
+    text = _clean_text(name)
+    try:
+        limit = max(8, int(max_chars or 48))
+    except Exception:
+        limit = 48
+    if len(text) <= limit:
+        return text
+    dot = text.rfind(".")
+    if dot > 0 and len(text) - dot <= 12:
+        ext = text[dot:]
+        stem_limit = max(4, limit - len(ext) - 3)
+        return text[:stem_limit] + "..." + ext
+    head = max(4, (limit - 3) // 2)
+    tail = max(4, limit - 3 - head)
+    return text[:head] + "..." + text[-tail:]
+
+
 def _clean_actions(actions: Optional[Iterable[object]]) -> List[Dict[str, object]]:
     result: List[Dict[str, object]] = []
     for item in actions or []:
