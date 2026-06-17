@@ -3154,6 +3154,15 @@ class RUDPTransferRoot(BoxLayout):
         data = dict(kwargs)
         Clock.schedule_once(lambda _dt, data=data: self._add_file_transfer_chat_card(**data), 0)
 
+    def _run_transfer_store_write(self, label: str, operation) -> None:
+        def _run() -> None:
+            try:
+                operation()
+            except Exception as exc:
+                self._append_debug_line(f"{label} failed: {exc}", protocol=True)
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _add_screen_chat_card(
         self,
         card_type: str,
@@ -3308,8 +3317,9 @@ class RUDPTransferRoot(BoxLayout):
         peer_id = str(req.get("chat_sender_peer_id") or req.get("sender_peer_id") or "")
         if mid:
             if self.file_transfer_service is not None:
-                try:
-                    self.file_transfer_service.upsert_incoming_task(
+                self._run_transfer_store_write(
+                    "transfer request status update",
+                    lambda mid=mid, peer_id=peer_id, total=total, req=dict(req), accepted=accepted, selected_policy=selected_policy: self.file_transfer_service.upsert_incoming_task(
                         chat_message_id=mid,
                         peer_id=peer_id,
                         conversation_id=str(req.get("chat_conversation_id") or ""),
@@ -3318,9 +3328,8 @@ class RUDPTransferRoot(BoxLayout):
                         remote_path=str(req.get("save_path") or ""),
                         total_bytes=total,
                         status="accepted" if accepted else "rejected",
-                    )
-                except Exception as exc:
-                    self._append_debug_line(f"transfer request status update failed: {exc}", protocol=True)
+                    ),
+                )
             if accepted:
                 status_text = self._file_accepted_text()
                 detail = self._file_size_detail(total, peer_label=self._file_peer_label(peer_id, str(req.get("sender") or "")))
@@ -4410,6 +4419,39 @@ class RUDPTransferRoot(BoxLayout):
                 pass
             return ""
 
+    def open_ui_preview(self) -> None:
+        script = APP_DIR / "ui_preview.py"
+        if not script.exists():
+            try:
+                self.sender_log_box.append(f"UI preview not found: {script}\n")
+            except Exception:
+                pass
+            return
+        executable = sys.executable
+        if IS_WINDOWS:
+            try:
+                pythonw = Path(sys.executable).with_name("pythonw.exe")
+                if pythonw.exists():
+                    executable = str(pythonw)
+            except Exception:
+                executable = sys.executable
+        env = os.environ.copy()
+        env["AGORALINK_UI_PREVIEW_HOLD"] = "1"
+        try:
+            subprocess.Popen(
+                [executable, "-B", str(script)],
+                cwd=str(APP_DIR),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        except Exception as exc:
+            try:
+                self.sender_log_box.append(f"UI preview failed: {exc}\n")
+            except Exception:
+                pass
+
     def _screen_runtime(self) -> ScreenRuntime:
         runtime = getattr(self.app, "screen_runtime", None)
         if runtime is None:
@@ -4502,7 +4544,17 @@ class RUDPTransferRoot(BoxLayout):
     def _format_udp_port_diagnostics(self, state: Optional[Dict[str, object]] = None) -> str:
         try:
             main = udp_port_status(MAIN_UDP_PORT)
-            main_status = "可用" if main.get("available") else "被占用"
+            receiver_running = False
+            try:
+                receiver_running = bool(getattr(self, "receiver_worker", None) and self.receiver_worker.is_running())
+            except Exception:
+                receiver_running = False
+            if main.get("available"):
+                main_status = "可用"
+            elif receiver_running:
+                main_status = "本机 AgoraLink 接收端正在使用"
+            else:
+                main_status = "已被占用，请关闭旧的 AgoraLink 或修改配置后重启"
             screen_statuses = udp_ports_status(SCREEN_PORT_CANDIDATES)
             occupied = [str(item.get("port")) for item in screen_statuses if not item.get("available")]
             occupied_text = ", ".join(occupied) if occupied else "无"
@@ -4720,13 +4772,25 @@ class RUDPTransferRoot(BoxLayout):
         try:
             deps = self._screen_runtime().check_dependencies()
             ffmpeg_path = str(deps.get("ffmpeg_path") or "")
-            profiles = get_advertised_profiles(ffmpeg_path=ffmpeg_path, runtime_seconds=0.75)
+            profiles = self._get_advertised_profiles_no_console(ffmpeg_path=ffmpeg_path, runtime_seconds=0.75)
             self.screen_share_advertised_profiles = [dict(item) for item in profiles]
             self.screen_share_advertised_profiles_ts = now
             return [dict(item) for item in profiles]
         except Exception as exc:
             self._append_debug_line(f"screen advertised profiles failed: {exc}", protocol=False)
             return [dict(item) for item in cached]
+
+    def _get_advertised_profiles_no_console(self, *, ffmpeg_path: str, runtime_seconds: float) -> List[Dict[str, object]]:
+        original_run = subprocess.run
+
+        def _run_without_console(args, *run_args, **kwargs):
+            return run_no_console(args, *run_args, run_factory=original_run, **kwargs)
+
+        subprocess.run = _run_without_console
+        try:
+            return get_advertised_profiles(ffmpeg_path=ffmpeg_path, runtime_seconds=runtime_seconds)
+        finally:
+            subprocess.run = original_run
 
     def _screen_preferred_profile(self) -> str:
         value = ""
@@ -5608,6 +5672,7 @@ class RUDPTransferRoot(BoxLayout):
             except Exception as exc:
                 log.append(f"\n诊断包导出失败: {exc}\n")
         buttons.add_widget(make_button("primary", text="导出诊断包", on_release=_export))
+        buttons.add_widget(make_button("secondary", text="UI Preview", on_release=lambda *_: self.open_ui_preview()))
         buttons.add_widget(make_button("secondary", text="关闭", on_release=lambda *_: popup.dismiss()))
         content.add_widget(buttons)
         apply_ui_font(content)
@@ -7160,108 +7225,141 @@ class RUDPTransferRoot(BoxLayout):
         threading.Thread(target=_run_package, daemon=True).start()
 
     def _send_file_path_to_current_chat(self, path: str, delete_after_success: bool = False, package_file_count: int = 0) -> bool:
-        if not path or not os.path.isfile(path):
+        path = str(path or "").strip()
+        if not path:
             return False
-        if self.message_service is None:
+        message_service = self.message_service
+        if message_service is None:
             self.main_messages_box.append("请先解锁聊天数据库。\n")
             return False
-        recipients = []
-        msg = None
-        if self.current_chat_mode == "direct" and self.current_peer_id:
-            try:
-                msg, contact = self.message_service.create_direct_file(self.current_peer_id, path)
-                recipients = [contact]
-            except Exception as exc:
-                self.main_messages_box.append(f"文件消息创建失败: {exc}\n")
-                return False
-        elif self.current_chat_mode == "group" and self.current_group_id:
-            if not self._is_local_active_group_member(self.current_group_id):
-                self.main_messages_box.append("你已不在此群，不能发送文件。\n")
-                return False
-            try:
-                msg, recipients = self.message_service.create_group_file(self.current_group_id, path)
-            except Exception as exc:
-                self.main_messages_box.append(f"文件消息创建失败: {exc}\n")
-                return False
-        if not recipients:
+        chat_mode = str(self.current_chat_mode or "")
+        peer_id = str(self.current_peer_id or "")
+        group_id = str(self.current_group_id or "")
+        if chat_mode == "direct" and not peer_id:
             self.main_messages_box.append("没有可发送文件的接收对象。\n")
             return False
-        self._start_file_transfer_for_message(
-            msg=msg,
-            recipients=recipients,
-            path=path,
-            delete_after_success=delete_after_success,
-            package_file_count=package_file_count,
-        )
+        if chat_mode == "group" and not group_id:
+            self.main_messages_box.append("没有可发送文件的接收对象。\n")
+            return False
+        if chat_mode not in ("direct", "group"):
+            self.main_messages_box.append("没有可发送文件的接收对象。\n")
+            return False
+
+        package_count = int(package_file_count or 0)
+        prepare_card_id = f"file_prepare:{int(time.time() * 1000)}:{secrets.token_hex(3)}"
+        name = os.path.basename(path) or unnamed_file_text(self.lang)
+        title = self._multi_file_card_title() if package_count > 1 else self._file_card_title()
+        subtitle = self._multi_file_summary(package_count) if package_count > 1 else truncate_filename(name, 48)
+        preparing_text = "正在准备发送" if self.lang == "zh" else "Preparing to send"
+        prepare_state = {"pending": True}
+
+        def _show_prepare_card(_dt):
+            if not prepare_state.get("pending"):
+                return
+            card = make_card(
+                CARD_FILE_TRANSFER,
+                title=title,
+                subtitle=subtitle,
+                status=preparing_text,
+                detail=str(path),
+                direction="outgoing",
+                side="outgoing",
+                actions=[],
+                card_id=prepare_card_id,
+                meta={"direction": "outgoing", "side": "outgoing"},
+            )
+            self._add_runtime_chat_card(
+                card,
+                peer_id=peer_id,
+                group_id=group_id if chat_mode == "group" else "",
+            )
+            self._schedule_transfer_card_refresh(force=True)
+
+        def _show_prepare_failed(error: str):
+            prepare_state["pending"] = False
+            def _finish(_dt):
+                card = make_card(
+                    CARD_FILE_TRANSFER,
+                    title=title,
+                    subtitle=subtitle,
+                    status=self._file_failed_text(error),
+                    detail=f"{error}\n{path}",
+                    direction="outgoing",
+                    side="outgoing",
+                    actions=[],
+                    card_id=prepare_card_id,
+                    meta={"direction": "outgoing", "side": "outgoing"},
+                )
+                self._add_runtime_chat_card(
+                    card,
+                    peer_id=peer_id,
+                    group_id=group_id if chat_mode == "group" else "",
+                )
+                self._schedule_transfer_card_refresh(force=True)
+
+            Clock.schedule_once(_finish, 0)
+
+        Clock.schedule_once(_show_prepare_card, 0)
+
+        def _prepare_and_start() -> None:
+            try:
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(self.cu("retry_file_missing"))
+                msg = None
+                recipients: List[Dict[str, object]] = []
+                if chat_mode == "direct":
+                    msg, contact = message_service.create_direct_file(peer_id, path)
+                    recipients = [contact] if contact else []
+                elif chat_mode == "group":
+                    if not self._is_local_active_group_member(group_id):
+                        raise RuntimeError("not an active group member")
+                    msg, recipients = message_service.create_group_file(group_id, path)
+                if not recipients:
+                    raise RuntimeError("no file recipients")
+                prepare_state["pending"] = False
+                Clock.schedule_once(lambda _dt: self._remove_runtime_chat_card(prepare_card_id), 0)
+                self._start_file_transfer_for_message(
+                    msg=msg,
+                    recipients=recipients,
+                    path=path,
+                    delete_after_success=delete_after_success,
+                    package_file_count=package_count,
+                )
+            except Exception as exc:
+                error = str(exc or "file send preparation failed")
+                self._append_debug_line(f"file send preparation failed: {error}", protocol=True)
+                _show_prepare_failed(error)
+
+        threading.Thread(target=_prepare_and_start, daemon=True).start()
         return True
 
 
     def _start_file_transfer_for_message(self, *, msg: Dict[str, object], recipients: List[Dict[str, object]], path: str, delete_after_success: bool = False, package_file_count: int = 0) -> None:
         if self.message_service is None or not msg:
             return
-        if not path or not os.path.isfile(path):
-            try:
-                self.sender_log_box.append(self.cu("retry_file_missing") + "\n")
-            except Exception:
-                pass
-            return
+        path = str(path or "")
         chat_message_id = str(msg.get('message_id') or '')
         chat_conversation_id = str(msg.get('conversation_id') or '')
         chat_group_id = str(msg.get('group_id') or (self.current_group_id if self.current_chat_mode == 'group' else ''))
         chat_sender_peer_id = str(msg.get('sender_peer_id') or self.chat_local_peer_id or '')
         created_at = float(msg.get('created_at') or time.time())
-        file_total = os.path.getsize(path) if os.path.exists(path) else 0
         first_peer_id = str((recipients[0] or {}).get("peer_id") or "") if recipients else ""
         first_peer_label = self._file_peer_label(first_peer_id)
-        self._add_file_transfer_chat_card(
+        preparing_text = "正在准备发送" if self.lang == "zh" else "Preparing to send"
+        self._schedule_file_transfer_chat_card(
             message_id=chat_message_id,
             peer_id=first_peer_id,
             group_id=chat_group_id,
             conversation_id=chat_conversation_id,
             direction="outgoing",
             transferred=0,
-            total=file_total,
+            total=0,
             pct=0.0,
-            status=self._file_waiting_text(first_peer_label),
-            detail=self._file_size_detail(file_total, peer_label=first_peer_label),
+            status=preparing_text,
+            detail=self._file_size_detail(0, peer_label=first_peer_label, path=path),
             package_count=package_file_count,
         )
         self._schedule_transfer_card_refresh(force=True)
-
-        if self.file_transfer_service is not None:
-            self.file_transfer_service.remember_runtime_task(
-                self.file_message_tasks,
-                chat_message_id=chat_message_id,
-                path=path,
-                recipients=[dict(r) for r in recipients],
-                conversation_id=chat_conversation_id,
-                group_id=chat_group_id,
-                sender_peer_id=chat_sender_peer_id,
-                created_at=created_at,
-                total_bytes=file_total,
-            )
-            self.file_transfer_service.create_outgoing_tasks(
-                chat_message_id=chat_message_id,
-                recipients=recipients,
-                path=path,
-                total_bytes=file_total,
-                conversation_id=chat_conversation_id,
-                group_id=chat_group_id,
-            )
-            if int(package_file_count or 0) > 1:
-                self.file_message_tasks.setdefault(chat_message_id, {})["package_file_count"] = int(package_file_count or 0)
-        else:
-            self.file_message_tasks[chat_message_id] = {
-                "message_id": chat_message_id,
-                "path": path,
-                "recipients": [dict(r) for r in recipients],
-                "conversation_id": chat_conversation_id,
-                "group_id": chat_group_id,
-                "sender_peer_id": chat_sender_peer_id,
-                "created_at": created_at,
-                "total": file_total,
-                "package_file_count": int(package_file_count or 0),
-            }
 
         def _mark_sent(pid: str) -> None:
             try:
@@ -7285,6 +7383,80 @@ class RUDPTransferRoot(BoxLayout):
                 self._append_debug_line(f"file mark_failed failed: {exc}; original={err}", protocol=True)
 
         def _run():
+            try:
+                if not path or not os.path.isfile(path):
+                    raise FileNotFoundError(self.cu("retry_file_missing"))
+                file_total = os.path.getsize(path) if os.path.exists(path) else 0
+                self._schedule_file_transfer_chat_card(
+                    message_id=chat_message_id,
+                    peer_id=first_peer_id,
+                    group_id=chat_group_id,
+                    conversation_id=chat_conversation_id,
+                    direction="outgoing",
+                    transferred=0,
+                    total=file_total,
+                    pct=0.0,
+                    status=self._file_waiting_text(first_peer_label),
+                    detail=self._file_size_detail(file_total, peer_label=first_peer_label, path=path),
+                    package_count=package_file_count,
+                )
+                self._schedule_transfer_card_refresh(force=True)
+                if self.file_transfer_service is not None:
+                    self.file_transfer_service.remember_runtime_task(
+                        self.file_message_tasks,
+                        chat_message_id=chat_message_id,
+                        path=path,
+                        recipients=[dict(r) for r in recipients],
+                        conversation_id=chat_conversation_id,
+                        group_id=chat_group_id,
+                        sender_peer_id=chat_sender_peer_id,
+                        created_at=created_at,
+                        total_bytes=file_total,
+                    )
+                    self.file_transfer_service.create_outgoing_tasks(
+                        chat_message_id=chat_message_id,
+                        recipients=recipients,
+                        path=path,
+                        total_bytes=file_total,
+                        conversation_id=chat_conversation_id,
+                        group_id=chat_group_id,
+                    )
+                    if int(package_file_count or 0) > 1:
+                        self.file_message_tasks.setdefault(chat_message_id, {})["package_file_count"] = int(package_file_count or 0)
+                else:
+                    self.file_message_tasks[chat_message_id] = {
+                        "message_id": chat_message_id,
+                        "path": path,
+                        "recipients": [dict(r) for r in recipients],
+                        "conversation_id": chat_conversation_id,
+                        "group_id": chat_group_id,
+                        "sender_peer_id": chat_sender_peer_id,
+                        "created_at": created_at,
+                        "total": file_total,
+                        "package_file_count": int(package_file_count or 0),
+                    }
+            except Exception as exc:
+                error = str(exc or "file send preparation failed")
+                self._append_debug_line(f"file transfer preparation failed: {error}", protocol=True)
+                targets = recipients or [{"peer_id": first_peer_id}]
+                for r in targets:
+                    pid = str((r or {}).get("peer_id") or first_peer_id)
+                    self._schedule_file_transfer_chat_card(
+                        message_id=chat_message_id,
+                        peer_id=pid,
+                        group_id=chat_group_id,
+                        conversation_id=chat_conversation_id,
+                        direction="outgoing",
+                        transferred=0,
+                        total=0,
+                        pct=0.0,
+                        status=self._file_failed_text(error),
+                        error=error,
+                        package_count=package_file_count,
+                    )
+                    Clock.schedule_once(lambda _dt, p=pid, e=error: (_mark_failed(p, e), self._force_chat_refresh()), 0)
+                Clock.schedule_once(lambda _dt, e=error: self.sender_log_box.append(f"file send failed: {e}\n"), 0)
+                return
             all_ok = True
             file_meta_text = json.dumps({"kind": "file", "name": os.path.basename(path), "size": file_total, "chat_message_id": chat_message_id}, ensure_ascii=False, separators=(",", ":"))
             for r in recipients:
@@ -7900,8 +8072,9 @@ class RUDPTransferRoot(BoxLayout):
                     self.current_receiving_file_message_id = mid
                     self.file_message_progress[mid] = {"sent": 0, "total": total, "pct": 0.0, "avg": 0.0, "eta": "", "state": self.cu("waiting_receive")}
                     if self.file_transfer_service is not None:
-                        try:
-                            self.file_transfer_service.upsert_incoming_task(
+                        self._run_transfer_store_write(
+                            "incoming file task upsert",
+                            lambda mid=mid, obj=dict(obj), body_name=body_name, total=total: self.file_transfer_service.upsert_incoming_task(
                                 chat_message_id=mid,
                                 peer_id=str(obj.get("sender_peer_id") or ""),
                                 conversation_id=str(obj.get("conversation_id") or ""),
@@ -7909,9 +8082,8 @@ class RUDPTransferRoot(BoxLayout):
                                 file_name=body_name,
                                 total_bytes=total,
                                 status="queued",
-                            )
-                        except Exception:
-                            pass
+                            ),
+                        )
                     self._add_file_offer_chat_card(
                         message_id=mid,
                         peer_id=str(obj.get("sender_peer_id") or ""),
@@ -7954,7 +8126,10 @@ class RUDPTransferRoot(BoxLayout):
                     saved_path=saved_path,
                 )
                 if self.file_transfer_service is not None:
-                    self.file_transfer_service.bind_saved_path(mid, saved_path)
+                    self._run_transfer_store_write(
+                        "receiver saved-path bind",
+                        lambda mid=mid, saved_path=saved_path: self.file_transfer_service.bind_saved_path(mid, saved_path),
+                    )
             self.receiving_file_message_by_conn.pop(int(conn or 0), None)
             if self.current_receiving_file_message_id == mid:
                 self.current_receiving_file_message_id = ""
@@ -8008,14 +8183,17 @@ class RUDPTransferRoot(BoxLayout):
                         saved_path=saved_path,
                     )
                     if self.file_transfer_service is not None:
-                        self.file_transfer_service.update_progress(
-                            chat_message_id=mid,
-                            direction="incoming",
-                            transferred_bytes=total,
-                            total_bytes=total,
-                            pct=100.0,
-                            eta="0:00",
-                            status="received",
+                        self._run_transfer_store_write(
+                            "receiver complete progress update",
+                            lambda mid=mid, total=total: self.file_transfer_service.update_progress(
+                                chat_message_id=mid,
+                                direction="incoming",
+                                transferred_bytes=total,
+                                total_bytes=total,
+                                pct=100.0,
+                                eta="0:00",
+                                status="received",
+                            ),
                         )
             self.receiving_file_message_by_conn.clear()
             self.current_receiving_file_message_id = ""
@@ -8054,13 +8232,16 @@ class RUDPTransferRoot(BoxLayout):
                     "state": self.cu("waiting_receive"),
                 }
                 if self.file_transfer_service is not None:
-                    self.file_transfer_service.upsert_incoming_task(
-                        chat_message_id=mid,
-                        file_name=str(req.get("name") or ""),
-                        local_path=str(req.get("save_path") or ""),
-                        remote_path=str(req.get("save_path") or ""),
-                        total_bytes=total,
-                        status="offered",
+                    self._run_transfer_store_write(
+                        "transfer request task upsert",
+                        lambda mid=mid, req=dict(req), total=total: self.file_transfer_service.upsert_incoming_task(
+                            chat_message_id=mid,
+                            file_name=str(req.get("name") or ""),
+                            local_path=str(req.get("save_path") or ""),
+                            remote_path=str(req.get("save_path") or ""),
+                            total_bytes=total,
+                            status="offered",
+                        ),
                     )
                 self._schedule_force_chat_refresh(0.0, 0.15)
             self.show_transfer_request(req)
@@ -8318,8 +8499,9 @@ class RUDPTransferRoot(BoxLayout):
             status=status,
         )
         if persist and self.file_transfer_service is not None:
-            try:
-                self.file_transfer_service.update_progress(
+            self._run_transfer_store_write(
+                "transfer_store progress update",
+                lambda mid=mid, direction=direction, peer_id=peer_id, transferred=transferred, total=total, pct=pct, avg=avg, current=current, peak=peak, elapsed=elapsed, eta=eta, status=status, obj=dict(obj): self.file_transfer_service.update_progress(
                     chat_message_id=mid,
                     direction=direction,
                     peer_id=peer_id,
@@ -8333,16 +8515,18 @@ class RUDPTransferRoot(BoxLayout):
                     eta=eta,
                     status=status,
                     error=str(obj.get("error") or ""),
-                )
-            except Exception as exc:
-                self._append_debug_line(f"transfer_store update failed: {exc}", protocol=True)
+                ),
+            )
 
         saved_path = str(obj.get("save_path") or obj.get("local_path") or "")
         if saved_path and self.message_service is not None and status in ("received", "completed"):
             try:
                 self.message_service.bind_file_path(mid, saved_path)
                 if self.file_transfer_service is not None:
-                    self.file_transfer_service.bind_saved_path(mid, saved_path)
+                    self._run_transfer_store_write(
+                        "transfer_store saved-path bind",
+                        lambda mid=mid, saved_path=saved_path: self.file_transfer_service.bind_saved_path(mid, saved_path),
+                    )
             except Exception as exc:
                 self._append_debug_line(f"transfer saved-path bind failed: {exc}", protocol=True)
 
@@ -8468,7 +8652,10 @@ class RUDPTransferRoot(BoxLayout):
                             saved_path=saved_path,
                         )
                         if self.file_transfer_service is not None:
-                            self.file_transfer_service.bind_saved_path(mid, saved_path)
+                            self._run_transfer_store_write(
+                                "receiver log saved-path bind",
+                                lambda mid=mid, saved_path=saved_path: self.file_transfer_service.bind_saved_path(mid, saved_path),
+                            )
                     self.receiving_file_message_by_conn.pop(conn, None)
                     self.pending_request_popups.discard(conn)
                     self.pending_transfer_requests.pop(conn, None)
@@ -8508,12 +8695,15 @@ class RUDPTransferRoot(BoxLayout):
                 self.current_receiving_file_message_id = mid
                 self.file_message_progress.setdefault(mid, {"sent": 0, "total": total, "pct": 0.0, "avg": 0.0, "eta": "", "state": self.cu("waiting_receive")})
                 if self.file_transfer_service is not None:
-                    self.file_transfer_service.upsert_incoming_task(
-                        chat_message_id=mid,
-                        file_name=str(req.get("name") or ""),
-                        remote_path=str(req.get("save_path") or ""),
-                        total_bytes=total,
-                        status="offered",
+                    self._run_transfer_store_write(
+                        "transfer popup task upsert",
+                        lambda mid=mid, req=dict(req), total=total: self.file_transfer_service.upsert_incoming_task(
+                            chat_message_id=mid,
+                            file_name=str(req.get("name") or ""),
+                            remote_path=str(req.get("save_path") or ""),
+                            total_bytes=total,
+                            status="offered",
+                        ),
                     )
                 self._schedule_transfer_card_refresh(force=True)
         except Exception:
