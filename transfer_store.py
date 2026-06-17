@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -24,61 +25,97 @@ class TransferStore:
     def __init__(self, db_path: str):
         self.db_path = str(Path(db_path).expanduser().resolve())
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._configure_connection()
         self._init_schema()
 
-    def _init_schema(self) -> None:
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS file_transfers(
-                transfer_key TEXT PRIMARY KEY,
-                chat_message_id TEXT NOT NULL,
-                transfer_id TEXT,
-                file_id TEXT,
-                direction TEXT NOT NULL,
-                peer_id TEXT,
-                conversation_id TEXT,
-                group_id TEXT,
-                local_path TEXT,
-                remote_path TEXT,
-                file_name TEXT,
-                total_bytes INTEGER DEFAULT 0,
-                transferred_bytes INTEGER DEFAULT 0,
-                pct REAL DEFAULT 0,
-                avg_mbps REAL DEFAULT 0,
-                current_mbps REAL DEFAULT 0,
-                peak_mbps REAL DEFAULT 0,
-                elapsed_sec REAL DEFAULT 0,
-                eta TEXT,
-                status TEXT DEFAULT 'queued',
-                error TEXT,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                completed_at REAL
-            )
-            """
-        )
-        for col, ddl in {
-            "transfer_id": "ALTER TABLE file_transfers ADD COLUMN transfer_id TEXT",
-            "file_id": "ALTER TABLE file_transfers ADD COLUMN file_id TEXT",
-            "remote_path": "ALTER TABLE file_transfers ADD COLUMN remote_path TEXT",
-            "pct": "ALTER TABLE file_transfers ADD COLUMN pct REAL DEFAULT 0",
-            "avg_mbps": "ALTER TABLE file_transfers ADD COLUMN avg_mbps REAL DEFAULT 0",
-            "current_mbps": "ALTER TABLE file_transfers ADD COLUMN current_mbps REAL DEFAULT 0",
-            "peak_mbps": "ALTER TABLE file_transfers ADD COLUMN peak_mbps REAL DEFAULT 0",
-            "elapsed_sec": "ALTER TABLE file_transfers ADD COLUMN elapsed_sec REAL DEFAULT 0",
-            "eta": "ALTER TABLE file_transfers ADD COLUMN eta TEXT",
-            "error": "ALTER TABLE file_transfers ADD COLUMN error TEXT",
-            "completed_at": "ALTER TABLE file_transfers ADD COLUMN completed_at REAL",
-        }.items():
+    def _configure_connection(self) -> None:
+        with self._lock:
+            self.conn.execute("PRAGMA busy_timeout = 30000")
             try:
-                self.conn.execute(ddl)
+                self.conn.execute("PRAGMA journal_mode = WAL")
             except sqlite3.OperationalError:
                 pass
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_file_transfers_message ON file_transfers(chat_message_id)")
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_file_transfers_updated ON file_transfers(updated_at)")
-        self.conn.commit()
+            self.conn.execute("PRAGMA synchronous = NORMAL")
+
+    @staticmethod
+    def _is_database_locked(exc: sqlite3.OperationalError) -> bool:
+        return "database is locked" in str(exc).lower()
+
+    def _with_locked_retry(self, operation):
+        backoffs = (0.1, 0.2, 0.4, 0.8, 1.6)
+        for attempt in range(len(backoffs) + 1):
+            try:
+                with self._lock:
+                    return operation()
+            except sqlite3.OperationalError as exc:
+                if not self._is_database_locked(exc) or attempt >= len(backoffs):
+                    raise
+                try:
+                    with self._lock:
+                        self.conn.rollback()
+                except Exception:
+                    pass
+                threading.Event().wait(backoffs[attempt])
+        return None
+
+    def _init_schema(self) -> None:
+        def _write_schema() -> None:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS file_transfers(
+                    transfer_key TEXT PRIMARY KEY,
+                    chat_message_id TEXT NOT NULL,
+                    transfer_id TEXT,
+                    file_id TEXT,
+                    direction TEXT NOT NULL,
+                    peer_id TEXT,
+                    conversation_id TEXT,
+                    group_id TEXT,
+                    local_path TEXT,
+                    remote_path TEXT,
+                    file_name TEXT,
+                    total_bytes INTEGER DEFAULT 0,
+                    transferred_bytes INTEGER DEFAULT 0,
+                    pct REAL DEFAULT 0,
+                    avg_mbps REAL DEFAULT 0,
+                    current_mbps REAL DEFAULT 0,
+                    peak_mbps REAL DEFAULT 0,
+                    elapsed_sec REAL DEFAULT 0,
+                    eta TEXT,
+                    status TEXT DEFAULT 'queued',
+                    error TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    completed_at REAL
+                )
+                """
+            )
+            for col, ddl in {
+                "transfer_id": "ALTER TABLE file_transfers ADD COLUMN transfer_id TEXT",
+                "file_id": "ALTER TABLE file_transfers ADD COLUMN file_id TEXT",
+                "remote_path": "ALTER TABLE file_transfers ADD COLUMN remote_path TEXT",
+                "pct": "ALTER TABLE file_transfers ADD COLUMN pct REAL DEFAULT 0",
+                "avg_mbps": "ALTER TABLE file_transfers ADD COLUMN avg_mbps REAL DEFAULT 0",
+                "current_mbps": "ALTER TABLE file_transfers ADD COLUMN current_mbps REAL DEFAULT 0",
+                "peak_mbps": "ALTER TABLE file_transfers ADD COLUMN peak_mbps REAL DEFAULT 0",
+                "elapsed_sec": "ALTER TABLE file_transfers ADD COLUMN elapsed_sec REAL DEFAULT 0",
+                "eta": "ALTER TABLE file_transfers ADD COLUMN eta TEXT",
+                "error": "ALTER TABLE file_transfers ADD COLUMN error TEXT",
+                "completed_at": "ALTER TABLE file_transfers ADD COLUMN completed_at REAL",
+            }.items():
+                try:
+                    self.conn.execute(ddl)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_file_transfers_message ON file_transfers(chat_message_id)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_file_transfers_updated ON file_transfers(updated_at)")
+            self.conn.commit()
+
+        self._with_locked_retry(_write_schema)
 
     @staticmethod
     def make_key(chat_message_id: str, direction: str, peer_id: str = "") -> str:
@@ -112,34 +149,37 @@ class TransferStore:
         now = _now()
         if not file_name:
             file_name = os.path.basename(str(local_path or remote_path or ""))
-        self.conn.execute(
-            """
-            INSERT INTO file_transfers(
-                transfer_key, chat_message_id, transfer_id, file_id, direction, peer_id,
-                conversation_id, group_id, local_path, remote_path, file_name,
-                total_bytes, transferred_bytes, pct, avg_mbps, current_mbps, peak_mbps, elapsed_sec, eta, status, error,
-                created_at, updated_at, completed_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(transfer_key) DO UPDATE SET
-                transfer_id=COALESCE(NULLIF(excluded.transfer_id,''), file_transfers.transfer_id),
-                file_id=COALESCE(NULLIF(excluded.file_id,''), file_transfers.file_id),
-                conversation_id=COALESCE(NULLIF(excluded.conversation_id,''), file_transfers.conversation_id),
-                group_id=COALESCE(NULLIF(excluded.group_id,''), file_transfers.group_id),
-                local_path=COALESCE(NULLIF(excluded.local_path,''), file_transfers.local_path),
-                remote_path=COALESCE(NULLIF(excluded.remote_path,''), file_transfers.remote_path),
-                file_name=COALESCE(NULLIF(excluded.file_name,''), file_transfers.file_name),
-                total_bytes=CASE WHEN excluded.total_bytes > 0 THEN excluded.total_bytes ELSE file_transfers.total_bytes END,
-                status=excluded.status,
-                updated_at=excluded.updated_at
-            """,
-            (
-                key, mid, transfer_id, file_id, direction, peer_id,
-                conversation_id or None, group_id or None, local_path or None, remote_path or None, file_name or None,
-                int(total_bytes or 0), 0, 0.0, 0.0, 0.0, 0.0, 0.0, "", status or "queued", None,
-                now, now, None,
-            ),
-        )
-        self.conn.commit()
+        def _write() -> None:
+            self.conn.execute(
+                """
+                INSERT INTO file_transfers(
+                    transfer_key, chat_message_id, transfer_id, file_id, direction, peer_id,
+                    conversation_id, group_id, local_path, remote_path, file_name,
+                    total_bytes, transferred_bytes, pct, avg_mbps, current_mbps, peak_mbps, elapsed_sec, eta, status, error,
+                    created_at, updated_at, completed_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(transfer_key) DO UPDATE SET
+                    transfer_id=COALESCE(NULLIF(excluded.transfer_id,''), file_transfers.transfer_id),
+                    file_id=COALESCE(NULLIF(excluded.file_id,''), file_transfers.file_id),
+                    conversation_id=COALESCE(NULLIF(excluded.conversation_id,''), file_transfers.conversation_id),
+                    group_id=COALESCE(NULLIF(excluded.group_id,''), file_transfers.group_id),
+                    local_path=COALESCE(NULLIF(excluded.local_path,''), file_transfers.local_path),
+                    remote_path=COALESCE(NULLIF(excluded.remote_path,''), file_transfers.remote_path),
+                    file_name=COALESCE(NULLIF(excluded.file_name,''), file_transfers.file_name),
+                    total_bytes=CASE WHEN excluded.total_bytes > 0 THEN excluded.total_bytes ELSE file_transfers.total_bytes END,
+                    status=excluded.status,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    key, mid, transfer_id, file_id, direction, peer_id,
+                    conversation_id or None, group_id or None, local_path or None, remote_path or None, file_name or None,
+                    int(total_bytes or 0), 0, 0.0, 0.0, 0.0, 0.0, 0.0, "", status or "queued", None,
+                    now, now, None,
+                ),
+            )
+            self.conn.commit()
+
+        self._with_locked_retry(_write)
         return key
 
     def update_progress(
@@ -171,50 +211,54 @@ class TransferStore:
             # Ensure a row exists even if the caller did not create it before.
             self.upsert_task(chat_message_id=mid, direction=direction, peer_id=peer_id, total_bytes=total_bytes, status=status)
         else:
-            rows = [str(r["transfer_key"]) for r in self.conn.execute("SELECT transfer_key FROM file_transfers WHERE chat_message_id=?", (mid,)).fetchall()]
+            with self._lock:
+                rows = [str(r["transfer_key"]) for r in self.conn.execute("SELECT transfer_key FROM file_transfers WHERE chat_message_id=?", (mid,)).fetchall()]
             if not rows:
                 key = self.upsert_task(chat_message_id=mid, direction="incoming", peer_id=peer_id, total_bytes=total_bytes, status=status)
                 rows = [key] if key else []
         now = _now()
         completed_at = now if status in ("completed", "received") else None
-        for key in rows:
-            self.conn.execute(
-                """
-                UPDATE file_transfers SET
-                    transferred_bytes=?,
-                    total_bytes=CASE WHEN ? > 0 THEN ? ELSE total_bytes END,
-                    pct=?,
-                    avg_mbps=?,
-                    current_mbps=?,
-                    peak_mbps=CASE WHEN ? > peak_mbps THEN ? ELSE peak_mbps END,
-                    elapsed_sec=CASE WHEN ? > 0 THEN ? ELSE elapsed_sec END,
-                    eta=?,
-                    status=?,
-                    error=?,
-                    updated_at=?,
-                    completed_at=COALESCE(?, completed_at)
-                WHERE transfer_key=?
-                """,
-                (
-                    int(transferred_bytes or 0),
-                    int(total_bytes or 0),
-                    int(total_bytes or 0),
-                    float(pct or 0.0),
-                    float(avg_mbps or 0.0),
-                    float(current_mbps or 0.0),
-                    float(peak_mbps or 0.0),
-                    float(peak_mbps or 0.0),
-                    float(elapsed_sec or 0.0),
-                    float(elapsed_sec or 0.0),
-                    str(eta or ""),
-                    str(status or "transferring"),
-                    str(error or "") or None,
-                    now,
-                    completed_at,
-                    key,
-                ),
-            )
-        self.conn.commit()
+        def _write() -> None:
+            for key in rows:
+                self.conn.execute(
+                    """
+                    UPDATE file_transfers SET
+                        transferred_bytes=?,
+                        total_bytes=CASE WHEN ? > 0 THEN ? ELSE total_bytes END,
+                        pct=?,
+                        avg_mbps=?,
+                        current_mbps=?,
+                        peak_mbps=CASE WHEN ? > peak_mbps THEN ? ELSE peak_mbps END,
+                        elapsed_sec=CASE WHEN ? > 0 THEN ? ELSE elapsed_sec END,
+                        eta=?,
+                        status=?,
+                        error=?,
+                        updated_at=?,
+                        completed_at=COALESCE(?, completed_at)
+                    WHERE transfer_key=?
+                    """,
+                    (
+                        int(transferred_bytes or 0),
+                        int(total_bytes or 0),
+                        int(total_bytes or 0),
+                        float(pct or 0.0),
+                        float(avg_mbps or 0.0),
+                        float(current_mbps or 0.0),
+                        float(peak_mbps or 0.0),
+                        float(peak_mbps or 0.0),
+                        float(elapsed_sec or 0.0),
+                        float(elapsed_sec or 0.0),
+                        str(eta or ""),
+                        str(status or "transferring"),
+                        str(error or "") or None,
+                        now,
+                        completed_at,
+                        key,
+                    ),
+                )
+            self.conn.commit()
+
+        self._with_locked_retry(_write)
 
     def bind_saved_path(self, chat_message_id: str, saved_path: str, peer_id: str = "") -> None:
         mid = str(chat_message_id or "").strip()
@@ -262,10 +306,11 @@ class TransferStore:
         )
 
     def get_rows(self, chat_message_id: str) -> List[Dict[str, object]]:
-        rows = self.conn.execute(
-            "SELECT * FROM file_transfers WHERE chat_message_id=? ORDER BY updated_at DESC",
-            (str(chat_message_id or ""),),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM file_transfers WHERE chat_message_id=? ORDER BY updated_at DESC",
+                (str(chat_message_id or ""),),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def get_progress(self, chat_message_id: str) -> Dict[str, object]:
@@ -329,4 +374,5 @@ class TransferStore:
         return base
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()

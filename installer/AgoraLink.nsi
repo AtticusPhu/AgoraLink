@@ -9,7 +9,7 @@
 !define FFPLAY_EXE "${ROOT}\dist\AgoraLink\_internal\tools\ffmpeg\bin\ffplay.exe"
 
 Name "${APP_NAME}"
-OutFile "AgoraLink_Setup_v0.0.5-screen-test-ffmpeg-bundled.exe"
+OutFile "AgoraLink_Setup_v0.0.6.exe"
 InstallDir "$LOCALAPPDATA\Programs\${APP_NAME}"
 InstallDirRegKey HKCU "Software\${APP_NAME}" "InstallDir"
 RequestExecutionLevel user
@@ -77,3 +77,4 @@ Section "Uninstall"
     DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"
     DeleteRegKey HKCU "Software\${APP_NAME}"
 SectionEnd
+

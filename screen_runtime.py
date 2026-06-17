@@ -14,11 +14,12 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from app_paths import debug_log_dir
-from process_utils import popen_no_console, run_no_console
+from process_utils import popen_ffplay_windowed, popen_no_console, run_no_console
 from screen_control import DEFAULT_SCREEN_PORT
 from screen_profile import PROFILES_BY_NAME, ScreenProfile, profile_id_from_info
 
@@ -62,6 +63,7 @@ class ScreenRuntime:
         self.current_port: Optional[int] = None
         self.current_profile: Optional[str] = None
         self.current_peer_label: Optional[str] = None
+        self._process_log_path: Optional[Path] = None
 
     def start_receiver(
         self,
@@ -101,6 +103,7 @@ class ScreenRuntime:
         self.current_port = port
         self.current_profile = profile_name or None
         self.current_peer_label = peer_label_text or None
+        self._schedule_startup_exit_check("ffplay", delay_sec=1.0)
         return self.get_state()
 
     def start_sender(
@@ -183,9 +186,11 @@ class ScreenRuntime:
         return debug_log_dir()
 
     def _open_process_log_file(self, tool_name: str):
+        self._process_log_path = None
         if self._popen_factory is not subprocess.Popen:
             return None
         path = self._debug_log_dir() / f"screen_{str(tool_name or 'process')}.log"
+        self._process_log_path = path
         return path.open("a", encoding="utf-8", errors="replace")
 
     def _close_process_log_file(self) -> None:
@@ -201,14 +206,17 @@ class ScreenRuntime:
         self._close_process_log_file()
         log_file = self._open_process_log_file(tool_name)
         try:
-            proc = popen_no_console(
-                cmd,
-                cwd=str(self.script_dir),
-                stdin=subprocess.PIPE,
-                stdout=log_file if log_file is not None else subprocess.DEVNULL,
-                stderr=subprocess.STDOUT,
-                popen_factory=self._popen_factory,
-            )
+            kwargs = {
+                "cwd": str(self.script_dir),
+                "stdin": subprocess.PIPE,
+                "stdout": log_file if log_file is not None else subprocess.DEVNULL,
+                "stderr": subprocess.STDOUT,
+                "popen_factory": self._popen_factory,
+            }
+            if str(tool_name or "").lower() == "ffplay":
+                proc = popen_ffplay_windowed(cmd, **kwargs)
+            else:
+                proc = popen_no_console(cmd, **kwargs)
         except Exception:
             if log_file is not None:
                 try:
@@ -218,6 +226,48 @@ class ScreenRuntime:
             raise
         self._process_log_file = log_file
         return proc
+
+    def _schedule_startup_exit_check(self, tool_name: str, delay_sec: float = 1.0) -> None:
+        proc = self._process
+        if proc is None:
+            return
+        timer = threading.Timer(max(0.0, float(delay_sec or 0.0)), lambda: self._handle_startup_exit_check(proc, tool_name))
+        timer.daemon = True
+        timer.start()
+
+    def _handle_startup_exit_check(self, proc: subprocess.Popen[bytes], tool_name: str) -> None:
+        if proc is None or proc is not self._process:
+            return
+        returncode = proc.poll()
+        if returncode is None:
+            return
+        self.last_returncode = int(returncode)
+        self._process = None
+        self._close_process_log_file()
+        mode = self.current_mode or str(tool_name or "screen")
+        tail = self._read_process_log_tail(tool_name)
+        self._state = STATE_ERROR
+        self.last_error = f"{mode} process exited with code {returncode}"
+        if tail:
+            self.last_error = self.last_error + "\n" + tail
+
+    def _read_process_log_tail(self, tool_name: str = "", max_chars: int = 4000) -> str:
+        path = self._process_log_path
+        if path is None:
+            candidate = self._debug_log_dir() / f"screen_{str(tool_name or 'process')}.log"
+            path = candidate if candidate.exists() else None
+        if path is None:
+            return ""
+        try:
+            max_bytes = max(512, int(max_chars or 4000) * 4)
+            size = path.stat().st_size
+            with path.open("rb") as f:
+                if size > max_bytes:
+                    f.seek(-max_bytes, os.SEEK_END)
+                raw = f.read(max_bytes)
+            return raw.decode("utf-8", errors="replace")[-int(max_chars or 4000):].strip()
+        except Exception:
+            return ""
 
     def _has_running_process(self) -> bool:
         self._refresh_process()
@@ -379,12 +429,7 @@ class ScreenRuntime:
             if found:
                 return found
 
-        for exe in exe_names:
-            found = shutil.which(exe)
-            if found:
-                return str(Path(found).resolve())
-
-        for base in self._source_ffmpeg_dirs():
+        for base in self._pyinstaller_internal_ffmpeg_dirs():
             found = self._find_tool_in_dir(base, exe_names)
             if found:
                 return found
@@ -394,15 +439,20 @@ class ScreenRuntime:
             if found:
                 return found
 
-        for base in self._pyinstaller_internal_ffmpeg_dirs():
-            found = self._find_tool_in_dir(base, exe_names)
-            if found:
-                return found
-
         for base in self._exe_sibling_ffmpeg_dirs():
             found = self._find_tool_in_dir(base, exe_names)
             if found:
                 return found
+
+        for base in self._source_ffmpeg_dirs():
+            found = self._find_tool_in_dir(base, exe_names)
+            if found:
+                return found
+
+        for exe in exe_names:
+            found = shutil.which(exe)
+            if found:
+                return str(Path(found).resolve())
 
         for base in self._winget_ffmpeg_dirs():
             found = self._find_tool_in_dir(base, exe_names)
@@ -590,6 +640,7 @@ class _FakeProcess:
 def _run_self_test() -> Dict[str, object]:
     commands: List[List[str]] = []
     cwd_values: List[Optional[str]] = []
+    popen_kwargs: List[Dict[str, object]] = []
     taskkill_commands: List[List[str]] = []
 
     expected_ffmpeg = str(Path("C:/AgoraLinkTools/ffmpeg/bin/ffmpeg.exe"))
@@ -605,6 +656,7 @@ def _run_self_test() -> Dict[str, object]:
     def fake_popen(cmd: List[str], cwd: Optional[str] = None, **kwargs) -> _FakeProcess:
         commands.append(list(cmd))
         cwd_values.append(cwd)
+        popen_kwargs.append(dict(kwargs))
         return _FakeProcess(cmd, cwd=cwd, **kwargs)
 
     def fake_taskkill(cmd: List[str], **_kwargs) -> subprocess.CompletedProcess[str]:
@@ -628,12 +680,15 @@ def _run_self_test() -> Dict[str, object]:
     def fast_exit_popen(cmd: List[str], cwd: Optional[str] = None, **kwargs) -> _FakeProcess:
         commands.append(list(cmd))
         cwd_values.append(cwd)
+        popen_kwargs.append(dict(kwargs))
         proc = _FakeProcess(cmd, cwd=cwd, **kwargs)
         proc.returncode = 7
         return proc
 
     fast_exit_runtime = ScreenRuntime(popen_factory=fast_exit_popen, taskkill_runner=fake_taskkill, tool_finder=fake_tool_finder)
     fast_exit_state = fast_exit_runtime.start_receiver()
+    fast_exit_runtime._handle_startup_exit_check(fast_exit_runtime._process, "ffplay")
+    fast_exit_state = fast_exit_runtime.get_state()
     missing_runtime = ScreenRuntime(popen_factory=fake_popen, taskkill_runner=fake_taskkill, tool_finder=lambda _name: "")
     missing_state = missing_runtime.start_sender("127.0.0.1")
     checks = [
@@ -663,6 +718,9 @@ def _run_self_test() -> Dict[str, object]:
         crashed_state["mode"] == STATE_SENDING,
         not runtime.is_running(),
         cwd_values[0] == expected_script_dir,
+        os.name != "nt" or "startupinfo" not in popen_kwargs[0],
+        os.name != "nt" or "creationflags" not in popen_kwargs[0],
+        os.name != "nt" or "startupinfo" in popen_kwargs[1],
         os.name != "nt" or (bool(taskkill_commands) and taskkill_commands[0][0] == "taskkill" and "/T" in taskkill_commands[0] and "/F" in taskkill_commands[0]),
         fast_exit_state["state"] == STATE_ERROR,
         fast_exit_state["returncode"] == 7,
