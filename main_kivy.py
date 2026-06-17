@@ -3097,10 +3097,12 @@ class RUDPTransferRoot(BoxLayout):
         data["meta"] = meta
         card_type = str(data.get("card_type") or data.get("type") or CARD_SYSTEM)
         data["card_type"] = card_type
-        if card_type in (CARD_FILE_OFFER, CARD_FILE_TRANSFER):
+        if card_type in (CARD_FILE_OFFER, CARD_FILE_TRANSFER, CARD_SCREEN_OFFER, CARD_SCREEN_STATE):
             direction = str(data.get("direction") or meta.get("direction") or "").strip().lower()
-            if direction not in ("incoming", "outgoing", "system"):
+            if card_type in (CARD_FILE_OFFER, CARD_FILE_TRANSFER) and direction not in ("incoming", "outgoing", "system"):
                 direction = self._file_card_direction(str(message_id or meta.get("message_id") or ""), direction)
+            elif card_type in (CARD_SCREEN_OFFER, CARD_SCREEN_STATE) and direction not in ("incoming", "outgoing", "system"):
+                direction = "incoming"
             data["direction"] = direction
             data["side"] = direction
             meta["direction"] = direction
@@ -3122,7 +3124,7 @@ class RUDPTransferRoot(BoxLayout):
                 if str(old.get("card_id") or "") == card_id:
                     old_meta = dict(old.get("meta") or {})
                     old_direction = str(old.get("direction") or old.get("side") or old_meta.get("direction") or old_meta.get("side") or "").strip().lower()
-                    if card_type in (CARD_FILE_OFFER, CARD_FILE_TRANSFER) and old_direction in ("incoming", "outgoing", "system"):
+                    if card_type in (CARD_FILE_OFFER, CARD_FILE_TRANSFER, CARD_SCREEN_OFFER, CARD_SCREEN_STATE) and old_direction in ("incoming", "outgoing", "system"):
                         data["direction"] = old_direction
                         data["side"] = old_direction
                         meta["direction"] = old_direction
@@ -3408,13 +3410,19 @@ class RUDPTransferRoot(BoxLayout):
         profile: str = "",
         port: object = "",
         actions: Optional[List[Dict[str, object]]] = None,
+        direction: str = "",
     ) -> None:
         sid = str(session_id or self.screen_share_session_id or "screen").strip()
+        card_direction = str(direction or "").strip().lower()
+        if card_direction not in ("incoming", "outgoing", "system"):
+            card_direction = "incoming"
         meta = {
             "session_id": sid,
             "profile": str(profile or "").strip(),
             "port": "" if port in (None, "") else str(port),
             "peer_label": str(subtitle or "").strip(),
+            "direction": card_direction,
+            "side": card_direction,
         }
         card = make_card(
             card_type,
@@ -3422,6 +3430,8 @@ class RUDPTransferRoot(BoxLayout):
             subtitle=subtitle,
             status=status,
             detail=detail,
+            direction=card_direction,
+            side=card_direction,
             actions=actions or [],
             card_id=f"screen_share:{sid}",
             meta=meta,
@@ -5221,6 +5231,7 @@ class RUDPTransferRoot(BoxLayout):
                             subtitle=peer_label,
                             status=status_text,
                             detail="invalid endpoint",
+                            direction="outgoing",
                         )
                         self.screen_share_session_id = ""
                         self.screen_share_peer_id = ""
@@ -5262,6 +5273,7 @@ class RUDPTransferRoot(BoxLayout):
                             subtitle=peer_label,
                             status=status_text,
                             detail="screen control send failed",
+                            direction="outgoing",
                         )
                         self.screen_share_session_id = ""
                         self.screen_share_peer_id = ""
@@ -5301,6 +5313,7 @@ class RUDPTransferRoot(BoxLayout):
                         subtitle=peer_label,
                         status=status_text,
                         detail=reason,
+                        direction="outgoing",
                     )
                 self._set_screen_share_ui_state("idle")
                 return
@@ -5342,6 +5355,7 @@ class RUDPTransferRoot(BoxLayout):
                     detail=self._screen_detail_text(preferred_profile, DEFAULT_SCREEN_PORT),
                     profile=preferred_profile,
                     port=DEFAULT_SCREEN_PORT,
+                    direction="outgoing",
                 )
             else:
                 status_text = self._screen_start_failed_text("screen control send failed")
@@ -5355,6 +5369,7 @@ class RUDPTransferRoot(BoxLayout):
                     detail=self._screen_detail_text(preferred_profile, DEFAULT_SCREEN_PORT),
                     profile=preferred_profile,
                     port=DEFAULT_SCREEN_PORT,
+                    direction="outgoing",
                 )
                 self.screen_share_session_id = ""
                 self.screen_share_peer_id = ""
@@ -5403,6 +5418,7 @@ class RUDPTransferRoot(BoxLayout):
                 detail=self._screen_detail_text(profile_name, port_text),
                 profile=profile_name,
                 port=port_text,
+                direction="outgoing",
             )
         self.screen_share_session_id = ""
         self.screen_share_peer_id = ""
