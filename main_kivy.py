@@ -319,6 +319,20 @@ from chat_cards import (
     make_card,
     system_card,
 )
+try:
+    from ui_components import (
+        FileTransferCard as UIFileTransferCard,
+        RoundedButton as UIRoundedButton,
+        ScreenShareCard as UIScreenShareCard,
+        StatusBadge as UIStatusBadge,
+        color as ui_component_color,
+    )
+except Exception:
+    UIFileTransferCard = None
+    UIRoundedButton = None
+    UIScreenShareCard = None
+    UIStatusBadge = None
+    ui_component_color = None
 
 SCREEN_CONTROL_TEXT_PREFIX = "__AGORALINK_SCREEN_CONTROL__:"
 MAIN_UDP_PORT = 9999
@@ -1340,11 +1354,224 @@ class ChatMessageBox(BoxLayout):
             label = str(action.get("label") or "")
             style = str(action.get("style") or "secondary")
             action_id = str(action.get("action") or "")
-            btn = make_button(style, text=label, size_hint_y=None, height=dp(28))
+            btn = self._make_card_action_button(style, label)
             btn.disabled = not bool(action_id)
             if owner is not None and hasattr(owner, "handle_chat_card_action") and action_id:
                 btn.bind(on_release=lambda _btn, cid=card_id, aid=action_id: owner.handle_chat_card_action(cid, aid))
             action_row.add_widget(btn)
+
+    def _make_card_action_button(self, style: str, label: str):
+        if UIRoundedButton is not None and ui_component_color is not None:
+            try:
+                style_name = str(style or "secondary").strip().lower()
+                kwargs = {
+                    "text": str(label or ""),
+                    "size_hint_y": None,
+                    "height": dp(28),
+                }
+                if style_name in ("primary", "accent", "success"):
+                    kwargs.update(
+                        bg_normal=ui_component_color("accent"),
+                        bg_hover=ui_component_color("accent_hover"),
+                        bg_down=ui_component_color("accent_hover"),
+                        text_normal=ui_component_color("white"),
+                        text_down=ui_component_color("white"),
+                        border_color=ui_component_color("accent"),
+                    )
+                elif style_name in ("danger", "destructive", "reject"):
+                    kwargs.update(
+                        bg_normal=ui_component_color("surface_muted"),
+                        bg_hover=ui_component_color("danger_soft"),
+                        bg_down=ui_component_color("danger_soft"),
+                        text_normal=ui_component_color("danger"),
+                        text_down=ui_component_color("danger"),
+                        border_color=ui_component_color("border"),
+                    )
+                return UIRoundedButton(**kwargs)
+            except Exception:
+                pass
+        return make_button(style, text=label, size_hint_y=None, height=dp(28))
+
+    def _modern_card_status_kind(self, status: str, detail: str) -> str:
+        text = f"{status} {detail}".lower()
+        if any(token in text for token in ("fail", "error", "reject", "denied", "失败", "拒绝")):
+            return "failed"
+        if any(token in text for token in ("complete", "completed", "saved", "success", "完成", "已完成")):
+            return "success"
+        if any(token in text for token in ("wait", "pending", "confirm", "queued", "等待", "确认")):
+            return "waiting"
+        if any(token in text for token in ("send", "transfer", "receive", "watch", "screen", "active", "start", "传输", "投屏", "观看", "启动")):
+            return "accent"
+        return "neutral"
+
+    def _modern_card_progress(self, data: Dict[str, object], status: str, detail: str) -> float:
+        meta = dict((data or {}).get("meta") or {})
+        for key in ("progress", "pct", "percent"):
+            try:
+                value = data.get(key, meta.get(key))
+                if value not in (None, ""):
+                    return max(0.0, min(100.0, float(value)))
+            except Exception:
+                pass
+        text = f"{status} {detail}"
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", text)
+        if match:
+            try:
+                return max(0.0, min(100.0, float(match.group(1))))
+            except Exception:
+                pass
+        if self._modern_card_status_kind(status, detail) == "success":
+            return 100.0
+        return 0.0
+
+    def _modern_card_action_callback(self, card_id: str):
+        owner = getattr(self, "root_owner", None)
+
+        def _dispatch(action_id: str) -> None:
+            if owner is not None and hasattr(owner, "handle_chat_card_action"):
+                owner.handle_chat_card_action(card_id, action_id)
+
+        return _dispatch
+
+    def _modern_card_available(self, card_type: str) -> bool:
+        if card_type in (CARD_FILE_OFFER, CARD_FILE_TRANSFER):
+            return UIFileTransferCard is not None
+        if card_type in (CARD_SCREEN_OFFER, CARD_SCREEN_STATE):
+            return UIScreenShareCard is not None
+        return False
+
+    def _create_modern_card_widget(
+        self,
+        data: Dict[str, object],
+        *,
+        card_type: str,
+        title: str,
+        subtitle: str,
+        status: str,
+        detail: str,
+        actions: List[Dict[str, object]],
+        card_id: str,
+    ):
+        kind = self._modern_card_status_kind(status, detail)
+        callback = self._modern_card_action_callback(card_id)
+        if card_type in (CARD_FILE_OFFER, CARD_FILE_TRANSFER):
+            return UIFileTransferCard(
+                title=title or "File",
+                filename=subtitle or title or "File",
+                detail=detail or self._card_body_text(status, detail),
+                status_text=status or "-",
+                status=kind,
+                progress=self._modern_card_progress(data, status, detail),
+                actions=actions,
+                on_action=callback,
+                size_hint_x=None,
+                width=dp(430),
+            )
+        return UIScreenShareCard(
+            title=title or "Screen",
+            peer=subtitle or "",
+            detail=detail or self._card_body_text(status, detail),
+            status_text=status or "-",
+            status=kind,
+            actions=actions,
+            on_action=callback,
+            size_hint_x=None,
+            width=dp(430),
+        )
+
+    def _sync_modern_line_height(self, line, card_widget) -> None:
+        try:
+            line.height = max(dp(94), float(card_widget.height or card_widget.minimum_height or dp(84)) + dp(10))
+        except Exception:
+            line.height = dp(116)
+
+    def _add_modern_card(self, data: Dict[str, object]) -> bool:
+        card_type = str(data.get("card_type") or data.get("type") or CARD_SYSTEM)
+        if not self._modern_card_available(card_type):
+            return False
+        title = str(data.get("title") or "")
+        subtitle = str(data.get("subtitle") or "")
+        status = str(data.get("status") or "")
+        detail = str(data.get("detail") or "")
+        actions = [dict(item) for item in (data.get("actions") or []) if isinstance(item, dict)]
+        card_id = str(data.get("card_id") or "")
+        try:
+            card_widget = self._create_modern_card_widget(
+                data,
+                card_type=card_type,
+                title=title,
+                subtitle=subtitle,
+                status=status,
+                detail=detail,
+                actions=actions,
+                card_id=card_id,
+            )
+            if float(card_widget.width or 0) <= 0 or float(card_widget.height or card_widget.minimum_height or 0) <= 0:
+                return False
+            side = self._card_side(data)
+            line = BoxLayout(orientation="horizontal", size_hint_y=None, padding=(0, dp(5), 0, dp(5)))
+            self._sync_modern_line_height(line, card_widget)
+            card_widget.bind(height=lambda inst, _value, row=line: self._sync_modern_line_height(row, inst))
+            if side in ("outgoing", "system"):
+                line.add_widget(BoxLayout(size_hint_x=1))
+            else:
+                line.add_widget(BoxLayout(size_hint_x=None, width=dp(8)))
+            line.add_widget(card_widget)
+            if side == "system":
+                line.add_widget(BoxLayout(size_hint_x=1))
+            elif side == "outgoing":
+                line.add_widget(BoxLayout(size_hint_x=None, width=dp(8)))
+            else:
+                line.add_widget(BoxLayout(size_hint_x=1))
+            self.inner.add_widget(line)
+            if card_id:
+                self.card_widgets[card_id] = {
+                    "line": line,
+                    "card_box": card_widget,
+                    "modern_card": card_widget,
+                    "side": side,
+                    "card_type": card_type,
+                }
+            self.scroll.scroll_y = 0
+            return True
+        except Exception:
+            return False
+
+    def _update_modern_card(self, widgets: Dict[str, object], data: Dict[str, object]) -> bool:
+        card_widget = widgets.get("modern_card")
+        if card_widget is None:
+            return False
+        card_type = str(data.get("card_type") or data.get("type") or CARD_SYSTEM)
+        title = str(data.get("title") or "")
+        subtitle = str(data.get("subtitle") or "")
+        status = str(data.get("status") or "")
+        detail = str(data.get("detail") or "")
+        actions = [dict(item) for item in (data.get("actions") or []) if isinstance(item, dict)]
+        card_id = str(data.get("card_id") or "")
+        try:
+            if card_type in (CARD_FILE_OFFER, CARD_FILE_TRANSFER) and UIFileTransferCard is not None:
+                card_widget.title = title or "File"
+                card_widget.filename = subtitle or title or "File"
+                card_widget.detail = detail or self._card_body_text(status, detail)
+                card_widget.status_text = status or "-"
+                card_widget.status = self._modern_card_status_kind(status, detail)
+                card_widget.progress = self._modern_card_progress(data, status, detail)
+            elif card_type in (CARD_SCREEN_OFFER, CARD_SCREEN_STATE) and UIScreenShareCard is not None:
+                card_widget.title = title or "Screen"
+                card_widget.peer = subtitle or ""
+                card_widget.detail = detail or self._card_body_text(status, detail)
+                card_widget.status_text = status or "-"
+                card_widget.status = self._modern_card_status_kind(status, detail)
+            else:
+                return False
+            if hasattr(card_widget, "set_actions"):
+                card_widget.set_actions(actions, on_action=self._modern_card_action_callback(card_id))
+            line = widgets.get("line")
+            if line is not None:
+                self._sync_modern_line_height(line, card_widget)
+            return True
+        except Exception:
+            return False
 
     def update_card(self, card: Dict[str, object]) -> None:
         data = dict(card or {})
@@ -1352,6 +1579,8 @@ class ChatMessageBox(BoxLayout):
         widgets = self.card_widgets.get(card_id)
         if not card_id or not widgets:
             self.add_card(data)
+            return
+        if self._update_modern_card(widgets, data):
             return
         title = str(data.get("title") or "")
         subtitle = str(data.get("subtitle") or "")
@@ -1425,6 +1654,9 @@ class ChatMessageBox(BoxLayout):
             line.add_widget(BoxLayout())
             self.inner.add_widget(line)
             self.scroll.scroll_y = 0
+            return
+
+        if self._add_modern_card(data):
             return
 
         has_actions = bool(actions)

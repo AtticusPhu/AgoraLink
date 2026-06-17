@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Mapping, Optional
 
 from kivy.animation import Animation
 from kivy.core.text import LabelBase
@@ -80,6 +80,106 @@ def _bind_single_line_label(label: Label, padding: float = 0) -> Label:
     label.bind(size=_sync)
     _sync(label)
     return label
+
+
+def _normalize_actions(actions: Optional[Iterable[object]]) -> List[Dict[str, object]]:
+    result: List[Dict[str, object]] = []
+    for item in actions or []:
+        if not isinstance(item, Mapping):
+            continue
+        label = str(item.get("label") or "").strip()
+        action = str(item.get("action") or "").strip()
+        if not label:
+            continue
+        result.append(
+            {
+                "label": label,
+                "action": action,
+                "style": str(item.get("style") or "secondary").strip().lower() or "secondary",
+            }
+        )
+    return result
+
+
+def _action_button_width(label: str) -> float:
+    try:
+        return dp(min(118, max(72, 28 + len(str(label or "")) * 8)))
+    except Exception:
+        return dp(86)
+
+
+def _button_style_kwargs(style: str) -> Dict[str, object]:
+    style_name = str(style or "secondary").strip().lower()
+    if style_name in ("primary", "accent", "success"):
+        return {
+            "bg_normal": color("accent"),
+            "bg_hover": color("accent_hover"),
+            "bg_down": color("accent_hover"),
+            "text_normal": color("white"),
+            "text_down": color("white"),
+            "border_color": color("accent"),
+        }
+    if style_name in ("danger", "destructive", "reject"):
+        return {
+            "bg_normal": color("surface_muted"),
+            "bg_hover": color("danger_soft"),
+            "bg_down": color("danger_soft"),
+            "text_normal": color("danger"),
+            "text_down": color("danger"),
+            "border_color": color("border"),
+        }
+    return {
+        "bg_normal": color("surface_muted"),
+        "bg_hover": color("accent_soft"),
+        "bg_down": color("accent_soft"),
+        "text_normal": color("text_primary"),
+        "text_down": color("text_primary"),
+        "border_color": color("border"),
+    }
+
+
+class _CardActionsMixin:
+    def _init_action_support(self, actions: Optional[Iterable[object]], on_action: Optional[Callable[[str], None]]) -> None:
+        self._actions: List[Dict[str, object]] = []
+        self._on_action = on_action
+        self.action_row = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(34))
+        self.set_actions(actions, on_action=on_action)
+
+    def set_actions(self, actions: Optional[Iterable[object]], on_action: Optional[Callable[[str], None]] = None) -> None:
+        if on_action is not None:
+            self._on_action = on_action
+        self._actions = _normalize_actions(actions)
+        self._sync_actions()
+
+    def _sync_actions(self) -> None:
+        self.action_row.clear_widgets()
+        if not self._actions:
+            if getattr(self.action_row, "parent", None) is self:
+                self.remove_widget(self.action_row)
+            self.height = self.minimum_height
+            return
+        for action in self._actions[:3]:
+            label = str(action.get("label") or "")
+            action_id = str(action.get("action") or "")
+            button = PillButton(
+                text=label,
+                size_hint_x=None,
+                width=_action_button_width(label),
+                disabled=not bool(action_id),
+                **_button_style_kwargs(str(action.get("style") or "secondary")),
+            )
+            if action_id:
+                button.bind(on_release=lambda _btn, aid=action_id: self._dispatch_action(aid))
+            self.action_row.add_widget(button)
+        self.action_row.add_widget(Widget(size_hint_x=1))
+        if getattr(self.action_row, "parent", None) is not self:
+            self.add_widget(self.action_row)
+        self.height = self.minimum_height
+
+    def _dispatch_action(self, action_id: str) -> None:
+        callback = getattr(self, "_on_action", None)
+        if callable(callback):
+            callback(str(action_id or ""))
 
 
 class _RoundedCanvasMixin:
@@ -369,7 +469,7 @@ class RoundedProgressBar(Widget):
             pass
 
 
-class FileTransferCard(RoundedCard):
+class FileTransferCard(_CardActionsMixin, RoundedCard):
     title = StringProperty("File transfer")
     filename = StringProperty("document.pdf")
     detail = StringProperty("")
@@ -378,6 +478,8 @@ class FileTransferCard(RoundedCard):
     progress = NumericProperty(0)
 
     def __init__(self, **kwargs):
+        actions = kwargs.pop("actions", None)
+        on_action = kwargs.pop("on_action", None)
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("padding", [dp(16), dp(14), dp(16), dp(14)])
         kwargs.setdefault("spacing", dp(8))
@@ -401,6 +503,7 @@ class FileTransferCard(RoundedCard):
         self.add_widget(self.progress_bar)
         self.bind(minimum_height=self.setter("height"))
         self.height = self.minimum_height
+        self._init_action_support(actions, on_action)
         self.bind(title=self._sync, filename=self._sync, detail=self._sync, status_text=self._sync, status=self._sync, progress=self._sync)
         self._sync()
 
@@ -413,7 +516,7 @@ class FileTransferCard(RoundedCard):
         self.progress_bar.value = float(self.progress or 0)
 
 
-class ScreenShareCard(RoundedCard):
+class ScreenShareCard(_CardActionsMixin, RoundedCard):
     title = StringProperty("Screen share")
     peer = StringProperty("Remote")
     detail = StringProperty("")
@@ -421,6 +524,8 @@ class ScreenShareCard(RoundedCard):
     status = StringProperty("accent")
 
     def __init__(self, **kwargs):
+        actions = kwargs.pop("actions", None)
+        on_action = kwargs.pop("on_action", None)
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("padding", [dp(16), dp(14), dp(16), dp(14)])
         kwargs.setdefault("spacing", dp(8))
@@ -437,16 +542,12 @@ class ScreenShareCard(RoundedCard):
         self.detail_label = Label(font_name=UI_FONT, font_size=sp(THEME.font_size["caption"]), color=color("text_secondary"), halign="left", valign="middle", shorten=True, shorten_from="right", size_hint_x=1, size_hint_y=None, height=dp(22))
         _bind_single_line_label(self.peer_label)
         _bind_single_line_label(self.detail_label)
-        action_row = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(34))
-        action_row.add_widget(PillButton(text="Accept", size_hint_x=None, width=dp(86), bg_normal=color("accent"), bg_hover=color("accent_hover"), text_normal=color("white"), text_down=color("white"), border_color=color("accent")))
-        action_row.add_widget(PillButton(text="Decline", size_hint_x=None, width=dp(86), bg_normal=color("surface_muted"), bg_hover=color("danger_soft"), text_normal=color("danger"), text_down=color("danger"), border_color=color("border")))
-        action_row.add_widget(Widget())
         self.add_widget(header)
         self.add_widget(self.peer_label)
         self.add_widget(self.detail_label)
-        self.add_widget(action_row)
         self.bind(minimum_height=self.setter("height"))
         self.height = self.minimum_height
+        self._init_action_support(actions, on_action)
         self.bind(title=self._sync, peer=self._sync, detail=self._sync, status_text=self._sync, status=self._sync)
         self._sync()
 
