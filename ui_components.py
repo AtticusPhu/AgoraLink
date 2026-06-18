@@ -398,6 +398,178 @@ class StatusBadge(Label):
             pass
 
 
+class ConversationItem(ButtonBehavior, RoundedCard):
+    title = StringProperty("")
+    preview = StringProperty("")
+    meta_text = StringProperty("")
+    status_text = StringProperty("")
+    badge_text = StringProperty("")
+    active = BooleanProperty(False)
+    hovered = BooleanProperty(False)
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("size_hint_y", None)
+        kwargs.setdefault("height", dp(62))
+        kwargs.setdefault("padding", [dp(12), dp(8), dp(12), dp(8)])
+        kwargs.setdefault("spacing", dp(3))
+        kwargs.setdefault("radius", THEME.radius["medium"])
+        kwargs.setdefault("bg_color", color("surface"))
+        kwargs.setdefault("border_color", color("border_soft"))
+        super().__init__(**kwargs)
+        self._disable_default_button_background()
+
+        top = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(24))
+        self.title_label = Label(
+            font_name=UI_FONT,
+            font_size=sp(THEME.font_size["body_strong"]),
+            bold=True,
+            color=color("text_primary"),
+            halign="left",
+            valign="middle",
+            shorten=True,
+            shorten_from="right",
+            size_hint_x=1,
+        )
+        self.meta_label = Label(
+            font_name=UI_FONT,
+            font_size=sp(THEME.font_size["caption"]),
+            color=color("text_muted"),
+            halign="right",
+            valign="middle",
+            shorten=True,
+            shorten_from="right",
+            size_hint_x=None,
+            width=dp(48),
+        )
+        _bind_single_line_label(self.title_label)
+        _bind_single_line_label(self.meta_label)
+        top.add_widget(self.title_label)
+        top.add_widget(self.meta_label)
+
+        bottom = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(20))
+        self.preview_label = Label(
+            font_name=UI_FONT,
+            font_size=sp(THEME.font_size["caption"]),
+            color=color("text_secondary"),
+            halign="left",
+            valign="middle",
+            shorten=True,
+            shorten_from="right",
+            size_hint_x=1,
+        )
+        self.status_label = Label(
+            font_name=UI_FONT,
+            font_size=sp(THEME.font_size["caption"]),
+            color=color("text_muted"),
+            halign="right",
+            valign="middle",
+            shorten=True,
+            shorten_from="right",
+            size_hint_x=None,
+            width=dp(48),
+        )
+        self.badge = StatusBadge(text="", status="accent", min_width=0, max_width=0, width=0)
+        _bind_single_line_label(self.preview_label)
+        _bind_single_line_label(self.status_label)
+        bottom.add_widget(self.preview_label)
+        bottom.add_widget(self.status_label)
+        bottom.add_widget(self.badge)
+
+        self.add_widget(top)
+        self.add_widget(bottom)
+        self.bind(
+            title=self._sync_text,
+            preview=self._sync_text,
+            meta_text=self._sync_text,
+            status_text=self._sync_text,
+            badge_text=self._sync_text,
+            active=self._sync_style,
+            hovered=self._sync_style,
+            state=lambda *_: self._sync_style(),
+        )
+        self.bind(size=lambda *_: self._sync_text_size())
+        Window.bind(mouse_pos=self._on_mouse_pos)
+        self.bind(parent=self._on_parent)
+        self._sync_text()
+        self._sync_style()
+
+    def _disable_default_button_background(self) -> None:
+        for name, value in (
+            ("background_normal", ""),
+            ("background_down", ""),
+            ("background_color", (0, 0, 0, 0)),
+        ):
+            try:
+                setattr(self, name, value)
+            except Exception:
+                pass
+
+    def _on_mouse_pos(self, _window, pos) -> None:
+        if not self.get_root_window():
+            return
+        self.hovered = self.collide_point(*pos)
+
+    def _on_parent(self, _instance, parent) -> None:
+        if parent is not None:
+            return
+        try:
+            Window.unbind(mouse_pos=self._on_mouse_pos)
+        except Exception:
+            pass
+
+    def _sync_text(self, *_args) -> None:
+        self.title_label.text = str(self.title or "")
+        self.preview_label.text = str(self.preview or "")
+        meta = str(self.meta_text or "").strip()
+        status = str(self.status_text or "").strip()
+        badge = str(self.badge_text or "").strip()
+        self.meta_label.text = meta
+        self.meta_label.opacity = 1.0 if meta else 0.0
+        self.meta_label.width = dp(48) if meta else 0
+        self.status_label.text = status
+        self.status_label.opacity = 1.0 if status else 0.0
+        self.status_label.width = dp(48) if status else 0
+        if badge:
+            self.badge.text = badge
+            self.badge.min_width = dp(34)
+            self.badge.max_width = dp(62)
+            self.badge.opacity = 1.0
+            self.badge._fit_width()
+        else:
+            self.badge.text = ""
+            self.badge.min_width = 0
+            self.badge.max_width = 0
+            self.badge.width = 0
+            self.badge.opacity = 0.0
+        self._sync_text_size()
+
+    def _sync_text_size(self) -> None:
+        try:
+            self.title_label.text_size = (max(1, self.title_label.width), None)
+            self.preview_label.text_size = (max(1, self.preview_label.width), None)
+            self.meta_label.text_size = (max(1, self.meta_label.width), None)
+            self.status_label.text_size = (max(1, self.status_label.width), None)
+        except Exception:
+            pass
+
+    def _sync_style(self, *_args) -> None:
+        try:
+            if self.state == "down":
+                self.bg_color = color("accent_soft")
+                self.border_color = color("accent")
+            elif self.active:
+                self.bg_color = color("surface_blue")
+                self.border_color = color("accent_soft")
+            elif self.hovered:
+                self.bg_color = color("surface_muted")
+                self.border_color = color("border")
+            else:
+                self.bg_color = color("surface")
+                self.border_color = color("border_soft")
+        except Exception:
+            pass
+
+
 class MessageBubble(RoundedCard):
     direction = StringProperty("incoming")
     sender = StringProperty("")

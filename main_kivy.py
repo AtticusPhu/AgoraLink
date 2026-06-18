@@ -321,6 +321,7 @@ from chat_cards import (
 )
 try:
     from ui_components import (
+        ConversationItem as UIConversationItem,
         FileTransferCard as UIFileTransferCard,
         MessageBubble as UIMessageBubble,
         PillButton as UIPillButton,
@@ -331,6 +332,7 @@ try:
         color as ui_component_color,
     )
 except Exception:
+    UIConversationItem = None
     UIFileTransferCard = None
     UIMessageBubble = None
     UIPillButton = None
@@ -2643,6 +2645,83 @@ class RUDPTransferRoot(BoxLayout):
         text = str(fp or "")
         return text[:12] + ("…" if len(text) > 12 else "")
 
+    def _chat_entry_display_data(self, label: str, value: str, meta: Dict[str, object]) -> Dict[str, str]:
+        meta = meta or {}
+        text = str(label or "")
+        lines = text.splitlines()
+        first = lines[0] if lines else ""
+        second = lines[1] if len(lines) > 1 else ""
+        title = str(meta.get("title") or "").strip()
+        meta_text = str(meta.get("time") or meta.get("meta_text") or "").strip()
+        if not title:
+            if "    " in first:
+                left, right = first.rsplit("    ", 1)
+                title = left.strip()
+                if not meta_text:
+                    meta_text = re.sub(r"\s*\(\d+\)\s*$", "", right).strip()
+            else:
+                title = first.strip()
+        preview = str(meta.get("preview") or second or "").strip()
+        status_icon = str(meta.get("status_icon") or "").strip()
+        if status_icon and preview and not preview.startswith(status_icon):
+            preview = f"{status_icon} {preview}"
+        status_text = str(meta.get("status_text") or meta.get("kind") or "").strip()
+        badge_text = str(meta.get("badge_text") or "").strip()
+        if not badge_text:
+            unread = 0
+            try:
+                unread = int(meta.get("unread_count") or 0)
+            except Exception:
+                unread = 0
+            if unread <= 0:
+                match = re.search(r"\((\d+)\)\s*$", first)
+                if match:
+                    try:
+                        unread = int(match.group(1))
+                    except Exception:
+                        unread = 0
+            if unread > 0:
+                badge_text = "99+" if unread > 99 else str(unread)
+        if not title:
+            title = str(value or "").strip() or self.cu("no_chat")
+        if not preview:
+            preview = self.cu("no_message")
+        return {
+            "title": title,
+            "preview": preview,
+            "meta_text": meta_text,
+            "status_text": status_text,
+            "badge_text": badge_text,
+        }
+
+    def _legacy_chat_entry_button(self, label: str, value: str, meta: Dict[str, object], active: bool) -> Button:
+        role = "active" if active else "secondary"
+        btn = make_button(role, text=str(label), size_hint_y=None, height=dp(62))
+        btn.halign = "center"
+        btn.valign = "middle"
+        btn.bold = bool((meta or {}).get("unread"))
+        btn.shorten = False
+        btn.bind(size=lambda inst, _val: setattr(inst, "text_size", (inst.width - dp(16), None)))
+        return btn
+
+    def _build_chat_entry_widget(self, label: str, value: str, meta: Dict[str, object], active: bool):
+        if UIConversationItem is not None:
+            try:
+                display = self._chat_entry_display_data(label, value, meta)
+                return UIConversationItem(
+                    title=display["title"],
+                    preview=display["preview"],
+                    meta_text=display["meta_text"],
+                    status_text=display["status_text"],
+                    badge_text=display["badge_text"],
+                    active=active,
+                    size_hint_y=None,
+                    height=dp(62),
+                )
+            except Exception:
+                pass
+        return self._legacy_chat_entry_button(label, value, meta, active)
+
     def _set_chat_entry_buttons(self, entries: List[tuple]) -> None:
         if not hasattr(self, "chat_items_box"):
             return
@@ -2654,13 +2733,8 @@ class RUDPTransferRoot(BoxLayout):
             else:
                 label, value, meta = item[0], item[1], {}
             values.append(value)
-            role = "active" if str(value or "") == str(getattr(self, "selected_chat_entry_value", "") or "") else "secondary"
-            btn = make_button(role, text=str(label), size_hint_y=None, height=dp(62))
-            btn.halign = "center"
-            btn.valign = "middle"
-            btn.bold = bool(meta.get("unread"))
-            btn.shorten = False
-            btn.bind(size=lambda inst, _val: setattr(inst, "text_size", (inst.width - dp(16), None)))
+            active = str(value or "") == str(getattr(self, "selected_chat_entry_value", "") or "")
+            btn = self._build_chat_entry_widget(str(label), str(value or ""), meta, active)
             btn.bind(on_release=lambda _btn, v=value: self._select_chat_entry(v))
             def _right_click(inst, touch, v=value):
                 if getattr(touch, "button", "") == "right" and inst.collide_point(*touch.pos):
@@ -2964,10 +3038,20 @@ class RUDPTransferRoot(BoxLayout):
                 name = self._device_display_name(d)
                 fp = self._device_fingerprint(d)
                 pid = self._device_peer_id(d)
+                ip, port = self._receiver_endpoint(d)
                 label = f"{name}"
                 if query and query not in label.lower() and query not in pid.lower() and query not in fp.lower():
                     continue
-                entries.append((label, self._chat_device_value(d)))
+                entries.append((
+                    label,
+                    self._chat_device_value(d),
+                    {
+                        "title": name,
+                        "preview": f"{ip}:{port}" if ip else self.cu("no_message"),
+                        "time": self._short_fp(fp),
+                        "kind": self.cu("devices"),
+                    },
+                ))
             if not entries:
                 entries.append(("未发现在线设备\n点击下方“扫描设备”", ""))
             self._set_chat_entry_buttons(entries)
@@ -2991,7 +3075,22 @@ class RUDPTransferRoot(BoxLayout):
                     label = self._format_chat_list_label(("[PIN] " if pinned else "") + title, preview, tlabel, status_icon, unread)
                     if query and query not in label.lower() and query not in gid.lower():
                         continue
-                    recent_items.append((1 if pinned else 0, ts or float(g.get("updated_at") or g.get("created_at") or 0), label, f"group::{gid}::{title}", {"unread": unread > 0, "pinned": pinned}))
+                    recent_items.append((
+                        1 if pinned else 0,
+                        ts or float(g.get("updated_at") or g.get("created_at") or 0),
+                        label,
+                        f"group::{gid}::{title}",
+                        {
+                            "title": ("[PIN] " if pinned else "") + title,
+                            "preview": preview,
+                            "time": tlabel,
+                            "kind": self.cu("group_prefix"),
+                            "status_icon": status_icon,
+                            "unread": unread > 0,
+                            "unread_count": unread,
+                            "pinned": pinned,
+                        },
+                    ))
                 for c in contacts:
                     name = str(c.get("remark_name") or c.get("display_name") or c.get("nickname") or c.get("peer_id"))
                     pid = str(c.get("peer_id") or "")
@@ -3000,7 +3099,22 @@ class RUDPTransferRoot(BoxLayout):
                     label = self._format_chat_list_label(("[PIN] " if pinned else "") + name, preview, tlabel, status_icon, unread)
                     if query and query not in label.lower() and query not in pid.lower():
                         continue
-                    recent_items.append((1 if pinned else 0, ts, label, f"direct::{pid}::{name}", {"unread": unread > 0, "pinned": pinned}))
+                    recent_items.append((
+                        1 if pinned else 0,
+                        ts,
+                        label,
+                        f"direct::{pid}::{name}",
+                        {
+                            "title": ("[PIN] " if pinned else "") + name,
+                            "preview": preview,
+                            "time": tlabel,
+                            "kind": self.cu("friend_prefix"),
+                            "status_icon": status_icon,
+                            "unread": unread > 0,
+                            "unread_count": unread,
+                            "pinned": pinned,
+                        },
+                    ))
                 for _pin, _ts, label, value, meta in sorted(recent_items, key=lambda x: (int(x[0] or 0), float(x[1] or 0)), reverse=True):
                     entries.append((label, value, meta))
             else:
@@ -3013,7 +3127,20 @@ class RUDPTransferRoot(BoxLayout):
                     label = self._format_chat_list_label(("[PIN] " if pinned else "") + f"{self.cu('group_prefix')}  {title}", preview, tlabel, status_icon, unread)
                     if query and query not in label.lower() and query not in gid.lower():
                         continue
-                    entries.append((label, f"group::{gid}::{title}", {"unread": unread > 0, "pinned": pinned}))
+                    entries.append((
+                        label,
+                        f"group::{gid}::{title}",
+                        {
+                            "title": ("[PIN] " if pinned else "") + f"{self.cu('group_prefix')}  {title}",
+                            "preview": preview,
+                            "time": tlabel,
+                            "kind": self.cu("group_prefix"),
+                            "status_icon": status_icon,
+                            "unread": unread > 0,
+                            "unread_count": unread,
+                            "pinned": pinned,
+                        },
+                    ))
                 for c in contacts:
                     name = str(c.get("remark_name") or c.get("display_name") or c.get("nickname") or c.get("peer_id"))
                     pid = str(c.get("peer_id") or "")
@@ -3022,7 +3149,20 @@ class RUDPTransferRoot(BoxLayout):
                     label = self._format_chat_list_label(("[PIN] " if pinned else "") + f"{self.cu('friend_prefix')}  {name}", preview, tlabel, status_icon, unread)
                     if query and query not in label.lower() and query not in pid.lower():
                         continue
-                    entries.append((label, f"direct::{pid}::{name}", {"unread": unread > 0, "pinned": pinned}))
+                    entries.append((
+                        label,
+                        f"direct::{pid}::{name}",
+                        {
+                            "title": ("[PIN] " if pinned else "") + f"{self.cu('friend_prefix')}  {name}",
+                            "preview": preview,
+                            "time": tlabel,
+                            "kind": self.cu("friend_prefix"),
+                            "status_icon": status_icon,
+                            "unread": unread > 0,
+                            "unread_count": unread,
+                            "pinned": pinned,
+                        },
+                    ))
 
             if not entries:
                 entries.append((self.cu("no_chat"), ""))
