@@ -322,14 +322,20 @@ from chat_cards import (
 try:
     from ui_components import (
         FileTransferCard as UIFileTransferCard,
+        MessageBubble as UIMessageBubble,
+        PillButton as UIPillButton,
         RoundedButton as UIRoundedButton,
+        RoundedCard as UIRoundedCard,
         ScreenShareCard as UIScreenShareCard,
         StatusBadge as UIStatusBadge,
         color as ui_component_color,
     )
 except Exception:
     UIFileTransferCard = None
+    UIMessageBubble = None
+    UIPillButton = None
     UIRoundedButton = None
+    UIRoundedCard = None
     UIScreenShareCard = None
     UIStatusBadge = None
     ui_component_color = None
@@ -1833,12 +1839,77 @@ class ChatMessageBox(BoxLayout):
         )
         return max(0.0, min(100.0, pct)), bool(failed), bool(complete), detail
 
+    def _modern_text_bubble_width(self, text: str) -> int:
+        char_units = 0
+        for ch in str(text or ""):
+            if ch == "\n":
+                char_units += 24
+            else:
+                char_units += 2 if ord(ch) > 127 else 1
+        char_units = max(1, char_units)
+        return max(132, min(420, 64 + min(char_units, 52) * 7))
+
+    def _add_modern_text_message(
+        self,
+        *,
+        mine: bool,
+        sender: str,
+        text: str,
+        timestamp: str,
+        summary: str = "",
+        message_id: str = "",
+        show_sender: bool = False,
+    ) -> bool:
+        if UIMessageBubble is None:
+            return False
+        try:
+            raw_text = str(text or "")
+            sender_text = str(sender or "").strip()
+            show_sender_label = bool(show_sender and sender_text and not mine)
+            bubble_width = self._modern_text_bubble_width(raw_text)
+            line = BoxLayout(orientation="horizontal", size_hint_y=None, padding=(0, dp(4), 0, dp(4)))
+            bubble = UIMessageBubble(
+                direction="outgoing" if mine else "incoming",
+                sender=shorten_middle(sender_text, 28) if show_sender_label else "",
+                message=raw_text,
+                size_hint_x=None,
+                width=dp(bubble_width),
+            )
+            if mine:
+                line.add_widget(BoxLayout(size_hint_x=1))
+                line.add_widget(bubble)
+                line.add_widget(BoxLayout(size_hint_x=None, width=dp(8)))
+            else:
+                line.add_widget(BoxLayout(size_hint_x=None, width=dp(8)))
+                line.add_widget(bubble)
+                line.add_widget(BoxLayout(size_hint_x=1))
+            self._add_footer(bubble, mine=mine, timestamp=timestamp, summary=summary)
+            if mine and "failed" in str(summary or "").lower() and getattr(self, "root_owner", None) is not None:
+                retry_btn = make_button("danger", text=self._cu("retry"), size_hint_y=None, height=dp(26), on_release=lambda *_p, mid=message_id: self.root_owner.retry_outgoing_message(mid))
+                bubble.add_widget(retry_btn)
+
+            def _sync_height(*_args):
+                try:
+                    line.height = max(dp(56), float(bubble.height or bubble.minimum_height or 0) + dp(8))
+                except Exception:
+                    line.height = dp(72)
+
+            bubble.bind(height=_sync_height, minimum_height=_sync_height)
+            Clock.schedule_once(lambda _dt: _sync_height(), 0)
+            self.inner.add_widget(line)
+            self.scroll.scroll_y = 0
+            return True
+        except Exception:
+            return False
+
 
     def add_message(self, *, mine: bool, sender: str, text: str, timestamp: str, summary: str = "", body_type: str = "text", file_path: str = "", message_id: str = "", progress_text: str = "", total_size: int = 0, show_sender: bool = False) -> None:
         is_file = body_type == "file"
         raw_text = str(text or "")
         sender_text = str(sender or "").strip()
         show_sender_label = bool(show_sender and sender_text and not mine)
+        if not is_file and self._add_modern_text_message(mine=mine, sender=sender, text=raw_text, timestamp=timestamp, summary=summary, message_id=message_id, show_sender=show_sender):
+            return
         if is_file:
             line_height = 158 if show_sender_label else 136
             bubble_width = 430
@@ -2022,6 +2093,67 @@ class RUDPTransferRoot(BoxLayout):
     def cu(self, key: str, **kwargs) -> str:
         text = CHAT_UI_TEXT.get(self.lang, CHAT_UI_TEXT.get("zh", {})).get(key, key)
         return text.format(**kwargs) if kwargs else text
+
+    def _modern_button_style(self, role: str) -> Dict[str, object]:
+        if ui_component_color is None:
+            return {}
+        role_name = str(role or "secondary").strip().lower()
+        if role_name in ("primary", "active", "success"):
+            return {
+                "bg_normal": ui_component_color("accent"),
+                "bg_hover": ui_component_color("accent_hover"),
+                "bg_down": ui_component_color("accent_hover"),
+                "text_normal": ui_component_color("white"),
+                "text_down": ui_component_color("white"),
+                "border_color": ui_component_color("accent"),
+            }
+        if role_name in ("danger", "destructive"):
+            return {
+                "bg_normal": ui_component_color("danger_soft"),
+                "bg_hover": ui_component_color("danger_soft"),
+                "bg_down": ui_component_color("danger_soft"),
+                "text_normal": ui_component_color("danger"),
+                "text_down": ui_component_color("danger"),
+                "border_color": ui_component_color("border"),
+            }
+        return {
+            "bg_normal": ui_component_color("surface_muted"),
+            "bg_hover": ui_component_color("accent_soft"),
+            "bg_down": ui_component_color("accent_soft"),
+            "text_normal": ui_component_color("text_primary"),
+            "text_down": ui_component_color("text_primary"),
+            "border_color": ui_component_color("border"),
+        }
+
+    def _style_modern_or_legacy_button(self, button, role: str) -> None:
+        if UIRoundedButton is not None and isinstance(button, UIRoundedButton):
+            try:
+                for name, value in self._modern_button_style(role).items():
+                    setattr(button, name, value)
+                button._refresh_button_state(animated=False)
+                return
+            except Exception:
+                pass
+        try:
+            style_button(button, role)
+        except Exception:
+            pass
+
+    def _make_modern_or_legacy_button(self, role: str, *, text: str, width: int, on_release):
+        if UIPillButton is not None and ui_component_color is not None:
+            try:
+                btn = UIPillButton(
+                    text=text,
+                    size_hint_x=None,
+                    width=dp(width),
+                    height=dp(36),
+                    **self._modern_button_style(role),
+                )
+                btn.bind(on_release=on_release)
+                return btn
+            except Exception:
+                pass
+        return make_button(role, text=text, size_hint_x=None, width=dp(width), on_release=on_release)
 
     def _build(self) -> None:
         Window.minimum_width = 1000
@@ -2311,16 +2443,58 @@ class RUDPTransferRoot(BoxLayout):
         )
         bind_label_wrap(self.screen_share_status_label)
         center.add_widget(self.screen_share_status_label)
-        input_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(46), spacing=dp(8))
-        self.main_message_input = make_input(text="", multiline=False)
+        if UIRoundedCard is not None and ui_component_color is not None:
+            input_line = UIRoundedCard(
+                orientation="horizontal",
+                size_hint_y=None,
+                height=dp(58),
+                spacing=dp(8),
+                padding=(dp(10), dp(9), dp(10), dp(9)),
+                radius=20,
+                bg_color=ui_component_color("surface_blue"),
+                border_color=ui_component_color("border_soft"),
+            )
+            input_shell = UIRoundedCard(
+                orientation="horizontal",
+                size_hint_x=1,
+                size_hint_y=None,
+                height=dp(40),
+                padding=(dp(12), 0, dp(12), 0),
+                spacing=0,
+                radius=12,
+                bg_color=ui_component_color("surface"),
+                border_color=ui_component_color("border_soft"),
+            )
+            self.main_message_input = make_input(text="", multiline=False)
+            try:
+                self.main_message_input.background_normal = ""
+                self.main_message_input.background_active = ""
+                self.main_message_input.background_color = ui_component_color("transparent")
+                self.main_message_input.foreground_color = ui_component_color("text_primary")
+                self.main_message_input.cursor_color = ui_component_color("accent")
+                self.main_message_input.padding = (0, dp(10), 0, dp(8))
+            except Exception:
+                pass
+            input_shell.add_widget(self.main_message_input)
+            input_line.add_widget(input_shell)
+            self.main_message_input.bind(
+                focus=lambda _inst, focused, shell=input_shell: setattr(
+                    shell,
+                    "border_color",
+                    ui_component_color("accent" if focused else "border_soft"),
+                )
+            )
+        else:
+            input_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(46), spacing=dp(8))
+            self.main_message_input = make_input(text="", multiline=False)
+            input_line.add_widget(self.main_message_input)
         self.main_message_input.hint_text = self.cu("input_hint")
         self.main_message_input.bind(on_text_validate=lambda *_: self.send_current_chat_message())
-        input_line.add_widget(self.main_message_input)
-        self.main_send_btn = make_button("primary", text=self.cu("send"), size_hint_x=None, width=dp(88), on_release=lambda *_: self.send_current_chat_message())
+        self.main_send_btn = self._make_modern_or_legacy_button("primary", text=self.cu("send"), width=78, on_release=lambda *_: self.send_current_chat_message())
         input_line.add_widget(self.main_send_btn)
-        self.main_file_btn = make_button("secondary", text=self.cu("send_file"), size_hint_x=None, width=dp(104), on_release=lambda *_: self.send_file_to_current_chat())
+        self.main_file_btn = self._make_modern_or_legacy_button("secondary", text=self.cu("send_file"), width=100, on_release=lambda *_: self.send_file_to_current_chat())
         input_line.add_widget(self.main_file_btn)
-        self.main_screen_btn = make_button("secondary", text="投屏", size_hint_x=None, width=dp(106), on_release=lambda *_: Clock.schedule_once(lambda _dt: self._on_screen_share_button(), 0))
+        self.main_screen_btn = self._make_modern_or_legacy_button("secondary", text="鎶曞睆", width=106, on_release=lambda *_: Clock.schedule_once(lambda _dt: self._on_screen_share_button(), 0))
         input_line.add_widget(self.main_screen_btn)
         self._schedule_screen_share_button_refresh()
         center.add_widget(input_line)
@@ -4893,7 +5067,7 @@ class RUDPTransferRoot(BoxLayout):
             self.screen_share_ui_state = "idle"
         self.main_screen_btn.text = self._screen_share_button_text(active)
         self.main_screen_btn.width = dp(106)
-        style_button(self.main_screen_btn, "danger" if active else "secondary")
+        self._style_modern_or_legacy_button(self.main_screen_btn, "danger" if active else "secondary")
 
     def _schedule_screen_share_button_refresh(self) -> None:
         try:

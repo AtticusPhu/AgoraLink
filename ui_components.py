@@ -404,26 +404,33 @@ class MessageBubble(RoundedCard):
     message = StringProperty("")
 
     def __init__(self, **kwargs):
-        kwargs.setdefault("padding", [dp(14), dp(10), dp(14), dp(10)])
-        kwargs.setdefault("spacing", dp(4))
+        kwargs.setdefault("padding", [dp(14), dp(10), dp(14), dp(8)])
+        kwargs.setdefault("spacing", dp(5))
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("size_hint_x", 0.78)
+        kwargs.setdefault("radius", THEME.radius["card"])
         super().__init__(**kwargs)
-        self.sender_label = Label(font_name=UI_FONT, font_size=sp(THEME.font_size["caption"]), color=color("text_secondary"), halign="left", valign="middle", size_hint_y=None, height=dp(18), shorten=True)
-        self.message_label = Label(font_name=UI_FONT, font_size=sp(THEME.font_size["body"]), color=color("text_primary"), halign="left", valign="middle", shorten=True, shorten_from="right", size_hint_y=None, height=dp(38))
+        self.sender_label = Label(font_name=UI_FONT, font_size=sp(THEME.font_size["caption"]), color=color("text_secondary"), halign="left", valign="middle", size_hint_y=None, height=0, shorten=True)
+        self.message_label = Label(font_name=UI_FONT, font_size=sp(THEME.font_size["body"]), color=color("text_primary"), halign="left", valign="top", shorten=False, size_hint_y=None)
         _bind_single_line_label(self.sender_label)
-        _bind_single_line_label(self.message_label)
+        self.message_label.bind(width=lambda inst, _value: setattr(inst, "text_size", (max(1, inst.width), None)))
+        self.message_label.bind(texture_size=lambda inst, value: setattr(inst, "height", max(dp(24), float(value[1]) + dp(2))))
         self.add_widget(self.sender_label)
         self.add_widget(self.message_label)
         self.bind(minimum_height=self.setter("height"))
+        self.bind(width=lambda *_: self._sync_text_size())
         self.height = self.minimum_height
         self.bind(sender=self._sync_text, message=self._sync_text, direction=self._sync_style)
         self._sync_text()
         self._sync_style()
 
     def _sync_text(self, *_args) -> None:
-        self.sender_label.text = str(self.sender or "")
+        sender = str(self.sender or "").strip()
+        self.sender_label.text = sender
+        self.sender_label.height = dp(18) if sender else 0
+        self.sender_label.opacity = 1.0 if sender else 0.0
         self.message_label.text = str(self.message or "")
+        self._sync_text_size()
 
     def _sync_style(self, *_args) -> None:
         if str(self.direction or "") == "outgoing":
@@ -432,6 +439,17 @@ class MessageBubble(RoundedCard):
         else:
             self.bg_color = color("surface")
             self.border_color = color("border")
+
+    def _sync_text_size(self) -> None:
+        try:
+            content_width = max(1, self.width - dp(28))
+            self.sender_label.text_size = (content_width, None)
+            self.message_label.text_size = (content_width, None)
+            self.message_label.texture_update()
+            self.message_label.height = max(dp(24), float(self.message_label.texture_size[1]) + dp(2))
+            self.height = self.minimum_height
+        except Exception:
+            pass
 
 
 class RoundedProgressBar(Widget):
