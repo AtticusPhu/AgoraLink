@@ -37,26 +37,26 @@ class Theme:
 
 
 LIGHT_THEME = Theme(
-    name="Calm Rounded Productivity Blue",
+    name="Variant C - Graphite Blue",
     colors={
-        "background": hex_to_rgba("#F6FAFF"),
+        "background": hex_to_rgba("#F5F7FA"),
         "surface": hex_to_rgba("#FFFFFF"),
-        "surface_muted": hex_to_rgba("#EEF6FF"),
-        "surface_blue": hex_to_rgba("#EAF4FF"),
-        "text_primary": hex_to_rgba("#1F2933"),
-        "text_secondary": hex_to_rgba("#667085"),
-        "text_muted": hex_to_rgba("#98A2B3"),
-        "border": hex_to_rgba("#D8E6F5"),
-        "border_soft": hex_to_rgba("#E6EEF7"),
-        "accent": hex_to_rgba("#5AA7E8"),
-        "accent_hover": hex_to_rgba("#4B98D9"),
-        "accent_soft": hex_to_rgba("#DCEEFF"),
-        "success": hex_to_rgba("#34C759"),
-        "success_soft": hex_to_rgba("#E9F8EE"),
-        "warning": hex_to_rgba("#FFB020"),
+        "surface_muted": hex_to_rgba("#EEF2F6"),
+        "surface_blue": hex_to_rgba("#EAF1F7"),
+        "text_primary": hex_to_rgba("#20242A"),
+        "text_secondary": hex_to_rgba("#5F6B7A"),
+        "text_muted": hex_to_rgba("#93A0AD"),
+        "border": hex_to_rgba("#D8E0EA"),
+        "border_soft": hex_to_rgba("#E4E9F0"),
+        "accent": hex_to_rgba("#3F7FA8"),
+        "accent_hover": hex_to_rgba("#356C8F"),
+        "accent_soft": hex_to_rgba("#D7E6F2"),
+        "success": hex_to_rgba("#4C9362"),
+        "success_soft": hex_to_rgba("#EDF6F0"),
+        "warning": hex_to_rgba("#A9772B"),
         "warning_soft": hex_to_rgba("#FFF4E2"),
-        "danger": hex_to_rgba("#FF4D4F"),
-        "danger_soft": hex_to_rgba("#FFE9E8"),
+        "danger": hex_to_rgba("#B64B4B"),
+        "danger_soft": hex_to_rgba("#FAECEB"),
         "white": hex_to_rgba("#FFFFFF"),
         "transparent": (0, 0, 0, 0),
     },
@@ -99,6 +99,127 @@ LIGHT_THEME = Theme(
 DARK_THEME_PLACEHOLDER = None
 
 
+def _variant(name: str, colors: Dict[str, str]) -> Theme:
+    base = dict(LIGHT_THEME.colors)
+    base.update(
+        {
+            "background": hex_to_rgba(colors["background"]),
+            "surface": hex_to_rgba(colors["surface"]),
+            "surface_muted": hex_to_rgba(colors["surface_muted"]),
+            "surface_blue": hex_to_rgba(colors["surface_blue"]),
+            "border": hex_to_rgba(colors["border"]),
+            "border_soft": hex_to_rgba(colors["border_soft"]),
+            "accent": hex_to_rgba(colors["accent"]),
+            "accent_hover": hex_to_rgba(colors["accent_hover"]),
+            "accent_soft": hex_to_rgba(colors["accent_soft"]),
+            "text_primary": hex_to_rgba(colors["text_primary"]),
+            "text_secondary": hex_to_rgba(colors["text_secondary"]),
+            "text_muted": hex_to_rgba(colors["text_muted"]),
+            # State colors are intentionally muted for the preview variants.
+            "success": hex_to_rgba(colors.get("success", "#4FA66A")),
+            "success_soft": hex_to_rgba(colors.get("success_soft", "#EDF7F0")),
+            "warning": hex_to_rgba(colors.get("warning", "#B7791F")),
+            "warning_soft": hex_to_rgba(colors.get("warning_soft", "#FFF4E0")),
+            "danger": hex_to_rgba(colors.get("danger", "#C44B4B")),
+            "danger_soft": hex_to_rgba(colors.get("danger_soft", "#FBEAEA")),
+        }
+    )
+    return Theme(
+        name=name,
+        colors=base,
+        radius=LIGHT_THEME.radius,
+        spacing=LIGHT_THEME.spacing,
+        font_size=LIGHT_THEME.font_size,
+        fonts=LIGHT_THEME.fonts,
+        shadow=LIGHT_THEME.shadow,
+    )
+
+
+MIST_BLUE_THEME = _variant(
+    "Variant A - Mist Blue",
+    {
+        "background": "#F7FAFD",
+        "surface": "#FFFFFF",
+        "surface_muted": "#F1F6FB",
+        "surface_blue": "#EEF5FB",
+        "border": "#D9E4EE",
+        "border_soft": "#E5ECF3",
+        "accent": "#4F95CF",
+        "accent_hover": "#437FAF",
+        "accent_soft": "#DCEAF6",
+        "text_primary": "#20242A",
+        "text_secondary": "#667085",
+        "text_muted": "#98A2B3",
+        "success": "#4FA66A",
+        "success_soft": "#EDF7F0",
+        "warning": "#B7791F",
+        "warning_soft": "#FFF5E5",
+        "danger": "#C44B4B",
+        "danger_soft": "#FBEAEA",
+    },
+)
+
+PORCELAIN_GRAY_BLUE_THEME = _variant(
+    "Variant B - Porcelain Gray Blue",
+    {
+        "background": "#F7F8FA",
+        "surface": "#FFFFFF",
+        "surface_muted": "#F2F4F7",
+        "surface_blue": "#EEF3F8",
+        "border": "#DDE5EE",
+        "border_soft": "#E8EDF3",
+        "accent": "#4E8DBC",
+        "accent_hover": "#41789F",
+        "accent_soft": "#DDEAF5",
+        "text_primary": "#1F2933",
+        "text_secondary": "#667085",
+        "text_muted": "#98A2B3",
+        "success": "#4D9F65",
+        "success_soft": "#EEF7F1",
+        "warning": "#AE7A28",
+        "warning_soft": "#FFF4E4",
+        "danger": "#BA4A4A",
+        "danger_soft": "#FAECEB",
+    },
+)
+
+GRAPHITE_BLUE_THEME = _variant(
+    "Variant C - Graphite Blue",
+    {
+        "background": "#F5F7FA",
+        "surface": "#FFFFFF",
+        "surface_muted": "#EEF2F6",
+        "surface_blue": "#EAF1F7",
+        "border": "#D8E0EA",
+        "border_soft": "#E4E9F0",
+        "accent": "#3F7FA8",
+        "accent_hover": "#356C8F",
+        "accent_soft": "#D7E6F2",
+        "text_primary": "#20242A",
+        "text_secondary": "#5F6B7A",
+        "text_muted": "#93A0AD",
+        "success": "#4C9362",
+        "success_soft": "#EDF6F0",
+        "warning": "#A9772B",
+        "warning_soft": "#FFF4E2",
+        "danger": "#B64B4B",
+        "danger_soft": "#FAECEB",
+    },
+)
+
+THEME_VARIANTS: Dict[str, Theme] = {
+    "current": LIGHT_THEME,
+    "default": LIGHT_THEME,
+    "light": LIGHT_THEME,
+    "mist": MIST_BLUE_THEME,
+    "porcelain": PORCELAIN_GRAY_BLUE_THEME,
+    "graphite": GRAPHITE_BLUE_THEME,
+}
+
+
 def get_theme(mode: str = "light") -> Theme:
-    """Return the requested theme; only light mode is implemented for now."""
+    """Return a named preview theme; Graphite Blue is the default."""
+    key = str(mode or "light").strip().lower()
+    if key in THEME_VARIANTS:
+        return THEME_VARIANTS[key]
     return LIGHT_THEME

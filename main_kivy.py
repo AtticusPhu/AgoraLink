@@ -260,7 +260,7 @@ from kivy.uix.recycleview import RecycleView
 from kivy.uix.recycleboxlayout import RecycleBoxLayout
 from kivy.uix.recycleview.views import RecycleDataViewBehavior
 from kivy.uix.scrollview import ScrollView
-from kivy.uix.spinner import Spinner
+from kivy.uix.spinner import Spinner, SpinnerOption
 from kivy.uix.tabbedpanel import TabbedPanel, TabbedPanelItem
 from kivy.uix.textinput import TextInput
 from kivy.graphics import Color, RoundedRectangle, Triangle, Line
@@ -801,32 +801,32 @@ UI_FONT = register_ui_font()
 # Centralized UI theme. Kivy color values are RGBA floats in the range 0..1.
 # Change these values if you want a different visual style.
 THEME = {
-    # Blue-white chat style. Accent background requested by user: #E0EDF8.
-    "window_bg": (0.965, 0.976, 0.992, 1),
+    # Graphite Blue: restrained blue-gray UI with small-area accent color.
+    "window_bg": (0.961, 0.969, 0.980, 1),
     "panel_bg": (1.000, 1.000, 1.000, 1),
-    "primary": (0.330, 0.510, 0.760, 1),
-    "primary_active": (0.250, 0.435, 0.690, 1),
-    "secondary": (0.878, 0.929, 0.973, 1),
-    "secondary_active": (0.820, 0.890, 0.960, 1),
-    "success": (0.150, 0.560, 0.320, 1),
-    "success_active": (0.090, 0.430, 0.230, 1),
-    "danger": (0.780, 0.200, 0.200, 1),
-    "danger_active": (0.610, 0.130, 0.130, 1),
-    "text": (0.090, 0.120, 0.180, 1),
-    "muted_text": (0.420, 0.470, 0.560, 1),
+    "primary": (0.247, 0.498, 0.659, 1),
+    "primary_active": (0.208, 0.424, 0.561, 1),
+    "secondary": (0.933, 0.949, 0.965, 1),
+    "secondary_active": (0.843, 0.902, 0.949, 1),
+    "success": (0.298, 0.576, 0.384, 1),
+    "success_active": (0.247, 0.490, 0.325, 1),
+    "danger": (0.714, 0.294, 0.294, 1),
+    "danger_active": (0.624, 0.247, 0.247, 1),
+    "text": (0.125, 0.141, 0.165, 1),
+    "muted_text": (0.373, 0.420, 0.478, 1),
     "on_primary": (1.000, 1.000, 1.000, 1),
-    "on_secondary": (0.090, 0.120, 0.180, 1),
-    "input_bg": (0.980, 0.988, 0.998, 1),
-    "input_text": (0.090, 0.120, 0.180, 1),
-    "input_cursor": (0.330, 0.510, 0.760, 1),
-    "log_bg": (0.980, 0.988, 0.998, 1),
-    "log_text": (0.090, 0.120, 0.180, 1),
-    "disabled": (0.720, 0.750, 0.800, 1),
-    "bubble_mine": (0.878, 0.929, 0.973, 1),
+    "on_secondary": (0.125, 0.141, 0.165, 1),
+    "input_bg": (0.933, 0.949, 0.965, 1),
+    "input_text": (0.125, 0.141, 0.165, 1),
+    "input_cursor": (0.247, 0.498, 0.659, 1),
+    "log_bg": (0.933, 0.949, 0.965, 1),
+    "log_text": (0.125, 0.141, 0.165, 1),
+    "disabled": (0.576, 0.627, 0.678, 1),
+    "bubble_mine": (0.918, 0.945, 0.969, 1),
     "bubble_other": (1.000, 1.000, 1.000, 1),
     "menu_bg": (1.000, 1.000, 1.000, 1),
-    "menu_hover": (0.940, 0.965, 0.990, 1),
-    "menu_danger_text": (0.780, 0.200, 0.200, 1),
+    "menu_hover": (0.933, 0.949, 0.965, 1),
+    "menu_danger_text": (0.714, 0.294, 0.294, 1),
 }
 
 _BUTTON_ROLES = {
@@ -839,7 +839,56 @@ _BUTTON_ROLES = {
 }
 
 
+def modern_button_style(role: str) -> Dict[str, object]:
+    if ui_component_color is None:
+        return {}
+    role_name = str(role or "secondary").strip().lower()
+    if role_name in ("primary", "active", "success"):
+        return {
+            "bg_normal": ui_component_color("accent"),
+            "bg_hover": ui_component_color("accent_hover"),
+            "bg_down": ui_component_color("accent_hover"),
+            "text_normal": ui_component_color("white"),
+            "text_down": ui_component_color("white"),
+            "border_color": ui_component_color("accent"),
+        }
+    if role_name in ("danger", "destructive"):
+        return {
+            "bg_normal": ui_component_color("danger_soft"),
+            "bg_hover": ui_component_color("danger_soft"),
+            "bg_down": ui_component_color("danger_soft"),
+            "text_normal": ui_component_color("danger"),
+            "text_down": ui_component_color("danger"),
+            "border_color": ui_component_color("border"),
+        }
+    if role_name == "ghost":
+        return {
+            "bg_normal": ui_component_color("transparent"),
+            "bg_hover": ui_component_color("surface_muted"),
+            "bg_down": ui_component_color("accent_soft"),
+            "text_normal": ui_component_color("text_secondary"),
+            "text_down": ui_component_color("text_primary"),
+            "border_color": ui_component_color("transparent"),
+        }
+    return {
+        "bg_normal": ui_component_color("surface_muted"),
+        "bg_hover": ui_component_color("accent_soft"),
+        "bg_down": ui_component_color("accent_soft"),
+        "text_normal": ui_component_color("text_primary"),
+        "text_down": ui_component_color("text_primary"),
+        "border_color": ui_component_color("border"),
+    }
+
+
 def style_button(button: Button, role: str = "secondary") -> Button:
+    if UIRoundedButton is not None and isinstance(button, UIRoundedButton):
+        try:
+            for name, value in modern_button_style(role).items():
+                setattr(button, name, value)
+            button._refresh_button_state(animated=False)
+            return button
+        except Exception:
+            pass
     bg_key, fg_key = _BUTTON_ROLES.get(role, _BUTTON_ROLES["secondary"])
     button.font_name = UI_FONT
     button.background_normal = ""
@@ -871,12 +920,45 @@ def make_label(**kwargs) -> Label:
     return Label(**kwargs)
 
 
+class ThemedSpinnerOption(SpinnerOption):
+    """Low-noise Spinner dropdown row that follows the active UI theme."""
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("font_name", UI_FONT)
+        kwargs.setdefault("size_hint_y", None)
+        kwargs.setdefault("height", dp(38))
+        super().__init__(**kwargs)
+        self.background_normal = ""
+        self.background_down = ""
+        self.background_disabled_normal = ""
+        self.color = ui_component_color("text_primary") if ui_component_color is not None else THEME["text"]
+        self.background_color = ui_component_color("surface") if ui_component_color is not None else THEME["panel_bg"]
+        self.bind(state=lambda *_: self._sync_theme_state())
+        self._sync_theme_state()
+
+    def _sync_theme_state(self) -> None:
+        try:
+            if self.disabled:
+                self.color = ui_component_color("text_muted") if ui_component_color is not None else THEME["disabled"]
+                self.background_color = ui_component_color("surface_muted") if ui_component_color is not None else THEME["secondary"]
+                return
+            self.color = ui_component_color("text_primary") if ui_component_color is not None else THEME["text"]
+            if self.state == "down":
+                self.background_color = ui_component_color("accent_soft") if ui_component_color is not None else THEME["secondary_active"]
+            else:
+                self.background_color = ui_component_color("surface") if ui_component_color is not None else THEME["panel_bg"]
+        except Exception:
+            pass
+
+
 def style_spinner(spinner: Spinner) -> Spinner:
     spinner.font_name = UI_FONT
+    spinner.option_cls = ThemedSpinnerOption
     spinner.background_normal = ""
     spinner.background_down = ""
-    spinner.background_color = THEME["input_bg"]
-    spinner.color = THEME["input_text"]
+    spinner.background_disabled_normal = ""
+    spinner.background_color = ui_component_color("surface_muted") if ui_component_color is not None else THEME["input_bg"]
+    spinner.color = ui_component_color("text_primary") if ui_component_color is not None else THEME["input_text"]
     return spinner
 
 
@@ -902,11 +984,19 @@ def style_popup(popup: Popup) -> Popup:
     except Exception:
         pass
     try:
-        popup.background_color = THEME["panel_bg"]
+        popup.background_color = ui_component_color("background") if ui_component_color is not None else THEME["window_bg"]
     except Exception:
         pass
     try:
-        popup.separator_color = THEME["secondary_active"]
+        popup.separator_color = ui_component_color("border_soft") if ui_component_color is not None else THEME["secondary_active"]
+    except Exception:
+        pass
+    try:
+        popup.title_color = ui_component_color("text_primary") if ui_component_color is not None else THEME["text"]
+    except Exception:
+        pass
+    try:
+        popup.separator_height = dp(1)
     except Exception:
         pass
     return popup
@@ -1307,7 +1397,7 @@ class ChatMessageBox(BoxLayout):
         super().__init__(orientation="vertical", **kwargs)
         self.root_owner = root_owner
         self.scroll = ScrollView(size_hint_y=1)
-        self.inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(3), padding=(dp(8), dp(8), dp(8), dp(8)))
+        self.inner = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4), padding=(dp(10), dp(8), dp(10), dp(8)))
         self.inner.bind(minimum_height=self.inner.setter("height"))
         self.scroll.add_widget(self.inner)
         self.add_widget(self.scroll)
@@ -1473,7 +1563,7 @@ class ChatMessageBox(BoxLayout):
                 actions=actions,
                 on_action=callback,
                 size_hint_x=None,
-                width=dp(430),
+                width=dp(420),
             )
         return UIScreenShareCard(
             title=title or "Screen",
@@ -1484,7 +1574,7 @@ class ChatMessageBox(BoxLayout):
             actions=actions,
             on_action=callback,
             size_hint_x=None,
-            width=dp(430),
+            width=dp(420),
         )
 
     def _sync_modern_line_height(self, line, card_widget) -> None:
@@ -1517,7 +1607,7 @@ class ChatMessageBox(BoxLayout):
             if float(card_widget.width or 0) <= 0 or float(card_widget.height or card_widget.minimum_height or 0) <= 0:
                 return False
             side = self._card_side(data)
-            line = BoxLayout(orientation="horizontal", size_hint_y=None, padding=(0, dp(5), 0, dp(5)))
+            line = BoxLayout(orientation="horizontal", size_hint_y=None, padding=(0, dp(4), 0, dp(4)))
             self._sync_modern_line_height(line, card_widget)
             card_widget.bind(height=lambda inst, _value, row=line: self._sync_modern_line_height(row, inst))
             if side in ("outgoing", "system"):
@@ -1670,14 +1760,14 @@ class ChatMessageBox(BoxLayout):
         has_actions = bool(actions)
         height = 132 if has_actions else 106
         side = self._card_side(data)
-        line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(height), padding=(0, dp(5), 0, dp(5)))
+        line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(height), padding=(0, dp(4), 0, dp(4)))
         if side == "outgoing":
             line.add_widget(BoxLayout(size_hint_x=1))
         elif side == "system":
             line.add_widget(BoxLayout(size_hint_x=1))
         else:
             line.add_widget(BoxLayout(size_hint_x=None, width=dp(8)))
-        card_box = BoxLayout(orientation="vertical", spacing=dp(5), padding=(dp(14), dp(10), dp(14), dp(10)), size_hint_x=None, width=dp(430))
+        card_box = BoxLayout(orientation="vertical", spacing=dp(5), padding=(dp(14), dp(10), dp(14), dp(10)), size_hint_x=None, width=dp(420))
         bg_style = "panel_bg" if card_type in (CARD_FILE_OFFER, CARD_FILE_TRANSFER) else "secondary"
         apply_card_background(card_box, bg_style, radius=12)
         title_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(24), spacing=dp(8))
@@ -1691,13 +1781,13 @@ class ChatMessageBox(BoxLayout):
         title_line.add_widget(badge)
         title_lab = make_label(text=shorten_middle(title or badge_text, 44), halign="left", valign="middle", color=THEME["text"], bold=True)
         title_lab.shorten = True
-        title_lab.text_size = (dp(330), None)
+        title_lab.text_size = (dp(320), None)
         title_line.add_widget(title_lab)
         card_box.add_widget(title_line)
         sub_lab = None
         if subtitle:
             sub_lab = make_label(text=shorten_middle(subtitle, 58), size_hint_y=None, height=dp(20), halign="left", valign="middle", color=THEME["muted_text"])
-            sub_lab.text_size = (dp(392), None)
+            sub_lab.text_size = (dp(382), None)
             card_box.add_widget(sub_lab)
         body_lab = make_label(text=shorten_middle(self._card_body_text(status, detail), 76), size_hint_y=None, height=dp(28), halign="left", valign="middle", color=THEME["text"])
         body_lab.text_size = (dp(392), None)
@@ -2001,7 +2091,7 @@ class ChatMessageBox(BoxLayout):
 
 class RUDPTransferRoot(BoxLayout):
     def __init__(self, app: "RUDPTransferApp", **kwargs):
-        super().__init__(orientation="vertical", spacing=dp(8), padding=dp(10), **kwargs)
+        super().__init__(orientation="vertical", spacing=dp(8), padding=dp(12), **kwargs)
         self.app = app
         self.lang = app.lang
         self.discovered: List[Dict[str, object]] = []
@@ -2097,35 +2187,7 @@ class RUDPTransferRoot(BoxLayout):
         return text.format(**kwargs) if kwargs else text
 
     def _modern_button_style(self, role: str) -> Dict[str, object]:
-        if ui_component_color is None:
-            return {}
-        role_name = str(role or "secondary").strip().lower()
-        if role_name in ("primary", "active", "success"):
-            return {
-                "bg_normal": ui_component_color("accent"),
-                "bg_hover": ui_component_color("accent_hover"),
-                "bg_down": ui_component_color("accent_hover"),
-                "text_normal": ui_component_color("white"),
-                "text_down": ui_component_color("white"),
-                "border_color": ui_component_color("accent"),
-            }
-        if role_name in ("danger", "destructive"):
-            return {
-                "bg_normal": ui_component_color("danger_soft"),
-                "bg_hover": ui_component_color("danger_soft"),
-                "bg_down": ui_component_color("danger_soft"),
-                "text_normal": ui_component_color("danger"),
-                "text_down": ui_component_color("danger"),
-                "border_color": ui_component_color("border"),
-            }
-        return {
-            "bg_normal": ui_component_color("surface_muted"),
-            "bg_hover": ui_component_color("accent_soft"),
-            "bg_down": ui_component_color("accent_soft"),
-            "text_normal": ui_component_color("text_primary"),
-            "text_down": ui_component_color("text_primary"),
-            "border_color": ui_component_color("border"),
-        }
+        return modern_button_style(role)
 
     def _style_modern_or_legacy_button(self, button, role: str) -> None:
         if UIRoundedButton is not None and isinstance(button, UIRoundedButton):
@@ -2141,44 +2203,120 @@ class RUDPTransferRoot(BoxLayout):
         except Exception:
             pass
 
-    def _make_modern_or_legacy_button(self, role: str, *, text: str, width: int, on_release):
+    def _make_modern_or_legacy_button(
+        self,
+        role: str,
+        *,
+        text: str = "",
+        width: Optional[int] = None,
+        on_release=None,
+        height: int = 36,
+        size_hint_x=None,
+        compact: bool = False,
+        pill: bool = True,
+    ):
         if UIPillButton is not None and ui_component_color is not None:
             try:
-                btn = UIPillButton(
-                    text=text,
-                    size_hint_x=None,
-                    width=dp(width),
-                    height=dp(36),
+                button_cls = UIPillButton if pill else UIRoundedButton
+                kwargs: Dict[str, object] = {
+                    "text": text,
+                    "height": dp(height),
+                    "compact": bool(compact),
                     **self._modern_button_style(role),
-                )
-                btn.bind(on_release=on_release)
+                }
+                if width is not None:
+                    kwargs.update(size_hint_x=None, width=dp(width))
+                elif size_hint_x is not None:
+                    kwargs.update(size_hint_x=size_hint_x)
+                btn = button_cls(**kwargs)
+                if on_release is not None:
+                    btn.bind(on_release=on_release)
                 return btn
             except Exception:
                 pass
-        return make_button(role, text=text, size_hint_x=None, width=dp(width), on_release=on_release)
+        kwargs = {"text": text, "on_release": on_release}
+        if width is not None:
+            kwargs.update(size_hint_x=None, width=dp(width))
+        elif size_hint_x is not None:
+            kwargs.update(size_hint_x=size_hint_x)
+        return make_button(role, **kwargs)
+
+    def _make_modern_input_shell(self, widget, *, height: int = 38):
+        if UIRoundedCard is not None and ui_component_color is not None:
+            try:
+                shell = UIRoundedCard(
+                    orientation="horizontal",
+                    size_hint_x=1,
+                    size_hint_y=None,
+                    height=dp(height),
+                    padding=(dp(12), 0, dp(12), 0),
+                    spacing=0,
+                    radius=12,
+                    bg_color=ui_component_color("surface_muted"),
+                    border_color=ui_component_color("border_soft"),
+                )
+                widget.size_hint_x = 1
+                widget.size_hint_y = None
+                widget.height = dp(height)
+                for name, value in (
+                    ("background_normal", ""),
+                    ("background_active", ""),
+                    ("background_down", ""),
+                    ("background_color", ui_component_color("transparent")),
+                    ("foreground_color", ui_component_color("text_primary")),
+                    ("cursor_color", ui_component_color("accent")),
+                ):
+                    try:
+                        setattr(widget, name, value)
+                    except Exception:
+                        pass
+                if isinstance(widget, TextInput):
+                    widget.padding = (0, dp(9), 0, dp(7))
+                    widget.bind(
+                        focus=lambda _inst, focused, target=shell: setattr(
+                            target,
+                            "border_color",
+                            ui_component_color("accent" if focused else "border_soft"),
+                        )
+                    )
+                elif isinstance(widget, Spinner):
+                    widget.option_cls = ThemedSpinnerOption
+                    widget.color = ui_component_color("text_primary")
+                    widget.bind(
+                        state=lambda _inst, state, target=shell: setattr(
+                            target,
+                            "border_color",
+                            ui_component_color("accent" if state == "down" else "border_soft"),
+                        )
+                    )
+                shell.add_widget(widget)
+                return shell
+            except Exception:
+                pass
+        return widget
 
     def _build(self) -> None:
-        Window.minimum_width = 1000
-        Window.minimum_height = 680
+        Window.minimum_width = 900
+        Window.minimum_height = 600
 
-        top = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(44), spacing=dp(8))
+        top = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(46), spacing=dp(10))
         # Keep a blank flexible spacer; the old "AgoraLink 文件传输与聊天"
         # title consumed horizontal/vertical attention after login.
         self.title_label = make_label(text="", halign="left", valign="middle")
         top.add_widget(self.title_label)
-        self.lang_btn = make_button("primary", size_hint_x=None, width=dp(90), on_release=lambda *_: self.toggle_lang())
+        self.lang_btn = self._make_modern_or_legacy_button("secondary", width=90, on_release=lambda *_: self.toggle_lang())
         top.add_widget(self.lang_btn)
-        self.online_btn = make_button("success", text="Online", size_hint_x=None, width=dp(90), on_release=lambda *_: self.toggle_online())
+        self.online_btn = self._make_modern_or_legacy_button("active", text="Online", width=90, on_release=lambda *_: self.toggle_online())
         top.add_widget(self.online_btn)
-        self.enter_chat_btn = make_button("primary", text="进入聊天", size_hint_x=None, width=dp(110), on_release=lambda *_: self.show_startup_unlock_popup())
+        self.enter_chat_btn = self._make_modern_or_legacy_button("primary", text="进入聊天", width=110, on_release=lambda *_: self.show_startup_unlock_popup())
         top.add_widget(self.enter_chat_btn)
-        self.settings_btn = make_button("secondary", text="设置", size_hint_x=None, width=dp(96), on_release=lambda *_: self.open_settings_popup())
+        self.settings_btn = self._make_modern_or_legacy_button("secondary", text="设置", width=96, on_release=lambda *_: self.open_settings_popup())
         top.add_widget(self.settings_btn)
-        self.debug_btn = make_button("secondary", text="诊断", size_hint_x=None, width=dp(112), on_release=lambda *_: self.open_debug_popup())
+        self.debug_btn = self._make_modern_or_legacy_button("secondary", text="诊断", width=112, on_release=lambda *_: self.open_debug_popup())
         top.add_widget(self.debug_btn)
         self.add_widget(top)
 
-        self.local_ip_label = make_label(size_hint_y=None, height=dp(30), halign="left", valign="middle", shorten=True)
+        self.local_ip_label = make_label(size_hint_y=None, height=dp(26), halign="left", valign="middle", shorten=True)
         bind_label_wrap(self.local_ip_label)
         self.add_widget(self.local_ip_label)
 
@@ -2186,10 +2324,10 @@ class RUDPTransferRoot(BoxLayout):
         # TabbedPanel headers use their own internal button class and may ignore
         # the application font on some Windows/Kivy builds, which causes Chinese
         # text to disappear. Normal Buttons give deterministic font behavior.
-        self.tab_bar = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(44), spacing=dp(8))
-        self.send_tab_btn = make_button("active", on_release=lambda *_: self.show_page("send"))
-        self.recv_tab_btn = make_button("secondary", on_release=lambda *_: self.show_page("recv"))
-        self.chat_tab_btn = make_button("secondary", on_release=lambda *_: self.show_page("chat"))
+        self.tab_bar = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(10))
+        self.send_tab_btn = self._make_modern_or_legacy_button("active", size_hint_x=1, height=36, on_release=lambda *_: self.show_page("send"))
+        self.recv_tab_btn = self._make_modern_or_legacy_button("secondary", size_hint_x=1, height=36, on_release=lambda *_: self.show_page("recv"))
+        self.chat_tab_btn = self._make_modern_or_legacy_button("secondary", size_hint_x=1, height=36, on_release=lambda *_: self.show_page("chat"))
         self.tab_bar.add_widget(self.send_tab_btn)
         self.tab_bar.add_widget(self.recv_tab_btn)
         self.tab_bar.add_widget(self.chat_tab_btn)
@@ -2377,9 +2515,9 @@ class RUDPTransferRoot(BoxLayout):
 
 
     def _build_agora_chat_main(self) -> BoxLayout:
-        root = BoxLayout(orientation="horizontal", spacing=dp(12), padding=dp(12))
+        root = BoxLayout(orientation="horizontal", spacing=dp(10), padding=dp(12))
 
-        left = BoxLayout(orientation="vertical", size_hint_x=None, width=dp(290), spacing=dp(10), padding=(dp(12), dp(12), dp(12), dp(12)))
+        left = BoxLayout(orientation="vertical", size_hint_x=None, width=dp(280), spacing=dp(10), padding=(dp(12), dp(12), dp(12), dp(12)))
         apply_card_background(left, "panel_bg", radius=22)
         self.profile_name_label = make_label(text=self.chat_nickname or "AgoraLink", size_hint_y=None, height=dp(32), halign="left", valign="middle", bold=True)
         bind_label_wrap(self.profile_name_label)
@@ -2392,16 +2530,16 @@ class RUDPTransferRoot(BoxLayout):
         self.chat_filter_input.bind(text=lambda *_: self.refresh_chat_main())
         left.add_widget(self.chat_filter_input)
         self.chat_nav = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(6))
-        self.recent_btn = make_button("active", text=self.cu("recent"), on_release=lambda *_: self.set_chat_section("recent"))
-        self.groups_btn = make_button("secondary", text=self.cu("contacts"), on_release=lambda *_: self.set_chat_section("contacts"))
-        self.devices_btn = make_button("secondary", text=self.cu("devices"), on_release=lambda *_: self.set_chat_section("devices"))
+        self.recent_btn = self._make_modern_or_legacy_button("active", text=self.cu("recent"), size_hint_x=1, height=36, compact=True, on_release=lambda *_: self.set_chat_section("recent"))
+        self.groups_btn = self._make_modern_or_legacy_button("secondary", text=self.cu("contacts"), size_hint_x=1, height=36, compact=True, on_release=lambda *_: self.set_chat_section("contacts"))
+        self.devices_btn = self._make_modern_or_legacy_button("secondary", text=self.cu("devices"), size_hint_x=1, height=36, compact=True, on_release=lambda *_: self.set_chat_section("devices"))
         self.chat_nav.add_widget(self.recent_btn)
         self.chat_nav.add_widget(self.groups_btn)
         self.chat_nav.add_widget(self.devices_btn)
         left.add_widget(self.chat_nav)
 
         self.chat_items_scroll = ScrollView(size_hint_y=1)
-        self.chat_items_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(6), padding=(0, dp(2), 0, dp(2)))
+        self.chat_items_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(8), padding=(0, dp(2), 0, dp(2)))
         self.chat_items_box.bind(minimum_height=self.chat_items_box.setter("height"))
         self.chat_items_scroll.add_widget(self.chat_items_box)
         left.add_widget(self.chat_items_scroll)
@@ -2414,15 +2552,15 @@ class RUDPTransferRoot(BoxLayout):
         self.chat_list_spinner = style_spinner(Spinner(text="", values=[], size_hint_y=None, height=0, font_name=UI_FONT))
         self.chat_list_spinner.disabled = True
 
-        list_actions = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(6))
-        self.scan_devices_btn = make_button("secondary", text=self.cu("scan_devices"), on_release=lambda *_: self.scan_devices_for_chat())
+        list_actions = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(36), spacing=dp(8))
+        self.scan_devices_btn = self._make_modern_or_legacy_button("secondary", text=self.cu("scan_devices"), size_hint_x=1, height=34, compact=True, on_release=lambda *_: self.scan_devices_for_chat())
         list_actions.add_widget(self.scan_devices_btn)
-        self.add_contact_btn = make_button("primary", text=self.cu("add_contact"), on_release=lambda *_: self.request_or_add_selected_device())
+        self.add_contact_btn = self._make_modern_or_legacy_button("primary", text=self.cu("add_contact"), size_hint_x=1, height=34, compact=True, on_release=lambda *_: self.request_or_add_selected_device())
         list_actions.add_widget(self.add_contact_btn)
         left.add_widget(list_actions)
         root.add_widget(left)
 
-        center = BoxLayout(orientation="vertical", spacing=dp(8), padding=(dp(12), dp(10), dp(12), dp(12)))
+        center = BoxLayout(orientation="vertical", spacing=dp(10), padding=(dp(12), dp(10), dp(12), dp(12)))
         apply_card_background(center, "panel_bg", radius=22)
         # The active chat is already highlighted in the left list, so the old
         # center title bar ("一对一：xxx" / "群聊：xxx") is hidden to save space.
@@ -2438,7 +2576,7 @@ class RUDPTransferRoot(BoxLayout):
         self.screen_share_status_label = make_label(
             text=self._screen_share_status_text("idle"),
             size_hint_y=None,
-            height=dp(44),
+            height=dp(38),
             halign="left",
             valign="middle",
             color=THEME["muted_text"],
@@ -2449,9 +2587,9 @@ class RUDPTransferRoot(BoxLayout):
             input_line = UIRoundedCard(
                 orientation="horizontal",
                 size_hint_y=None,
-                height=dp(58),
+                height=dp(56),
                 spacing=dp(8),
-                padding=(dp(10), dp(9), dp(10), dp(9)),
+                padding=(dp(10), dp(8), dp(10), dp(8)),
                 radius=20,
                 bg_color=ui_component_color("surface_blue"),
                 border_color=ui_component_color("border_soft"),
@@ -2460,7 +2598,7 @@ class RUDPTransferRoot(BoxLayout):
                 orientation="horizontal",
                 size_hint_x=1,
                 size_hint_y=None,
-                height=dp(40),
+                height=dp(38),
                 padding=(dp(12), 0, dp(12), 0),
                 spacing=0,
                 radius=12,
@@ -2474,7 +2612,7 @@ class RUDPTransferRoot(BoxLayout):
                 self.main_message_input.background_color = ui_component_color("transparent")
                 self.main_message_input.foreground_color = ui_component_color("text_primary")
                 self.main_message_input.cursor_color = ui_component_color("accent")
-                self.main_message_input.padding = (0, dp(10), 0, dp(8))
+                self.main_message_input.padding = (0, dp(9), 0, dp(7))
             except Exception:
                 pass
             input_shell.add_widget(self.main_message_input)
@@ -2492,22 +2630,24 @@ class RUDPTransferRoot(BoxLayout):
             input_line.add_widget(self.main_message_input)
         self.main_message_input.hint_text = self.cu("input_hint")
         self.main_message_input.bind(on_text_validate=lambda *_: self.send_current_chat_message())
-        self.main_send_btn = self._make_modern_or_legacy_button("primary", text=self.cu("send"), width=78, on_release=lambda *_: self.send_current_chat_message())
+        self.main_send_btn = self._make_modern_or_legacy_button("primary", text=self.cu("send"), width=78, height=38, on_release=lambda *_: self.send_current_chat_message())
         input_line.add_widget(self.main_send_btn)
-        self.main_file_btn = self._make_modern_or_legacy_button("secondary", text=self.cu("send_file"), width=100, on_release=lambda *_: self.send_file_to_current_chat())
+        self.main_file_btn = self._make_modern_or_legacy_button("secondary", text=self.cu("send_file"), width=98, height=38, on_release=lambda *_: self.send_file_to_current_chat())
         input_line.add_widget(self.main_file_btn)
         self.main_screen_btn = self._make_modern_or_legacy_button("secondary", text="鎶曞睆", width=106, on_release=lambda *_: Clock.schedule_once(lambda _dt: self._on_screen_share_button(), 0))
+        self.main_screen_btn.height = dp(38)
+        self.main_screen_btn.width = dp(104)
         input_line.add_widget(self.main_screen_btn)
         self._schedule_screen_share_button_refresh()
         center.add_widget(input_line)
         root.add_widget(center)
 
-        right = BoxLayout(orientation="vertical", size_hint_x=None, width=dp(300), spacing=dp(8), padding=(dp(12), dp(12), dp(12), dp(12)))
+        right = BoxLayout(orientation="vertical", size_hint_x=None, width=dp(288), spacing=dp(8), padding=(dp(12), dp(12), dp(12), dp(12)))
         apply_card_background(right, "panel_bg", radius=22)
         self.right_title = make_label(text=self.cu("right_title"), size_hint_y=None, height=dp(30), halign="left", valign="middle", bold=True)
         bind_label_wrap(self.right_title)
         right.add_widget(self.right_title)
-        self.right_member_scroll = ScrollView(size_hint_y=None, height=dp(210))
+        self.right_member_scroll = ScrollView(size_hint_y=None, height=dp(190))
         self.right_member_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(6), padding=(0, 0, 0, dp(4)))
         self.right_member_box.bind(minimum_height=self.right_member_box.setter("height"))
         self.right_member_scroll.add_widget(self.right_member_box)
@@ -2523,17 +2663,17 @@ class RUDPTransferRoot(BoxLayout):
         self.shared_files_scroll.add_widget(self.shared_files_box)
         right.add_widget(self.shared_files_scroll)
         self.right_action1 = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(4))
-        self.new_group_btn = make_button("success", text=self.cu("new_group"), on_release=lambda *_: self.open_group_popup())
+        self.new_group_btn = self._make_modern_or_legacy_button("primary", text=self.cu("new_group"), size_hint_x=1, height=36, compact=True, on_release=lambda *_: self.open_group_popup())
         self.right_action1.add_widget(self.new_group_btn)
-        self.add_member_main_btn = make_button("secondary", text=self.cu("add_member"), on_release=lambda *_: self.add_selected_contact_to_current_group())
+        self.add_member_main_btn = self._make_modern_or_legacy_button("secondary", text=self.cu("add_member"), size_hint_x=1, height=36, compact=True, on_release=lambda *_: self.add_selected_contact_to_current_group())
         self.right_action1.add_widget(self.add_member_main_btn)
         right.add_widget(self.right_action1)
         self.right_action2 = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(4))
-        self.remove_member_main_btn = make_button("danger", text=self.cu("remove_member"), on_release=lambda *_: self.confirm_remove_member())
+        self.remove_member_main_btn = self._make_modern_or_legacy_button("danger", text=self.cu("remove_member"), size_hint_x=1, height=36, compact=True, on_release=lambda *_: self.confirm_remove_member())
         self.right_action2.add_widget(self.remove_member_main_btn)
-        self.leave_group_main_btn = make_button("danger", text=self.cu("leave_group"), on_release=lambda *_: self.confirm_leave_group())
+        self.leave_group_main_btn = self._make_modern_or_legacy_button("danger", text=self.cu("leave_group"), size_hint_x=1, height=36, compact=True, on_release=lambda *_: self.confirm_leave_group())
         self.right_action2.add_widget(self.leave_group_main_btn)
-        self.delete_friend_main_btn = make_button("danger", text=self.cu("delete_friend"), on_release=lambda *_: self.confirm_delete_contact())
+        self.delete_friend_main_btn = self._make_modern_or_legacy_button("danger", text=self.cu("delete_friend"), size_hint_x=1, height=36, compact=True, on_release=lambda *_: self.confirm_delete_contact())
         self.right_action2.add_widget(self.delete_friend_main_btn)
         right.add_widget(self.right_action2)
         self.chat_detail_panel = right
@@ -2560,7 +2700,7 @@ class RUDPTransferRoot(BoxLayout):
             panel = self.chat_detail_panel
             panel.disabled = False
             panel.opacity = 1.0
-            panel.width = dp(300)
+            panel.width = dp(288)
             panel.size_hint_x = None
         except Exception:
             pass
@@ -2623,7 +2763,7 @@ class RUDPTransferRoot(BoxLayout):
         if hasattr(self, "right_action2"):
             self._set_widget_visible(self.right_action2, is_group)
         if hasattr(self, "right_member_scroll"):
-            self._set_widget_visible(self.right_member_scroll, is_group, height=260)
+            self._set_widget_visible(self.right_member_scroll, is_group, height=210)
         if hasattr(self, "new_group_btn"):
             self._set_button_visible(self.new_group_btn, False)
         if hasattr(self, "add_member_main_btn"):
@@ -4659,8 +4799,28 @@ class RUDPTransferRoot(BoxLayout):
         popup.open()
 
     def show_startup_unlock_popup(self) -> None:
-        content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
-        content.add_widget(make_label(text="AgoraLink", size_hint_y=None, height=dp(30), bold=True, halign="left"))
+        if UIRoundedCard is not None and ui_component_color is not None:
+            content = UIRoundedCard(
+                orientation="vertical",
+                spacing=dp(10),
+                padding=(dp(18), dp(18), dp(18), dp(18)),
+                radius=24,
+                bg_color=ui_component_color("surface"),
+                border_color=ui_component_color("border_soft"),
+            )
+        else:
+            content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+            apply_card_background(content, "panel_bg", radius=22)
+        title = make_label(
+            text="AgoraLink",
+            size_hint_y=None,
+            height=dp(32),
+            bold=True,
+            halign="left",
+            valign="middle",
+            color=ui_component_color("text_primary") if ui_component_color is not None else THEME["text"],
+        )
+        content.add_widget(title)
         db_input = make_input(text=self.chat_db_path, multiline=False)
         mode_values = ["登录", "注册", "仅收发"]
         db_exists = Path(self.chat_db_path).expanduser().exists()
@@ -4668,18 +4828,43 @@ class RUDPTransferRoot(BoxLayout):
         password_input = make_input(text="", multiline=False, password=True)
         confirm_input = make_input(text="", multiline=False, password=True)
         nick_input = make_input(text=self.chat_nickname, multiline=False)
-        content.add_widget(row("启动模式", mode_spinner, label_width=120))
-        content.add_widget(row("聊天数据库", db_input, label_width=120))
-        content.add_widget(row("密码", password_input, label_width=120))
-        confirm_row = row("确认密码", confirm_input, label_width=120)
-        nick_row = row("昵称", nick_input, label_width=120)
+
+        def login_row(label_text: str, control) -> BoxLayout:
+            box = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(10))
+            lab = make_label(
+                text=label_text,
+                size_hint_x=None,
+                width=dp(112),
+                halign="right",
+                valign="middle",
+                shorten=True,
+                color=THEME["muted_text"],
+            )
+            bind_label_wrap(lab)
+            box.add_widget(lab)
+            box.add_widget(control)
+            return box
+
+        content.add_widget(login_row("启动模式", self._make_modern_input_shell(mode_spinner)))
+        content.add_widget(login_row("聊天数据库", self._make_modern_input_shell(db_input)))
+        content.add_widget(login_row("密码", self._make_modern_input_shell(password_input)))
+        confirm_row = login_row("确认密码", self._make_modern_input_shell(confirm_input))
+        nick_row = login_row("昵称", self._make_modern_input_shell(nick_input))
         content.add_widget(confirm_row)
         content.add_widget(nick_row)
-        hint = make_label(text="登录：输入已有密码。注册：首次创建聊天库。仅收发：进入旧接收页，不启用聊天。", size_hint_y=None, height=dp(54), halign="left", valign="middle", color=THEME["muted_text"])
+        hint = make_label(text="登录：输入已有密码。注册：首次创建聊天库。仅收发：进入旧接收页，不启用聊天。", size_hint_y=None, height=dp(48), halign="left", valign="middle", color=THEME["muted_text"])
         bind_label_wrap(hint)
         content.add_widget(hint)
-        buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
-        popup = style_popup(Popup(title="AgoraLink 启动", content=content, size_hint=(0.64, 0.60), auto_dismiss=False))
+        buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(8))
+        popup = style_popup(Popup(title="AgoraLink 启动", content=content, size_hint=(0.62, 0.76), auto_dismiss=False))
+
+        def set_hint(text: str, *, error: bool = False) -> None:
+            hint.text = str(text or "")
+            hint.color = (
+                ui_component_color("danger")
+                if error and ui_component_color is not None
+                else (THEME["danger"] if error else THEME["muted_text"])
+            )
 
         def _sync_mode(*_):
             mode = mode_spinner.text
@@ -4690,11 +4875,11 @@ class RUDPTransferRoot(BoxLayout):
             confirm_row.opacity = 1.0 if is_register else 0.35
             nick_row.opacity = 1.0 if is_register else 0.35
             if mode == "登录":
-                hint.text = "输入已注册聊天库密码。无需确认密码。"
+                set_hint("输入已注册聊天库密码。无需确认密码。")
             elif mode == "注册":
-                hint.text = "首次创建聊天库时需要密码、确认密码和昵称。"
+                set_hint("首次创建聊天库时需要密码、确认密码和昵称。")
             else:
-                hint.text = "仅收发模式：进入旧接收页，保留设备发现、文件发送和文件接收，不启用聊天。"
+                set_hint("仅收发模式：进入旧接收页，保留设备发现、文件发送和文件接收，不启用聊天。")
         mode_spinner.bind(text=lambda *_: _sync_mode())
         _sync_mode()
 
@@ -4715,24 +4900,24 @@ class RUDPTransferRoot(BoxLayout):
             nick = nick_input.text.strip() or "AgoraLinkUser"
             exists_now = Path(db_path).expanduser().exists()
             if not pwd:
-                hint.text = "密码不能为空。"
+                set_hint("密码不能为空。", error=True)
                 return
             if mode == "登录":
                 if not exists_now:
-                    hint.text = "聊天库不存在，请切换到注册。"
+                    set_hint("聊天库不存在，请切换到注册。", error=True)
                     return
             if mode == "注册":
                 if exists_now:
-                    hint.text = "聊天库已存在。请登录，或先使用重置。"
+                    set_hint("聊天库已存在。请登录，或先使用重置。", error=True)
                     return
                 if pwd != confirm:
-                    hint.text = "注册时密码和确认密码必须一致。"
+                    set_hint("注册时密码和确认密码必须一致。", error=True)
                     return
             try:
                 self.unlock_chat_with(db_path, pwd, nick)
                 popup.dismiss()
             except Exception as exc:
-                hint.text = f"解锁失败: {exc}"
+                set_hint(f"解锁失败: {exc}", error=True)
 
         def _reset(_btn=None):
             db_path = Path(db_input.text.strip() or self.chat_db_path).expanduser()
@@ -4748,16 +4933,16 @@ class RUDPTransferRoot(BoxLayout):
                         pass
                 pop2.dismiss()
                 mode_spinner.text = "注册"
-                hint.text = "聊天库已删除。请选择注册并输入新密码和昵称。"
-            line.add_widget(make_button("danger", text="确认重置", on_release=_do_reset))
-            line.add_widget(make_button("secondary", text="取消", on_release=lambda *_: pop2.dismiss()))
+                set_hint("聊天库已删除。请选择注册并输入新密码和昵称。")
+            line.add_widget(self._make_modern_or_legacy_button("danger", text="确认重置", size_hint_x=1, height=36, on_release=_do_reset))
+            line.add_widget(self._make_modern_or_legacy_button("secondary", text="取消", size_hint_x=1, height=36, on_release=lambda *_: pop2.dismiss()))
             content2.add_widget(line)
             apply_ui_font(content2)
             pop2.open()
 
-        buttons.add_widget(make_button("primary", text="进入", on_release=_submit))
-        buttons.add_widget(make_button("secondary", text="仅收发", on_release=_enter_basic))
-        buttons.add_widget(make_button("danger", text="忘记密码/重置", on_release=_reset))
+        buttons.add_widget(self._make_modern_or_legacy_button("primary", text="进入", size_hint_x=1, height=38, on_release=_submit))
+        buttons.add_widget(self._make_modern_or_legacy_button("secondary", text="仅收发", size_hint_x=1, height=38, on_release=_enter_basic))
+        buttons.add_widget(self._make_modern_or_legacy_button("danger", text="忘记密码/重置", size_hint_x=1, height=38, on_release=_reset))
         content.add_widget(buttons)
         apply_ui_font(content)
         popup.open()
@@ -5150,6 +5335,185 @@ class RUDPTransferRoot(BoxLayout):
             f"{self._format_udp_port_diagnostics(state)}"
         )
 
+    def _diagnostic_section_title(self, text: str, subtitle: str = "") -> BoxLayout:
+        box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(46 if subtitle else 28), spacing=dp(2))
+        title = make_label(
+            text=str(text or ""),
+            size_hint_y=None,
+            height=dp(24),
+            halign="left",
+            valign="middle",
+            bold=True,
+            color=ui_component_color("text_primary") if ui_component_color is not None else THEME["text"],
+        )
+        bind_label_wrap(title)
+        box.add_widget(title)
+        if subtitle:
+            sub = make_label(
+                text=str(subtitle or ""),
+                size_hint_y=None,
+                height=dp(18),
+                halign="left",
+                valign="middle",
+                color=THEME["muted_text"],
+                shorten=True,
+            )
+            bind_label_wrap(sub)
+            box.add_widget(sub)
+        return box
+
+    def _diagnostic_status_card(self, title: str, status: str, detail: str, kind: str = "neutral"):
+        try:
+            card = UIRoundedCard(
+                orientation="vertical",
+                size_hint_y=None,
+                height=dp(78),
+                spacing=dp(6),
+                padding=(dp(12), dp(10), dp(12), dp(8)),
+                radius=16,
+                bg_color=ui_component_color("surface"),
+                border_color=ui_component_color("danger_soft" if kind in ("danger", "failed") else "border_soft"),
+            )
+            header = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(24), spacing=dp(8))
+            title_label = make_label(
+                text=str(title or ""),
+                size_hint_x=1,
+                halign="left",
+                valign="middle",
+                bold=True,
+                shorten=True,
+                color=ui_component_color("text_primary") if ui_component_color is not None else THEME["text"],
+            )
+            bind_label_wrap(title_label)
+            badge_kind = "failed" if kind == "danger" else ("warning" if kind == "warning" else ("accent" if kind == "accent" else "neutral"))
+            badge = UIStatusBadge(text=str(status or ""), status=badge_kind, max_width=dp(120))
+            header.add_widget(title_label)
+            header.add_widget(badge)
+            detail_label = make_label(
+                text=str(detail or "-"),
+                size_hint_y=None,
+                height=dp(30),
+                halign="left",
+                valign="top",
+                color=ui_component_color("danger" if kind == "danger" else "text_secondary") if ui_component_color is not None else THEME["muted_text"],
+                shorten=True,
+                shorten_from="right",
+            )
+            bind_label_wrap(detail_label)
+            card.add_widget(header)
+            card.add_widget(detail_label)
+            return card
+        except Exception:
+            card = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(78), spacing=dp(4), padding=dp(10))
+            apply_card_background(card, "panel_bg", radius=16)
+            card.add_widget(make_label(text=f"{title}  {status}", size_hint_y=None, height=dp(24), halign="left", valign="middle", bold=True))
+            detail_label = make_label(text=str(detail or "-"), size_hint_y=None, height=dp(30), halign="left", valign="top", color=THEME["muted_text"])
+            bind_label_wrap(detail_label)
+            card.add_widget(detail_label)
+            return card
+
+    def _recent_error_summary(self, max_lines: int = 4) -> str:
+        lines = list(getattr(self, "debug_runtime_lines", []) or []) + list(getattr(self, "debug_protocol_lines", []) or [])
+        markers = ("error", "failed", "fail", "traceback", "exception", "错误", "失败", "异常")
+        picked = []
+        for line in reversed(lines):
+            text = str(line or "").strip()
+            if text and any(marker in text.lower() for marker in markers):
+                picked.append(text)
+            if len(picked) >= max_lines:
+                break
+        return "\n".join(reversed(picked)) if picked else "暂无最近错误。"
+
+    def _tail_text(self, lines: List[str], *, max_lines: int = 24, max_chars: int = 5000, fallback: str = "暂无日志。") -> str:
+        text = "\n".join([str(item or "") for item in (lines or [])[-max_lines:]]).strip()
+        return text[-max_chars:] if text else fallback
+
+    def _diagnostic_snapshot(self) -> Dict[str, object]:
+        try:
+            runtime_state = dict(self._screen_runtime().get_state())
+        except Exception as exc:
+            runtime_state = {"state": "error", "last_error": str(exc)}
+        try:
+            deps = dict(self._screen_runtime().check_dependencies())
+        except Exception as exc:
+            deps = {"ok": False, "error": str(exc)}
+        try:
+            receiver_running = bool(getattr(self, "receiver_worker", None) and self.receiver_worker.is_running())
+        except Exception:
+            receiver_running = False
+        try:
+            main_port = udp_port_status(MAIN_UDP_PORT)
+        except Exception as exc:
+            main_port = {"available": False, "occupied": False, "error": str(exc), "port": MAIN_UDP_PORT}
+        try:
+            screen_ports = udp_ports_status(SCREEN_PORT_CANDIDATES)
+        except Exception:
+            screen_ports = []
+        return {
+            "runtime_state": runtime_state,
+            "dependencies": deps,
+            "receiver_running": receiver_running,
+            "main_port": main_port,
+            "screen_ports": screen_ports,
+            "recent_errors": self._recent_error_summary(),
+        }
+
+    def _diagnostic_udp_9999_summary(self, snapshot: Dict[str, object]) -> Tuple[str, str, str]:
+        main = dict(snapshot.get("main_port") or {})
+        receiver_running = bool(snapshot.get("receiver_running"))
+        if main.get("available"):
+            return "正常", "UDP 9999：当前可用", "neutral"
+        if receiver_running and main.get("occupied"):
+            return "正常", "UDP 9999：本机 AgoraLink 接收端正在使用", "neutral"
+        if main.get("occupied"):
+            return "异常", MAIN_UDP_PORT_BUSY_MESSAGE, "danger"
+        return "需检查", f"UDP 9999 检测失败：{main.get('error') or '未知错误'}", "warning"
+
+    def _diagnostic_screen_ports_summary(self, snapshot: Dict[str, object]) -> Tuple[str, str, str]:
+        statuses = list(snapshot.get("screen_ports") or [])
+        if not statuses:
+            return "需检查", "投屏端口 50020-50025 状态暂不可用。", "warning"
+        occupied = [str(item.get("port")) for item in statuses if not item.get("available")]
+        available = [str(item.get("port")) for item in statuses if item.get("available")]
+        current = self._current_screen_port_text(dict(snapshot.get("runtime_state") or {})) or "无"
+        if len(available) == 0:
+            return "异常", "投屏端口 50020-50025 均被占用，无法启动接收端。", "danger"
+        if occupied:
+            return "可用", f"可用：{', '.join(available)}；占用：{', '.join(occupied)}；当前：{current}", "warning"
+        return "正常", f"50020-50025 均可用；当前投屏端口：{current}", "neutral"
+
+    def _diagnostic_dependencies_summary(self, snapshot: Dict[str, object]) -> Tuple[str, str, str]:
+        deps = dict(snapshot.get("dependencies") or {})
+        ffmpeg_ok = bool(deps.get("ffmpeg_ok"))
+        ffplay_ok = bool(deps.get("ffplay_ok"))
+        if ffmpeg_ok and ffplay_ok:
+            return "正常", "FFmpeg 与 ffplay 已找到。", "neutral"
+        missing = []
+        if not ffmpeg_ok:
+            missing.append("ffmpeg")
+        if not ffplay_ok:
+            missing.append("ffplay")
+        hint = deps.get("install_hint") or "winget install --id Gyan.FFmpeg -e"
+        return "异常", f"缺少 {', '.join(missing)}。安装命令：{hint}", "danger"
+
+    def _diagnostic_runtime_summary(self, snapshot: Dict[str, object]) -> Tuple[str, str, str]:
+        state = dict(snapshot.get("runtime_state") or {})
+        runtime_state = str(state.get("state") or "idle")
+        running = bool(state.get("running"))
+        mode = str(state.get("mode") or "-")
+        profile = self._current_screen_profile_name(state) or str(state.get("profile") or "-")
+        port = self._current_screen_port_text(state) or "-"
+        if runtime_state == "error":
+            return "异常", str(state.get("last_error") or "screen runtime error"), "danger"
+        if running:
+            return "运行中", f"{runtime_state} / {mode}，profile: {profile}，port: {port}", "accent"
+        return "空闲", f"screen runtime: {runtime_state}", "neutral"
+
+    def _diagnostic_receiver_summary(self, snapshot: Dict[str, object]) -> Tuple[str, str, str]:
+        if bool(snapshot.get("receiver_running")):
+            return "运行中", "AgoraLink 接收端正在运行。", "accent"
+        return "未运行", "接收端未运行；需要收文件或聊天时请启动接收端。", "warning"
+
     def _refresh_screen_runtime_status(self, status_label: Label) -> None:
         try:
             state = self._screen_runtime().get_state()
@@ -5206,7 +5570,7 @@ class RUDPTransferRoot(BoxLayout):
         if not active and str(getattr(self, "screen_share_ui_state", "idle") or "") not in ("pending_offer", "pending_accept"):
             self.screen_share_ui_state = "idle"
         self.main_screen_btn.text = self._screen_share_button_text(active)
-        self.main_screen_btn.width = dp(106)
+        self.main_screen_btn.width = dp(104)
         self._style_modern_or_legacy_button(self.main_screen_btn, "danger" if active else "secondary")
 
     def _schedule_screen_share_button_refresh(self) -> None:
@@ -6164,66 +6528,134 @@ class RUDPTransferRoot(BoxLayout):
             self._set_screen_share_ui_state("idle")
 
     def open_debug_popup(self) -> None:
-        content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
-        intro = make_label(
-            text="诊断窗口用于排查问题；普通设置不会显示这些协议日志。",
+        content = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(14))
+        header = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(54), spacing=dp(2))
+        title = make_label(
+            text="诊断",
             size_hint_y=None,
-            height=dp(36),
+            height=dp(28),
             halign="left",
             valign="middle",
-            color=THEME["muted_text"],
+            bold=True,
+            color=ui_component_color("text_primary") if ui_component_color is not None else THEME["text"],
         )
-        bind_label_wrap(intro)
-        content.add_widget(intro)
-        screen_box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(292), spacing=dp(6))
-        screen_title = make_label(
-            text="Screen share debug (FFmpeg/UDP only)",
+        intro = make_label(
+            text="状态摘要优先显示；原始日志和路径信息放在下方详细区域。",
             size_hint_y=None,
             height=dp(24),
             halign="left",
             valign="middle",
             color=THEME["muted_text"],
+            shorten=True,
         )
-        bind_label_wrap(screen_title)
-        screen_box.add_widget(screen_title)
+        bind_label_wrap(title)
+        bind_label_wrap(intro)
+        header.add_widget(title)
+        header.add_widget(intro)
+        content.add_widget(header)
+
+        scroll = ScrollView(size_hint_y=1)
+        body = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(10), padding=(0, 0, 0, dp(6)))
+        body.bind(minimum_height=body.setter("height"))
+        scroll.add_widget(body)
+
+        summary_grid = GridLayout(cols=2, size_hint_y=None, spacing=dp(10))
+        summary_grid.bind(minimum_height=summary_grid.setter("height"))
+        summary_grid.height = dp(250)
+
+        def _populate_summary() -> None:
+            summary_grid.clear_widgets()
+            snapshot = self._diagnostic_snapshot()
+            cards = [
+                ("接收端状态",) + self._diagnostic_receiver_summary(snapshot),
+                ("UDP 9999 状态",) + self._diagnostic_udp_9999_summary(snapshot),
+                ("投屏端口 50020-50025",) + self._diagnostic_screen_ports_summary(snapshot),
+                ("FFmpeg / ffplay",) + self._diagnostic_dependencies_summary(snapshot),
+                ("screen runtime",) + self._diagnostic_runtime_summary(snapshot),
+            ]
+            recent_errors = str(snapshot.get("recent_errors") or "").strip()
+            cards.append(("最近错误摘要", "异常" if recent_errors != "暂无最近错误。" else "正常", recent_errors.splitlines()[-1] if recent_errors else "暂无最近错误。", "danger" if recent_errors != "暂无最近错误。" else "neutral"))
+            for title_text, status_text, detail_text, kind in cards:
+                summary_grid.add_widget(self._diagnostic_status_card(title_text, status_text, detail_text, kind))
+            rows = (len(cards) + 1) // 2
+            summary_grid.height = rows * dp(78) + max(0, rows - 1) * dp(10)
+
+        body.add_widget(self._diagnostic_section_title("Summary", "关键状态先看这里；正常状态保持低噪声显示。"))
+        body.add_widget(summary_grid)
+        _populate_summary()
+
         screen_target_input = make_input(text="", hint_text="Target receiver IP", multiline=False, size_hint_x=1)
-        screen_target_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(8))
-        screen_target_row.add_widget(make_label(text="Target IP", size_hint_x=None, width=dp(92), halign="right", valign="middle", color=THEME["muted_text"]))
-        screen_target_row.add_widget(screen_target_input)
-        screen_box.add_widget(screen_target_row)
-        screen_buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(34), spacing=dp(8))
         screen_status_label = make_label(
             text="",
             size_hint_y=None,
-            height=dp(196),
+            height=dp(116),
             halign="left",
             valign="top",
             color=THEME["muted_text"],
         )
         bind_label_wrap(screen_status_label)
-        screen_buttons.add_widget(make_button("secondary", text="Receive screen", on_release=lambda *_: Clock.schedule_once(lambda _dt: self._screen_debug_start_receiver(screen_status_label), 0)))
-        screen_buttons.add_widget(make_button("secondary", text="Send screen", on_release=lambda *_: Clock.schedule_once(lambda _dt: self._screen_debug_start_sender(screen_target_input, screen_status_label), 0)))
-        screen_buttons.add_widget(make_button("danger", text="Stop screen", on_release=lambda *_: Clock.schedule_once(lambda _dt: self._screen_debug_stop(screen_status_label), 0)))
-        screen_buttons.add_widget(make_button("secondary", text="Refresh", on_release=lambda *_: self._schedule_screen_runtime_status(screen_status_label)))
-        screen_box.add_widget(screen_buttons)
-        screen_box.add_widget(screen_status_label)
+
+        body.add_widget(self._diagnostic_section_title("Screen", "FFmpeg/UDP 投屏调试入口；视频流仍不经过 RUDP 文件队列。"))
+        if UIRoundedCard is not None and ui_component_color is not None:
+            screen_card = UIRoundedCard(
+                orientation="vertical",
+                size_hint_y=None,
+                height=dp(218),
+                spacing=dp(8),
+                padding=(dp(12), dp(10), dp(12), dp(10)),
+                radius=16,
+                bg_color=ui_component_color("surface"),
+                border_color=ui_component_color("border_soft"),
+            )
+        else:
+            screen_card = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(218), spacing=dp(8), padding=dp(10))
+            apply_card_background(screen_card, "panel_bg", radius=16)
+        screen_target_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(8))
+        screen_target_row.add_widget(make_label(text="Target IP", size_hint_x=None, width=dp(92), halign="right", valign="middle", color=THEME["muted_text"]))
+        screen_target_row.add_widget(self._make_modern_input_shell(screen_target_input))
+        screen_card.add_widget(screen_target_row)
+        screen_buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(36), spacing=dp(8))
+
+        def _refresh_screen_details(*_):
+            self._schedule_screen_runtime_status(screen_status_label)
+            Clock.schedule_once(lambda _dt: _populate_summary(), 0.05)
+
+        screen_buttons.add_widget(self._make_modern_or_legacy_button("secondary", text="Receive screen", size_hint_x=1, height=34, compact=True, on_release=lambda *_: Clock.schedule_once(lambda _dt: (self._screen_debug_start_receiver(screen_status_label), _populate_summary()), 0)))
+        screen_buttons.add_widget(self._make_modern_or_legacy_button("secondary", text="Send screen", size_hint_x=1, height=34, compact=True, on_release=lambda *_: Clock.schedule_once(lambda _dt: (self._screen_debug_start_sender(screen_target_input, screen_status_label), _populate_summary()), 0)))
+        screen_buttons.add_widget(self._make_modern_or_legacy_button("danger", text="Stop screen", size_hint_x=1, height=34, compact=True, on_release=lambda *_: Clock.schedule_once(lambda _dt: (self._screen_debug_stop(screen_status_label), _populate_summary()), 0)))
+        screen_buttons.add_widget(self._make_modern_or_legacy_button("secondary", text="Refresh", size_hint_x=1, height=34, compact=True, on_release=_refresh_screen_details))
+        screen_card.add_widget(screen_buttons)
+        screen_card.add_widget(screen_status_label)
         self._schedule_screen_runtime_status(screen_status_label)
-        content.add_widget(screen_box)
-        log = LogBox(size_hint_y=1)
-        protocol_text = "\n".join(self.debug_protocol_lines[-160:]) or "暂无协议日志。"
-        runtime_text = "\n".join(self.debug_runtime_lines[-120:]) or "暂无运行日志。"
+        body.add_widget(screen_card)
+
+        snapshot = self._diagnostic_snapshot()
+        network_detail = self._format_udp_port_diagnostics(dict(snapshot.get("runtime_state") or {}))
+        body.add_widget(self._diagnostic_section_title("Network", "端口检测只绑定临时 socket，检测后立即释放。"))
+        network_log = LogBox(size_hint_y=None, height=dp(112))
+        network_log.append(network_detail)
+        body.add_widget(network_log)
+
+        body.add_widget(self._diagnostic_section_title("Logs", "默认只显示最近摘要；完整日志请导出诊断包。"))
+        log = LogBox(size_hint_y=None, height=dp(152))
+        protocol_text = self._tail_text(list(getattr(self, "debug_protocol_lines", []) or []), max_lines=36, max_chars=6000, fallback="暂无协议日志。")
+        runtime_text = self._tail_text(list(getattr(self, "debug_runtime_lines", []) or []), max_lines=28, max_chars=5000, fallback="暂无运行日志。")
+        error_text = self._recent_error_summary(max_lines=6)
         log.append(
-            "重点搜索：CHAT_MESSAGE_JSON、TRANSFER_REQUEST_JSON、Session saved、end reason=complete、LAN_STATS。\n"
-            "若窗口日志为空，可查看本机 AppData\\Local\\AgoraLink\\debug\\sender_worker.log。\n\n"
-            "=== Protocol ===\n"
-            + protocol_text[-12000:]
-            + "\n\n=== Runtime ===\n"
-            + runtime_text[-12000:]
+            "最近错误摘要：\n"
+            + error_text
+            + "\n\n=== Protocol tail ===\n"
+            + protocol_text
+            + "\n\n=== Runtime tail ===\n"
+            + runtime_text
             + "\n"
         )
-        content.add_widget(log)
-        buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
-        popup = style_popup(Popup(title="诊断", content=content, size_hint=(0.78, 0.72)))
+        body.add_widget(log)
+        content.add_widget(scroll)
+
+        buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(8))
+        popup = style_popup(Popup(title="诊断", content=content, size_hint=(0.82, 0.84)))
+
         def _export(*_):
             try:
                 path = self.export_diagnostic_logs()
@@ -6233,9 +6665,10 @@ class RUDPTransferRoot(BoxLayout):
                     log.append("\n诊断包导出失败：请查看发送日志中的错误信息。\n")
             except Exception as exc:
                 log.append(f"\n诊断包导出失败: {exc}\n")
-        buttons.add_widget(make_button("primary", text="导出诊断包", on_release=_export))
-        buttons.add_widget(make_button("secondary", text="UI Preview", on_release=lambda *_: self.open_ui_preview()))
-        buttons.add_widget(make_button("secondary", text="关闭", on_release=lambda *_: popup.dismiss()))
+
+        buttons.add_widget(self._make_modern_or_legacy_button("primary", text="导出诊断包", size_hint_x=1, height=38, on_release=_export))
+        buttons.add_widget(self._make_modern_or_legacy_button("secondary", text="UI Preview", width=112, height=38, on_release=lambda *_: self.open_ui_preview()))
+        buttons.add_widget(self._make_modern_or_legacy_button("secondary", text="关闭", width=88, height=38, on_release=lambda *_: popup.dismiss()))
         content.add_widget(buttons)
         apply_ui_font(content)
         popup.open()

@@ -48,8 +48,16 @@ UI_FONT = _register_font_alias("AgoraLinkPreviewUI", THEME.fonts["ui"])
 MONO_FONT = _register_font_alias("AgoraLinkPreviewMono", THEME.fonts["mono"])
 
 
-def color(name: str, alpha: Optional[float] = None, theme: Theme = THEME) -> List[float]:
-    rgba = list(theme.colors.get(name, theme.colors["text_primary"]))
+def set_theme(theme: Theme) -> None:
+    """Set the active theme for newly created preview widgets."""
+    global THEME
+    if isinstance(theme, Theme):
+        THEME = theme
+
+
+def color(name: str, alpha: Optional[float] = None, theme: Optional[Theme] = None) -> List[float]:
+    active = theme or THEME
+    rgba = list(active.colors.get(name, active.colors["text_primary"]))
     if alpha is not None:
         rgba[3] = float(alpha)
     return rgba
@@ -231,6 +239,8 @@ class RoundedCard(_RoundedCanvasMixin, BoxLayout):
         kwargs.setdefault("orientation", "vertical")
         kwargs.setdefault("spacing", dp(THEME.spacing["sm"]))
         kwargs.setdefault("padding", [dp(THEME.spacing["md"])] * 4)
+        kwargs.setdefault("bg_color", color("surface"))
+        kwargs.setdefault("border_color", color("border"))
         super().__init__(**kwargs)
         self._init_rounded_canvas()
 
@@ -238,6 +248,8 @@ class RoundedCard(_RoundedCanvasMixin, BoxLayout):
 class RoundedButton(ButtonBehavior, Label):
     """Rounded text button with subtle hover and press feedback."""
 
+    variant = StringProperty("")
+    compact = BooleanProperty(False)
     bg_normal = ListProperty(color("surface_muted"))
     bg_hover = ListProperty(color("accent_soft"))
     bg_down = ListProperty(color("accent"))
@@ -249,16 +261,18 @@ class RoundedButton(ButtonBehavior, Label):
     hovered = BooleanProperty(False)
 
     def __init__(self, **kwargs):
+        is_compact = bool(kwargs.get("compact", False))
         kwargs.setdefault("font_name", UI_FONT)
-        kwargs.setdefault("font_size", sp(THEME.font_size["body"]))
+        kwargs.setdefault("font_size", sp(THEME.font_size["caption"] if is_compact else THEME.font_size["body"]))
         kwargs.setdefault("halign", "center")
         kwargs.setdefault("valign", "middle")
         kwargs.setdefault("shorten", True)
         kwargs.setdefault("shorten_from", "right")
         kwargs.setdefault("size_hint_y", None)
-        kwargs.setdefault("height", dp(38))
+        kwargs.setdefault("height", dp(32 if is_compact else 38))
         super().__init__(**kwargs)
         self._disable_default_button_background()
+        self._apply_variant()
         self.color = self.text_normal
         self.fill_color = list(self.bg_normal)
         self.bind(size=lambda inst, _value: setattr(inst, "text_size", (max(1, inst.width - dp(16)), max(1, inst.height))))
@@ -273,16 +287,20 @@ class RoundedButton(ButtonBehavior, Label):
             radius=self._update_button_canvas,
             fill_color=self._update_button_canvas,
             border_color=self._update_button_canvas,
+            variant=lambda *_: self._apply_variant(),
+            disabled=lambda *_: self._refresh_button_state(animated=False),
             state=lambda *_: self._refresh_button_state(animated=True),
             hovered=lambda *_: self._refresh_button_state(animated=True),
         )
         Window.bind(mouse_pos=self._on_mouse_pos)
+        self.bind(parent=self._on_parent)
         self._update_button_canvas()
 
     def _disable_default_button_background(self) -> None:
         for name, value in (
             ("background_normal", ""),
             ("background_down", ""),
+            ("background_disabled_normal", ""),
             ("background_color", (0, 0, 0, 0)),
         ):
             try:
@@ -302,9 +320,53 @@ class RoundedButton(ButtonBehavior, Label):
             return
         self.hovered = self.collide_point(*pos)
 
+    def _on_parent(self, _instance, parent) -> None:
+        if parent is not None:
+            return
+        try:
+            Window.unbind(mouse_pos=self._on_mouse_pos)
+        except Exception:
+            pass
+
+    def _apply_variant(self, *_args) -> None:
+        variant = str(self.variant or "").strip().lower()
+        if variant in ("primary", "active", "success", "accent"):
+            self.bg_normal = color("accent")
+            self.bg_hover = color("accent_hover")
+            self.bg_down = color("accent_hover")
+            self.text_normal = color("white")
+            self.text_down = color("white")
+            self.border_color = color("accent")
+        elif variant in ("danger", "destructive", "reject"):
+            self.bg_normal = color("danger_soft")
+            self.bg_hover = color("danger_soft")
+            self.bg_down = color("danger_soft")
+            self.text_normal = color("danger")
+            self.text_down = color("danger")
+            self.border_color = color("border")
+        elif variant == "ghost":
+            self.bg_normal = color("transparent")
+            self.bg_hover = color("surface_muted")
+            self.bg_down = color("accent_soft")
+            self.text_normal = color("text_secondary")
+            self.text_down = color("text_primary")
+            self.border_color = color("transparent")
+        elif variant in ("", "secondary"):
+            self.bg_normal = color("surface_muted")
+            self.bg_hover = color("accent_soft")
+            self.bg_down = color("accent_soft")
+            self.text_normal = color("text_primary")
+            self.text_down = color("text_primary")
+            self.border_color = color("border")
+        self._refresh_button_state(animated=False)
+
     def _refresh_button_state(self, animated: bool = False) -> None:
-        target = list(self.bg_down if self.state == "down" else (self.bg_hover if self.hovered else self.bg_normal))
-        self.color = self.text_down if self.state == "down" else self.text_normal
+        if self.disabled:
+            target = _mix(list(self.bg_normal), color("surface"), 0.50)
+            self.color = color("text_muted")
+        else:
+            target = list(self.bg_down if self.state == "down" else (self.bg_hover if self.hovered else self.bg_normal))
+            self.color = self.text_down if self.state == "down" else self.text_normal
         if animated:
             Animation.cancel_all(self, "fill_color")
             Animation(fill_color=target, d=0.14, t="out_quad").start(self)
@@ -409,9 +471,9 @@ class ConversationItem(ButtonBehavior, RoundedCard):
 
     def __init__(self, **kwargs):
         kwargs.setdefault("size_hint_y", None)
-        kwargs.setdefault("height", dp(62))
+        kwargs.setdefault("height", dp(60))
         kwargs.setdefault("padding", [dp(12), dp(8), dp(12), dp(8)])
-        kwargs.setdefault("spacing", dp(3))
+        kwargs.setdefault("spacing", dp(4))
         kwargs.setdefault("radius", THEME.radius["medium"])
         kwargs.setdefault("bg_color", color("surface"))
         kwargs.setdefault("border_color", color("border_soft"))
@@ -576,8 +638,8 @@ class MessageBubble(RoundedCard):
     message = StringProperty("")
 
     def __init__(self, **kwargs):
-        kwargs.setdefault("padding", [dp(14), dp(10), dp(14), dp(8)])
-        kwargs.setdefault("spacing", dp(5))
+        kwargs.setdefault("padding", [dp(14), dp(10), dp(14), dp(10)])
+        kwargs.setdefault("spacing", dp(4))
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("size_hint_x", 0.78)
         kwargs.setdefault("radius", THEME.radius["card"])
@@ -634,6 +696,8 @@ class RoundedProgressBar(Widget):
     def __init__(self, **kwargs):
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("height", dp(8))
+        kwargs.setdefault("track_color", color("surface_muted"))
+        kwargs.setdefault("fill_color", color("accent"))
         super().__init__(**kwargs)
         with self.canvas:
             self._track_color = Color(*self.track_color)
@@ -671,7 +735,7 @@ class FileTransferCard(_CardActionsMixin, RoundedCard):
         actions = kwargs.pop("actions", None)
         on_action = kwargs.pop("on_action", None)
         kwargs.setdefault("size_hint_y", None)
-        kwargs.setdefault("padding", [dp(16), dp(14), dp(16), dp(14)])
+        kwargs.setdefault("padding", [dp(14), dp(12), dp(14), dp(12)])
         kwargs.setdefault("spacing", dp(8))
         kwargs.setdefault("bg_color", color("surface_blue"))
         kwargs.setdefault("border_color", color("border"))
@@ -717,7 +781,7 @@ class ScreenShareCard(_CardActionsMixin, RoundedCard):
         actions = kwargs.pop("actions", None)
         on_action = kwargs.pop("on_action", None)
         kwargs.setdefault("size_hint_y", None)
-        kwargs.setdefault("padding", [dp(16), dp(14), dp(16), dp(14)])
+        kwargs.setdefault("padding", [dp(14), dp(12), dp(14), dp(12)])
         kwargs.setdefault("spacing", dp(8))
         kwargs.setdefault("bg_color", color("surface_blue"))
         kwargs.setdefault("border_color", color("border"))
