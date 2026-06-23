@@ -2177,6 +2177,7 @@ class RUDPTransferRoot(BoxLayout):
         # The second line is informational; it must not create another UI message.
         self._recent_chat_json_seen: Dict[Tuple[str, str], float] = {}
         self._chat_render_sig: Optional[Tuple[object, ...]] = None
+        self._chat_render_generation = 0
         self.pending_outgoing_contact_requests: Dict[str, Dict[str, object]] = {}
         self._build()
         self.refresh_texts()
@@ -2788,7 +2789,7 @@ class RUDPTransferRoot(BoxLayout):
             self._hide_detail_panel()
         else:
             self._show_detail_panel()
-            self.render_current_chat()
+            self.render_current_chat(reason="detail_panel")
 
     def toggle_online_state(self) -> None:
         try:
@@ -3472,7 +3473,7 @@ class RUDPTransferRoot(BoxLayout):
             # Online device row. Do not auto-save contact.
             self.current_chat_mode = "device"
             self.current_chat_title.text = ""
-        self.render_current_chat()
+        self.render_current_chat(reason="switch")
 
     def _transfer_store_tick(self) -> float:
         if self.file_transfer_service is None:
@@ -3605,6 +3606,22 @@ class RUDPTransferRoot(BoxLayout):
         except Exception:
             pass
 
+    def _bump_chat_render_generation(self) -> int:
+        self._chat_render_generation = int(getattr(self, "_chat_render_generation", 0) or 0) + 1
+        return self._chat_render_generation
+
+    def _sync_chat_render_signature(self) -> None:
+        try:
+            sig = self._current_chat_signature()
+            if sig is not None:
+                self._chat_render_sig = sig
+        except Exception:
+            pass
+
+    def _note_chat_live_update(self) -> None:
+        self._bump_chat_render_generation()
+        self._sync_chat_render_signature()
+
     def _message_matches_current_chat(self, msg: Dict[str, object]) -> bool:
         group_id = str((msg or {}).get("group_id") or "").strip()
         if self.current_chat_mode == "group" and self.current_group_id:
@@ -3650,6 +3667,7 @@ class RUDPTransferRoot(BoxLayout):
             show_sender=self.current_chat_mode == "group",
         )
         self._mark_chat_message_rendered(data)
+        self._note_chat_live_update()
         return True
 
     def _chat_card_matches_current(self, card: Dict[str, object]) -> bool:
@@ -3769,6 +3787,8 @@ class RUDPTransferRoot(BoxLayout):
                     self.chat_runtime_cards[idx] = data
                     if should_update_widget:
                         self._update_runtime_chat_card_widget(data)
+                    if self._chat_card_matches_current(data):
+                        self._note_chat_live_update()
                     return data
         if meta.get("render_sequence") in (None, ""):
             meta["render_sequence"] = self._next_runtime_card_sequence()
@@ -3779,6 +3799,8 @@ class RUDPTransferRoot(BoxLayout):
             self.chat_runtime_cards = self.chat_runtime_cards[-160:]
         if should_update_widget:
             self._update_runtime_chat_card_widget(data)
+        if self._chat_card_matches_current(data):
+            self._note_chat_live_update()
         return data
 
     def _update_runtime_chat_card_widget(self, card: Dict[str, object]) -> None:
@@ -4354,17 +4376,17 @@ class RUDPTransferRoot(BoxLayout):
         try:
             if self.current_chat_mode == "group" and self.current_group_id:
                 row = store.db.conn.execute(
-                    "SELECT COUNT(*) AS n, COALESCE(MAX(created_at),0) AS t, COALESCE(MAX(delivered_at),0) AS d, COALESCE(MAX(read_at),0) AS r FROM messages WHERE group_id=?",
+                    "SELECT COUNT(*) AS n, COALESCE(MAX(created_at),0) AS t FROM messages WHERE group_id=?",
                     (self.current_group_id,),
                 ).fetchone()
-                return ("group", self.current_group_id, int(row["n"] or 0), float(row["t"] or 0), float(row["d"] or 0), float(row["r"] or 0))
+                return ("group", self.current_group_id, int(row["n"] or 0), float(row["t"] or 0))
             if self.current_chat_mode == "direct" and self.current_peer_id:
                 conv = self.message_service.create_direct_conversation(self.current_peer_id)
                 row = store.db.conn.execute(
-                    "SELECT COUNT(*) AS n, COALESCE(MAX(created_at),0) AS t, COALESCE(MAX(delivered_at),0) AS d, COALESCE(MAX(read_at),0) AS r FROM messages WHERE conversation_id=?",
+                    "SELECT COUNT(*) AS n, COALESCE(MAX(created_at),0) AS t FROM messages WHERE conversation_id=?",
                     (conv,),
                 ).fetchone()
-                return ("direct", conv, int(row["n"] or 0), float(row["t"] or 0), float(row["d"] or 0), float(row["r"] or 0))
+                return ("direct", conv, int(row["n"] or 0), float(row["t"] or 0))
         except Exception:
             return None
         return None
@@ -4372,12 +4394,14 @@ class RUDPTransferRoot(BoxLayout):
     def _auto_refresh_current_chat(self) -> None:
         sig = self._current_chat_signature()
         if sig is not None and sig != getattr(self, "_chat_render_sig", None):
-            self.render_current_chat()
+            self._force_chat_refresh(reason="history_sync")
 
-    def _force_chat_refresh(self) -> None:
+    def _force_chat_refresh(self, reason: str = "manual_refresh", generation: Optional[int] = None) -> None:
+        if generation is not None and generation != getattr(self, "_chat_render_generation", 0):
+            return
         self._chat_render_sig = None
         self.refresh_chat_main()
-        self.render_current_chat()
+        self.render_current_chat(reason=reason, allow_clear=True)
 
     def _date_separator_label(self, ts: float) -> str:
         try:
@@ -4520,7 +4544,24 @@ class RUDPTransferRoot(BoxLayout):
             btn.bind(on_release=lambda _btn, member=dict(m): self.show_group_member_detail(member))
             self.right_member_box.add_widget(btn)
 
-    def render_current_chat(self) -> None:
+    def render_current_chat(self, reason: str = "live", allow_clear: Optional[bool] = None, generation: Optional[int] = None) -> None:
+        if generation is not None and generation != getattr(self, "_chat_render_generation", 0):
+            return
+        if allow_clear is None:
+            allow_clear = str(reason or "") in {
+                "switch",
+                "initial",
+                "manual_refresh",
+                "history",
+                "history_sync",
+                "detail_panel",
+                "group_manage",
+                "contact_manage",
+            }
+        if not allow_clear:
+            self._sync_chat_render_signature()
+            return
+        self._bump_chat_render_generation()
         self.main_messages_box.clear()
         self._rendered_chat_message_ids = set()
         self.right_info_box.clear()
@@ -4925,7 +4966,7 @@ class RUDPTransferRoot(BoxLayout):
                 if hasattr(self, attr):
                     getattr(self, attr).text = self.cu(key)
             self.refresh_chat_main()
-            self.render_current_chat()
+            self.render_current_chat(reason="initial")
 
     def _set_row_label(self, widget, text: str) -> None:
         parent = widget.parent
@@ -7441,7 +7482,7 @@ class RUDPTransferRoot(BoxLayout):
                 self.main_messages_box.append(f"group create failed: {exc}\n")
             popup.dismiss()
             self.refresh_chat_main()
-            self.render_current_chat()
+            self.render_current_chat(reason="group_manage")
         buttons.add_widget(make_button("success", text=self.cu("new_group"), on_release=_ok))
         buttons.add_widget(make_button("secondary", text="Cancel", on_release=lambda *_: popup.dismiss()))
         content.add_widget(buttons)
@@ -7472,7 +7513,7 @@ class RUDPTransferRoot(BoxLayout):
             if contact:
                 self.group_service.add_member_from_contact(self.current_group_id, contact)
             popup.dismiss()
-            self.render_current_chat()
+            self.render_current_chat(reason="group_manage")
         buttons.add_widget(make_button("success", text="加入", on_release=_ok))
         buttons.add_widget(make_button("secondary", text="取消", on_release=lambda *_: popup.dismiss()))
         content.add_widget(buttons)
@@ -7514,7 +7555,7 @@ class RUDPTransferRoot(BoxLayout):
         if pid not in allowed:
             self.right_info_box.append("请先在右侧选择一个可移除的成员。\n")
             return
-        self._confirm_action("移除成员", f"确认移除成员 {pid}？", lambda: (self.group_service.remove_member(self.current_group_id, pid, removed=True), self.render_current_chat()))
+        self._confirm_action("移除成员", f"确认移除成员 {pid}？", lambda: (self.group_service.remove_member(self.current_group_id, pid, removed=True), self.render_current_chat(reason="group_manage")))
 
 
     def confirm_leave_group(self) -> None:
@@ -7527,7 +7568,7 @@ class RUDPTransferRoot(BoxLayout):
             self.current_chat_mode = ""
             self.current_chat_title.text = ""
             self.refresh_chat_main()
-            self.render_current_chat()
+            self.render_current_chat(reason="group_manage")
         self._confirm_action("退出群组", f"确认退出群组 {gid}？\n该群相关成员、消息、回执都会从本机删除。", _do)
 
 
@@ -7542,7 +7583,7 @@ class RUDPTransferRoot(BoxLayout):
             self.current_chat_mode = ""
             self.current_chat_title.text = ""
             self.refresh_chat_main()
-            self.render_current_chat()
+            self.render_current_chat(reason="contact_manage")
         self._confirm_action("删除联系人", f"确认删除联系人 {pid}？\n该联系人、一对一聊天记录和相关回执都会从本机删除。", _do)
 
 
@@ -7629,10 +7670,10 @@ class RUDPTransferRoot(BoxLayout):
                         ok = False
                         self._append_debug_line(f"retry _send_chat_to_endpoint exception: {exc}", protocol=True)
                     if ok:
-                        Clock.schedule_once(lambda _dt, peer=pid: (_mark_delivered(peer), self._force_chat_refresh()), 0)
+                        Clock.schedule_once(lambda _dt, peer=pid: (_mark_delivered(peer), self.refresh_chat_main(), self._sync_chat_render_signature()), 0)
                     else:
-                        Clock.schedule_once(lambda _dt, peer=pid: (_mark_failed(peer, "retry_failed"), self._force_chat_refresh()), 0)
-                Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+                        Clock.schedule_once(lambda _dt, peer=pid: (_mark_failed(peer, "retry_failed"), self.refresh_chat_main(), self._sync_chat_render_signature()), 0)
+                Clock.schedule_once(lambda _dt: (self.refresh_chat_main(), self._sync_chat_render_signature()), 0)
             threading.Thread(target=_run, daemon=True).start()
         except Exception as exc:
             try:
@@ -9306,12 +9347,16 @@ class RUDPTransferRoot(BoxLayout):
             pass
         return ""
 
-    def _schedule_force_chat_refresh(self, *delays: float) -> None:
+    def _schedule_force_chat_refresh(self, *delays: float, reason: str = "manual_refresh") -> None:
         if not delays:
             delays = (0.0,)
+        generation = getattr(self, "_chat_render_generation", 0)
         for delay in delays:
             try:
-                Clock.schedule_once(lambda _dt: self._force_chat_refresh(), max(0.0, float(delay or 0.0)))
+                Clock.schedule_once(
+                    lambda _dt, gen=generation, why=reason: self._force_chat_refresh(reason=why, generation=gen),
+                    max(0.0, float(delay or 0.0)),
+                )
             except Exception:
                 pass
 
