@@ -241,6 +241,7 @@ if len(sys.argv) >= 2 and sys.argv[1] == "--worker":
 
 # GUI imports are intentionally below the worker dispatch.
 from kivy.app import App
+from kivy.animation import Animation
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.core.text import LabelBase, DEFAULT_FONT
@@ -1120,7 +1121,7 @@ class WorkerProcess:
                     self._try_progress(line)
         finally:
             rc = self.proc.wait() if self.proc is not None else None
-            self.exit_callback(rc)
+            Clock.schedule_once(lambda _dt, result=rc: self.exit_callback(result), 0)
 
     def _try_progress(self, line: str) -> None:
         m = PROGRESS_RE.search(line)
@@ -1988,7 +1989,9 @@ class ChatMessageBox(BoxLayout):
 
             bubble.bind(height=_sync_height, minimum_height=_sync_height)
             Clock.schedule_once(lambda _dt: _sync_height(), 0)
+            line.opacity = 0.0
             self.inner.add_widget(line)
+            Animation(opacity=1.0, d=0.12, t="out_quad").start(line)
             self.scroll.scroll_y = 0
             return True
         except Exception:
@@ -2161,6 +2164,9 @@ class RUDPTransferRoot(BoxLayout):
         self.screen_share_last_status = ""
         self.screen_share_ui_state = "idle"
         self._seen_screen_control_messages = set()
+        self._worker_stop_in_progress = set()
+        self._screen_stop_in_progress = False
+        self._diagnostic_export_in_progress = False
         self.pending_screen_offers: Dict[str, Dict[str, object]] = {}
         self.pending_screen_offer_popups: Dict[str, Popup] = {}
         # Deduplicate the receiver's two log lines for one chat frame:
@@ -2240,6 +2246,74 @@ class RUDPTransferRoot(BoxLayout):
         elif size_hint_x is not None:
             kwargs.update(size_hint_x=size_hint_x)
         return make_button(role, **kwargs)
+
+    def _stopping_text(self) -> str:
+        return "正在停止..." if self.lang == "zh" else "Stopping..."
+
+    def _set_button_busy(self, button, busy: bool, text: Optional[str] = None) -> str:
+        previous = str(getattr(button, "text", "") or "") if button is not None else ""
+        if button is None:
+            return previous
+        try:
+            button.disabled = bool(busy)
+            if text is not None:
+                button.text = str(text)
+        except Exception:
+            pass
+        return previous
+
+    def _append_worker_stop_log(self, worker_name: str, text: str) -> None:
+        box_name = "receiver_log_box" if str(worker_name or "") == "receiver" else "sender_log_box"
+        try:
+            log_box = getattr(self, box_name, None)
+            if log_box is not None:
+                log_box.append(str(text or ""))
+        except Exception:
+            pass
+
+    def _stop_worker_nonblocking(self, worker_name: str, worker: WorkerProcess, button=None, on_done=None) -> None:
+        key = str(worker_name or "worker")
+        if key in self._worker_stop_in_progress:
+            self._append_worker_stop_log(key, f"{self._stopping_text()}\n")
+            return
+        try:
+            running = bool(worker and worker.is_running())
+        except Exception:
+            running = False
+        if not running:
+            if on_done is not None:
+                try:
+                    on_done(True, "")
+                except Exception:
+                    pass
+            return
+        self._worker_stop_in_progress.add(key)
+        previous_text = self._set_button_busy(button, True, self._stopping_text())
+        self._append_worker_stop_log(key, f"{self._stopping_text()}\n")
+
+        def _run_stop() -> None:
+            error = ""
+            try:
+                worker.stop()
+            except Exception as exc:
+                error = str(exc)
+
+            def _finish(_dt) -> None:
+                self._worker_stop_in_progress.discard(key)
+                self._set_button_busy(button, False, previous_text if previous_text else None)
+                if error:
+                    self._append_worker_stop_log(key, f"Stop failed: {error}\n")
+                else:
+                    self._append_worker_stop_log(key, "Stopped.\n")
+                if on_done is not None:
+                    try:
+                        on_done(not bool(error), error)
+                    except Exception:
+                        pass
+
+            Clock.schedule_once(_finish, 0)
+
+        threading.Thread(target=_run_stop, daemon=True).start()
 
     def _make_modern_input_shell(self, widget, *, height: int = 38):
         if UIRoundedCard is not None and ui_component_color is not None:
@@ -2397,7 +2471,7 @@ class RUDPTransferRoot(BoxLayout):
         self.send_btn = make_button("success", on_release=lambda *_: self.start_sender())
         self.retry_send_btn = make_button("primary", on_release=lambda *_: self.retry_sender())
         self.retry_send_btn.disabled = True
-        self.stop_send_btn = make_button("danger", on_release=lambda *_: self.sender_worker.stop())
+        self.stop_send_btn = make_button("danger", on_release=lambda *_: self._stop_worker_nonblocking("sender", self.sender_worker, self.stop_send_btn))
         self.clear_send_btn = make_button("secondary", on_release=lambda *_: self.sender_log_box.clear())
         action.add_widget(self.send_btn)
         action.add_widget(self.retry_send_btn)
@@ -2440,7 +2514,7 @@ class RUDPTransferRoot(BoxLayout):
         root.add_widget(form)
         action = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
         self.start_recv_btn = make_button("success", on_release=lambda *_: self.start_receiver())
-        self.stop_recv_btn = make_button("danger", on_release=lambda *_: self.receiver_worker.stop())
+        self.stop_recv_btn = make_button("danger", on_release=lambda *_: self._stop_worker_nonblocking("receiver", self.receiver_worker, self.stop_recv_btn))
         self.firewall_btn = make_button("primary", on_release=lambda *_: self.allow_firewall())
         self.clear_recv_btn = make_button("secondary", on_release=lambda *_: self.receiver_log_box.clear())
         action.add_widget(self.start_recv_btn)
@@ -2720,13 +2794,11 @@ class RUDPTransferRoot(BoxLayout):
         except Exception:
             running = False
         if running:
-            try:
-                self.receiver_worker.stop()
-            except Exception:
-                pass
-            if hasattr(self, "online_state_btn"):
-                self.online_state_btn.text = "Offline"
-                style_button(self.online_state_btn, "secondary")
+            def _offline_done(_ok, _error) -> None:
+                if hasattr(self, "online_state_btn"):
+                    self.online_state_btn.text = "Offline"
+                    style_button(self.online_state_btn, "secondary")
+            self._stop_worker_nonblocking("receiver", self.receiver_worker, getattr(self, "online_state_btn", None), _offline_done)
         else:
             try:
                 self.start_receiver()
@@ -5031,9 +5103,10 @@ class RUDPTransferRoot(BoxLayout):
 
     def toggle_online(self) -> None:
         if self.receiver_worker.is_running():
-            self.receiver_worker.stop()
-            self.online_btn.text = "Offline"
-            style_button(self.online_btn, "secondary")
+            def _offline_done(_ok, _error) -> None:
+                self.online_btn.text = "Offline"
+                style_button(self.online_btn, "secondary")
+            self._stop_worker_nonblocking("receiver", self.receiver_worker, getattr(self, "online_btn", None), _offline_done)
         else:
             self.start_receiver(auto=True)
 
@@ -5071,14 +5144,10 @@ class RUDPTransferRoot(BoxLayout):
                 save_gui_config(self.gui_config)
             except Exception:
                 pass
-        def _export(*_):
-            path = self.export_diagnostic_logs()
-            if path:
-                self.sender_log_box.append(f"Diagnostics exported: {path}\n")
-            else:
-                self.sender_log_box.append("Diagnostics export failed\n")
         buttons.add_widget(make_button("primary", text="应用", on_release=_apply_theme))
-        buttons.add_widget(make_button("secondary", text="导出诊断包", on_release=_export))
+        export_btn = make_button("secondary", text="导出诊断包")
+        export_btn.bind(on_release=lambda *_: self.export_diagnostic_logs_async(log_box=self.sender_log_box, button=export_btn))
+        buttons.add_widget(export_btn)
         buttons.add_widget(make_button("secondary", text="防火墙", on_release=lambda *_: self.allow_firewall()))
         buttons.add_widget(make_button("secondary", text="关闭", on_release=lambda *_: popup.dismiss()))
         content.add_widget(buttons)
@@ -5141,18 +5210,21 @@ class RUDPTransferRoot(BoxLayout):
             summary["file_transfers_error"] = str(exc)
         return summary
 
+    def _export_diagnostic_logs_payload(self) -> str:
+        return export_diagnostic_bundle(
+            screen_runtime=self._screen_runtime(),
+            extra_json={
+                "chat_state_summary.json": self._chat_diagnostic_summary(),
+            },
+            extra_text={
+                "gui_runtime_recent.log": "\n".join(getattr(self, "debug_runtime_lines", [])[-1000:]),
+                "gui_protocol_recent.log": "\n".join(getattr(self, "debug_protocol_lines", [])[-1000:]),
+            },
+        )
+
     def export_diagnostic_logs(self) -> str:
         try:
-            return export_diagnostic_bundle(
-                screen_runtime=self._screen_runtime(),
-                extra_json={
-                    "chat_state_summary.json": self._chat_diagnostic_summary(),
-                },
-                extra_text={
-                    "gui_runtime_recent.log": "\n".join(getattr(self, "debug_runtime_lines", [])[-1000:]),
-                    "gui_protocol_recent.log": "\n".join(getattr(self, "debug_protocol_lines", [])[-1000:]),
-                },
-            )
+            return self._export_diagnostic_logs_payload()
         except Exception as exc:
             try:
                 self.sender_log_box.append(f"Diagnostics export failed: {exc}\n")
@@ -5160,27 +5232,74 @@ class RUDPTransferRoot(BoxLayout):
                 pass
             return ""
 
+    def export_diagnostic_logs_async(self, *, log_box=None, button=None) -> None:
+        if self._diagnostic_export_in_progress:
+            try:
+                if log_box is not None:
+                    log_box.append("\nDiagnostics export is already running.\n")
+            except Exception:
+                pass
+            return
+        self._diagnostic_export_in_progress = True
+        previous_text = self._set_button_busy(button, True, "Exporting...")
+        try:
+            if log_box is not None:
+                log_box.append("\nExporting diagnostics...\n")
+        except Exception:
+            pass
+
+        def _run_export() -> None:
+            path = ""
+            error = ""
+            try:
+                path = self._export_diagnostic_logs_payload()
+            except Exception as exc:
+                error = str(exc)
+
+            def _finish(_dt) -> None:
+                self._diagnostic_export_in_progress = False
+                self._set_button_busy(button, False, previous_text if previous_text else None)
+                if path:
+                    try:
+                        if log_box is not None:
+                            log_box.append(f"\nDiagnostics exported: {path}\n")
+                        else:
+                            self.sender_log_box.append(f"Diagnostics exported: {path}\n")
+                    except Exception:
+                        pass
+                else:
+                    message = f"Diagnostics export failed: {error or 'unknown'}\n"
+                    try:
+                        if log_box is not None:
+                            log_box.append("\n" + message)
+                        else:
+                            self.sender_log_box.append(message)
+                    except Exception:
+                        pass
+
+            Clock.schedule_once(_finish, 0)
+
+        threading.Thread(target=_run_export, daemon=True).start()
+
     def open_ui_preview(self) -> None:
         script = APP_DIR / "ui_preview.py"
+        if FROZEN:
+            try:
+                self.sender_log_box.append("UI Preview is available in source mode only.\n")
+            except Exception:
+                pass
+            return
         if not script.exists():
             try:
                 self.sender_log_box.append(f"UI preview not found: {script}\n")
             except Exception:
                 pass
             return
-        executable = sys.executable
-        if IS_WINDOWS:
-            try:
-                pythonw = Path(sys.executable).with_name("pythonw.exe")
-                if pythonw.exists():
-                    executable = str(pythonw)
-            except Exception:
-                executable = sys.executable
         env = os.environ.copy()
         env["AGORALINK_UI_PREVIEW_HOLD"] = "1"
         try:
-            subprocess.Popen(
-                [executable, "-B", str(script)],
+            popen_no_console(
+                [sys.executable, "-B", str(script)],
                 cwd=str(APP_DIR),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -5199,6 +5318,47 @@ class RUDPTransferRoot(BoxLayout):
             runtime = ScreenRuntime()
             self.app.screen_runtime = runtime
         return runtime
+
+    def _screen_stopping_status_text(self) -> str:
+        return "正在停止投屏..." if self.lang == "zh" else "Stopping screen share..."
+
+    def _stop_screen_runtime_nonblocking(self, *, status_label: Optional[Label] = None, update_chat_ui: bool = True, on_done=None) -> bool:
+        if self._screen_stop_in_progress:
+            if status_label is not None:
+                status_label.text = self._screen_stopping_status_text()
+            return False
+        self._screen_stop_in_progress = True
+        if update_chat_ui:
+            self._set_screen_share_ui_state("stopping")
+            self._set_screen_share_status(self._screen_stopping_status_text())
+        if status_label is not None:
+            status_label.text = self._screen_stopping_status_text()
+
+        def _run_stop() -> None:
+            state: Dict[str, object] = {}
+            error = ""
+            try:
+                state = dict(self._screen_runtime().stop())
+            except Exception as exc:
+                error = str(exc)
+                try:
+                    self._screen_runtime().last_error = error
+                except Exception:
+                    pass
+
+            def _finish(_dt) -> None:
+                self._screen_stop_in_progress = False
+                if on_done is not None:
+                    try:
+                        on_done(state, error)
+                    except Exception as callback_exc:
+                        self._set_screen_share_status(self._screen_stop_failed_text(str(callback_exc)))
+                        self._set_screen_share_ui_state("idle")
+
+            Clock.schedule_once(_finish, 0)
+
+        threading.Thread(target=_run_stop, daemon=True).start()
+        return True
 
     def _choose_screen_receive_port(self) -> Optional[int]:
         return find_available_udp_port(SCREEN_PORT_CANDIDATES)
@@ -5553,7 +5713,7 @@ class RUDPTransferRoot(BoxLayout):
 
     def _screen_share_button_active(self) -> bool:
         ui_state = str(getattr(self, "screen_share_ui_state", "idle") or "idle")
-        if ui_state in ("pending_offer", "pending_accept"):
+        if ui_state in ("pending_offer", "pending_accept", "stopping"):
             return True
         try:
             state = self._screen_runtime().get_state()
@@ -5566,10 +5726,12 @@ class RUDPTransferRoot(BoxLayout):
     def _refresh_screen_share_button(self) -> None:
         if not hasattr(self, "main_screen_btn"):
             return
+        ui_state = str(getattr(self, "screen_share_ui_state", "idle") or "idle")
         active = self._screen_share_button_active()
-        if not active and str(getattr(self, "screen_share_ui_state", "idle") or "") not in ("pending_offer", "pending_accept"):
+        if not active and ui_state not in ("pending_offer", "pending_accept", "stopping"):
             self.screen_share_ui_state = "idle"
-        self.main_screen_btn.text = self._screen_share_button_text(active)
+        self.main_screen_btn.text = self._stopping_text() if ui_state == "stopping" else self._screen_share_button_text(active)
+        self.main_screen_btn.disabled = ui_state == "stopping"
         self.main_screen_btn.width = dp(104)
         self._style_modern_or_legacy_button(self.main_screen_btn, "danger" if active else "secondary")
 
@@ -5670,19 +5832,25 @@ class RUDPTransferRoot(BoxLayout):
             return
         self._schedule_screen_runtime_status(status_label)
 
-    def _screen_debug_stop(self, status_label: Label) -> None:
-        try:
-            self._screen_runtime().stop()
-            self._clear_current_screen_context()
-            self._append_debug_line("screen runtime stop requested", protocol=False)
-        except Exception as exc:
-            try:
-                self._screen_runtime().last_error = str(exc)
-            except Exception:
-                pass
-            status_label.text = f"screen runtime stop failed: {exc}"
-            return
-        self._schedule_screen_runtime_status(status_label)
+    def _screen_debug_stop(self, status_label: Label, on_done=None) -> None:
+        def _finish_stop(_state: Dict[str, object], error: str) -> None:
+            if error:
+                try:
+                    self._screen_runtime().last_error = error
+                except Exception:
+                    pass
+                status_label.text = f"screen runtime stop failed: {error}"
+            else:
+                self._clear_current_screen_context()
+                self._append_debug_line("screen runtime stop requested", protocol=False)
+                self._schedule_screen_runtime_status(status_label)
+            if on_done is not None:
+                try:
+                    on_done()
+                except Exception:
+                    pass
+
+        self._stop_screen_runtime_nonblocking(status_label=status_label, on_done=_finish_stop)
 
     def _screen_advertised_profiles(self, force: bool = False) -> List[Dict[str, object]]:
         now = time.time()
@@ -6066,42 +6234,39 @@ class RUDPTransferRoot(BoxLayout):
         peer_label = self._current_screen_peer_label() or self._screen_peer_label(peer_id)
         profile_name = self._current_screen_profile_name()
         port_text = self._current_screen_port_text()
-        stop_status_text = self._screen_stopped_text()
-        try:
-            state = self._screen_runtime().stop()
-            self._set_screen_share_ui_state("idle")
-            if str(state.get("state") or "") == "error":
+
+        def _finish_stop(state: Dict[str, object], error: str) -> None:
+            stop_status_text = self._screen_stopped_text()
+            if error:
+                stop_status_text = self._screen_stop_failed_text(error)
+            elif str(state.get("state") or "") == "error":
                 stop_status_text = self._screen_stop_failed_text(self._screen_runtime_error_detail(state))
-                self._set_screen_share_status(stop_status_text)
-            else:
-                self._set_screen_share_status(stop_status_text)
-        except Exception as exc:
-            stop_status_text = self._screen_stop_failed_text(str(exc))
             self._set_screen_share_status(stop_status_text)
+            if peer_id:
+                try:
+                    stop_msg = make_stop(session_id, self.chat_local_peer_id, peer_id, reason="user_stop")
+                    self._send_screen_control_to_peer(peer_id, stop_msg)
+                except Exception as exc:
+                    self._set_screen_share_status(f"Screen stop notify failed: {exc}")
+            if peer_id:
+                self._add_screen_chat_card(
+                    CARD_SCREEN_STATE,
+                    session_id=session_id,
+                    peer_id=peer_id,
+                    title=self._screen_offer_title(),
+                    subtitle=peer_label,
+                    status=stop_status_text,
+                    detail=self._screen_detail_text(profile_name, port_text),
+                    profile=profile_name,
+                    port=port_text,
+                    direction="outgoing",
+                )
+            self.screen_share_session_id = ""
+            self.screen_share_peer_id = ""
+            self._clear_current_screen_context()
             self._set_screen_share_ui_state("idle")
-        if peer_id:
-            try:
-                stop_msg = make_stop(session_id, self.chat_local_peer_id, peer_id, reason="user_stop")
-                self._send_screen_control_to_peer(peer_id, stop_msg)
-            except Exception as exc:
-                self._set_screen_share_status(f"Screen stop notify failed: {exc}")
-        if peer_id:
-            self._add_screen_chat_card(
-                CARD_SCREEN_STATE,
-                session_id=session_id,
-                peer_id=peer_id,
-                title=self._screen_offer_title(),
-                subtitle=peer_label,
-                status=stop_status_text,
-                detail=self._screen_detail_text(profile_name, port_text),
-                profile=profile_name,
-                port=port_text,
-                direction="outgoing",
-            )
-        self.screen_share_session_id = ""
-        self.screen_share_peer_id = ""
-        self._clear_current_screen_context()
-        self._set_screen_share_ui_state("idle")
+
+        self._stop_screen_runtime_nonblocking(on_done=_finish_stop)
 
     def _parse_screen_control_from_chat(self, obj: Dict[str, object]) -> Optional[Dict[str, object]]:
         try:
@@ -6503,12 +6668,11 @@ class RUDPTransferRoot(BoxLayout):
         peer_label = self._current_screen_peer_label() or self._screen_peer_label(sender)
         profile_name = self._current_screen_profile_name()
         port_text = self._current_screen_port_text()
-        try:
-            self._screen_runtime().stop()
+
+        def _finish_stop(_state: Dict[str, object], error: str) -> None:
             self.screen_share_session_id = ""
             self.screen_share_peer_id = ""
-            self._set_screen_share_ui_state("idle")
-            stopped_text = self._screen_stopped_text()
+            stopped_text = self._screen_stop_failed_text(error) if error else self._screen_stopped_text()
             self._add_screen_chat_card(
                 CARD_SCREEN_STATE,
                 session_id=str(control.get("session_id") or ""),
@@ -6522,10 +6686,9 @@ class RUDPTransferRoot(BoxLayout):
             )
             self._clear_current_screen_context()
             self._set_screen_share_status(stopped_text)
-        except Exception as exc:
-            self._clear_current_screen_context()
-            self._set_screen_share_status(self._screen_start_failed_text(str(exc)))
             self._set_screen_share_ui_state("idle")
+
+        self._stop_screen_runtime_nonblocking(on_done=_finish_stop)
 
     def open_debug_popup(self) -> None:
         content = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(14))
@@ -6622,7 +6785,7 @@ class RUDPTransferRoot(BoxLayout):
 
         screen_buttons.add_widget(self._make_modern_or_legacy_button("secondary", text="Receive screen", size_hint_x=1, height=34, compact=True, on_release=lambda *_: Clock.schedule_once(lambda _dt: (self._screen_debug_start_receiver(screen_status_label), _populate_summary()), 0)))
         screen_buttons.add_widget(self._make_modern_or_legacy_button("secondary", text="Send screen", size_hint_x=1, height=34, compact=True, on_release=lambda *_: Clock.schedule_once(lambda _dt: (self._screen_debug_start_sender(screen_target_input, screen_status_label), _populate_summary()), 0)))
-        screen_buttons.add_widget(self._make_modern_or_legacy_button("danger", text="Stop screen", size_hint_x=1, height=34, compact=True, on_release=lambda *_: Clock.schedule_once(lambda _dt: (self._screen_debug_stop(screen_status_label), _populate_summary()), 0)))
+        screen_buttons.add_widget(self._make_modern_or_legacy_button("danger", text="Stop screen", size_hint_x=1, height=34, compact=True, on_release=lambda *_: Clock.schedule_once(lambda _dt: self._screen_debug_stop(screen_status_label, on_done=_populate_summary), 0)))
         screen_buttons.add_widget(self._make_modern_or_legacy_button("secondary", text="Refresh", size_hint_x=1, height=34, compact=True, on_release=_refresh_screen_details))
         screen_card.add_widget(screen_buttons)
         screen_card.add_widget(screen_status_label)
@@ -6656,17 +6819,9 @@ class RUDPTransferRoot(BoxLayout):
         buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(8))
         popup = style_popup(Popup(title="诊断", content=content, size_hint=(0.82, 0.84)))
 
-        def _export(*_):
-            try:
-                path = self.export_diagnostic_logs()
-                if path:
-                    log.append(f"\n诊断包已导出: {path}\n")
-                else:
-                    log.append("\n诊断包导出失败：请查看发送日志中的错误信息。\n")
-            except Exception as exc:
-                log.append(f"\n诊断包导出失败: {exc}\n")
-
-        buttons.add_widget(self._make_modern_or_legacy_button("primary", text="导出诊断包", size_hint_x=1, height=38, on_release=_export))
+        export_btn = self._make_modern_or_legacy_button("primary", text="导出诊断包", size_hint_x=1, height=38)
+        export_btn.bind(on_release=lambda *_: self.export_diagnostic_logs_async(log_box=log, button=export_btn))
+        buttons.add_widget(export_btn)
         buttons.add_widget(self._make_modern_or_legacy_button("secondary", text="UI Preview", width=112, height=38, on_release=lambda *_: self.open_ui_preview()))
         buttons.add_widget(self._make_modern_or_legacy_button("secondary", text="关闭", width=88, height=38, on_release=lambda *_: popup.dismiss()))
         content.add_widget(buttons)
@@ -9374,7 +9529,7 @@ class RUDPTransferRoot(BoxLayout):
             except Exception:
                 pass
 
-        min_interval = 0.75
+        min_interval = 0.20
         if force:
             # This method is often called from worker threads. All Kivy widget
             # and canvas updates must be marshalled back to the main thread.

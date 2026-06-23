@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional
 
 from kivy.animation import Animation
+from kivy.clock import Clock
 from kivy.core.text import LabelBase
 from kivy.core.window import Window
 from kivy.graphics import Color, Line, RoundedRectangle
@@ -20,6 +22,9 @@ from kivy.uix.widget import Widget
 from ui_theme import LIGHT_THEME, Color as ThemeColor, Theme
 
 THEME = LIGHT_THEME
+UI_ANIMATION_SECONDS = 0.14
+PROGRESS_UI_INTERVAL_SECONDS = 0.15
+TERMINAL_STATUSES = {"success", "failed", "danger", "rejected", "stopped", "complete", "completed"}
 
 
 def _register_font_alias(alias: str, candidates: Iterable[str]) -> str:
@@ -66,6 +71,34 @@ def color(name: str, alpha: Optional[float] = None, theme: Optional[Theme] = Non
 def _mix(a: List[float], b: List[float], amount: float) -> List[float]:
     t = max(0.0, min(1.0, float(amount)))
     return [a[i] + (b[i] - a[i]) * t for i in range(4)]
+
+
+def _animate_list_property(widget, name: str, target: Iterable[float], *, duration: float = UI_ANIMATION_SECONDS, animated: bool = True) -> None:
+    values = list(target)
+    try:
+        current = list(getattr(widget, name))
+        if len(current) == len(values) and all(abs(float(current[i]) - float(values[i])) < 0.001 for i in range(len(values))):
+            return
+    except Exception:
+        pass
+    if not animated:
+        setattr(widget, name, values)
+        return
+    Animation.cancel_all(widget, name)
+    Animation(**{name: values}, d=duration, t="out_quad").start(widget)
+
+
+def _status_border_color(status: str) -> List[float]:
+    text = str(status or "").strip().lower()
+    if any(token in text for token in ("failed", "fail", "error", "reject", "rejected", "danger", "失败", "拒绝")):
+        return color("danger_soft")
+    if any(token in text for token in ("success", "complete", "completed", "done", "saved", "accepted", "已完成", "成功")):
+        return color("success_soft")
+    if any(token in text for token in ("wait", "pending", "starting", "打包", "等待")):
+        return color("warning_soft")
+    if any(token in text for token in ("active", "sending", "receiving", "progress", "watching", "投屏", "传输")):
+        return color("accent_soft")
+    return color("border")
 
 
 def _bind_label_width(label: Label, vertical: bool = False) -> Label:
@@ -368,8 +401,7 @@ class RoundedButton(ButtonBehavior, Label):
             target = list(self.bg_down if self.state == "down" else (self.bg_hover if self.hovered else self.bg_normal))
             self.color = self.text_down if self.state == "down" else self.text_normal
         if animated:
-            Animation.cancel_all(self, "fill_color")
-            Animation(fill_color=target, d=0.14, t="out_quad").start(self)
+            _animate_list_property(self, "fill_color", target)
         else:
             self.fill_color = target
 
@@ -415,6 +447,7 @@ class StatusBadge(Label):
         kwargs.setdefault("size_hint_x", None)
         kwargs.setdefault("width", dp(76))
         super().__init__(**kwargs)
+        self._status_initialized = False
         with self.canvas.before:
             self._badge_fill = Color(*self.fill_color)
             self._badge_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[self.radius])
@@ -437,8 +470,10 @@ class StatusBadge(Label):
             "neutral": ("surface_muted", "text_secondary"),
         }
         fill_name, text_name = mapping.get(str(self.status or "neutral"), mapping["neutral"])
-        self.fill_color = color(fill_name)
+        animated = bool(getattr(self, "_status_initialized", False))
+        _animate_list_property(self, "fill_color", color(fill_name), animated=animated)
         self.color = color(text_name)
+        self._status_initialized = True
 
     def _update_badge(self, *_args) -> None:
         try:
@@ -688,6 +723,7 @@ class MessageBubble(RoundedCard):
 
 class RoundedProgressBar(Widget):
     value = NumericProperty(0)
+    display_value = NumericProperty(0)
     max = NumericProperty(100)
     track_color = ListProperty(color("surface_muted"))
     fill_color = ListProperty(color("accent"))
@@ -699,17 +735,73 @@ class RoundedProgressBar(Widget):
         kwargs.setdefault("track_color", color("surface_muted"))
         kwargs.setdefault("fill_color", color("accent"))
         super().__init__(**kwargs)
+        self._pending_display_value: Optional[float] = None
+        self._progress_clock = None
+        self._last_progress_apply_ts = 0.0
+        self.display_value = float(self.value or 0)
         with self.canvas:
             self._track_color = Color(*self.track_color)
             self._track = RoundedRectangle(pos=self.pos, size=self.size, radius=[self.radius])
             self._fill_color = Color(*self.fill_color)
             self._fill = RoundedRectangle(pos=self.pos, size=(0, self.height), radius=[self.radius])
-        self.bind(pos=self._update_bar, size=self._update_bar, value=self._update_bar, max=self._update_bar, track_color=self._update_bar, fill_color=self._update_bar)
+        self.bind(pos=self._update_bar, size=self._update_bar, display_value=self._update_bar, max=self._update_bar, track_color=self._update_bar, fill_color=self._update_bar)
+        self.bind(value=self._schedule_display_value)
         self._update_bar()
+
+    def set_value(self, value: float, *, immediate: bool = False) -> None:
+        if immediate:
+            self.value = float(value or 0)
+            self._cancel_progress_clock()
+            self._apply_display_value(float(value or 0), immediate=True)
+            return
+        self.value = float(value or 0)
+
+    def _cancel_progress_clock(self) -> None:
+        event = getattr(self, "_progress_clock", None)
+        if event is not None:
+            try:
+                event.cancel()
+            except Exception:
+                pass
+        self._progress_clock = None
+        self._pending_display_value = None
+
+    def _schedule_display_value(self, *_args) -> None:
+        target = max(0.0, min(float(self.max or 100), float(self.value or 0)))
+        if target <= 0.0 or target >= float(self.max or 100):
+            self._cancel_progress_clock()
+            self._apply_display_value(target, immediate=True)
+            return
+        self._pending_display_value = target
+        if self._progress_clock is not None:
+            return
+        now = time.time()
+        delay = max(0.0, PROGRESS_UI_INTERVAL_SECONDS - (now - float(self._last_progress_apply_ts or 0.0)))
+        self._progress_clock = Clock.schedule_once(self._flush_display_value, delay)
+
+    def _flush_display_value(self, _dt) -> None:
+        self._progress_clock = None
+        target = self._pending_display_value
+        self._pending_display_value = None
+        if target is None:
+            return
+        self._apply_display_value(float(target), immediate=False)
+
+    def _apply_display_value(self, value: float, *, immediate: bool = False) -> None:
+        try:
+            target = max(0.0, min(float(self.max or 100), float(value or 0)))
+            self._last_progress_apply_ts = time.time()
+            Animation.cancel_all(self, "display_value")
+            if immediate or target < float(self.display_value or 0):
+                self.display_value = target
+            else:
+                Animation(display_value=target, d=UI_ANIMATION_SECONDS, t="out_quad").start(self)
+        except Exception:
+            self.display_value = float(value or 0)
 
     def _update_bar(self, *_args) -> None:
         try:
-            ratio = max(0.0, min(1.0, float(self.value) / float(self.max or 100)))
+            ratio = max(0.0, min(1.0, float(self.display_value) / float(self.max or 100)))
             r = float(self.radius)
             self._track_color.rgba = self.track_color
             self._track.pos = self.pos
@@ -767,7 +859,10 @@ class FileTransferCard(_CardActionsMixin, RoundedCard):
         self.detail_label.text = str(self.detail or "")
         self.badge.text = str(self.status_text or "")
         self.badge.status = str(self.status or "neutral")
-        self.progress_bar.value = float(self.progress or 0)
+        status_text = f"{self.status} {self.status_text}".lower()
+        terminal = bool(str(self.status or "").lower() in TERMINAL_STATUSES or any(token in status_text for token in ("complete", "completed", "failed", "rejected", "saved", "已完成", "失败", "拒绝")))
+        self.progress_bar.set_value(float(self.progress or 0), immediate=terminal)
+        _animate_list_property(self, "border_color", _status_border_color(status_text), animated=True)
 
 
 class ScreenShareCard(_CardActionsMixin, RoundedCard):
@@ -811,6 +906,8 @@ class ScreenShareCard(_CardActionsMixin, RoundedCard):
         self.detail_label.text = str(self.detail or "")
         self.badge.text = str(self.status_text or "")
         self.badge.status = str(self.status or "neutral")
+        status_text = f"{self.status} {self.status_text}".lower()
+        _animate_list_property(self, "border_color", _status_border_color(status_text), animated=True)
 
 
 class EmptyState(RoundedCard):
