@@ -2167,6 +2167,8 @@ class RUDPTransferRoot(BoxLayout):
         self._worker_stop_in_progress = set()
         self._screen_stop_in_progress = False
         self._diagnostic_export_in_progress = False
+        self._chat_runtime_card_sequence = 0
+        self._rendered_chat_message_ids = set()
         self.pending_screen_offers: Dict[str, Dict[str, object]] = {}
         self.pending_screen_offer_popups: Dict[str, Popup] = {}
         # Deduplicate the receiver's two log lines for one chat frame:
@@ -3553,6 +3555,103 @@ class RUDPTransferRoot(BoxLayout):
             meta["target_id"] = peer or conv
         return meta
 
+    def _chat_message_created_at(self, message_id: str) -> float:
+        mid = str(message_id or "").strip()
+        if not mid or self.message_service is None:
+            return 0.0
+        try:
+            msg = self.message_service.get_message(mid) or {}
+            return float(msg.get("created_at") or msg.get("sent_at") or msg.get("received_at") or 0.0)
+        except Exception:
+            return 0.0
+
+    def _next_runtime_card_sequence(self) -> int:
+        self._chat_runtime_card_sequence = int(getattr(self, "_chat_runtime_card_sequence", 0) or 0) + 1
+        return self._chat_runtime_card_sequence
+
+    def _runtime_card_sequence(self, card: Dict[str, object]) -> int:
+        meta = dict((card or {}).get("meta") or {})
+        for key in ("render_sequence", "sequence"):
+            try:
+                value = meta.get(key, card.get(key))
+                if value not in (None, ""):
+                    return int(value)
+            except Exception:
+                pass
+        return 0
+
+    def _runtime_card_sort_key(self, card: Dict[str, object]) -> Tuple[float, int, str]:
+        try:
+            ts = float((card or {}).get("timestamp") or 0.0)
+        except Exception:
+            ts = 0.0
+        return (ts, self._runtime_card_sequence(card), str((card or {}).get("card_id") or ""))
+
+    def _chat_message_render_key(self, msg: Dict[str, object]) -> str:
+        mid = str((msg or {}).get("message_id") or "").strip()
+        if mid:
+            return "message:" + mid
+        sender = str((msg or {}).get("sender_peer_id") or "").strip()
+        created = str((msg or {}).get("created_at") or (msg or {}).get("sent_at") or (msg or {}).get("received_at") or "").strip()
+        text = str((msg or {}).get("text") or "").strip()
+        return "live:" + hashlib.sha1(f"{sender}|{created}|{text}".encode("utf-8", errors="replace")).hexdigest()
+
+    def _is_chat_message_rendered(self, msg: Dict[str, object]) -> bool:
+        return self._chat_message_render_key(msg) in getattr(self, "_rendered_chat_message_ids", set())
+
+    def _mark_chat_message_rendered(self, msg: Dict[str, object]) -> None:
+        try:
+            self._rendered_chat_message_ids.add(self._chat_message_render_key(msg))
+        except Exception:
+            pass
+
+    def _message_matches_current_chat(self, msg: Dict[str, object]) -> bool:
+        group_id = str((msg or {}).get("group_id") or "").strip()
+        if self.current_chat_mode == "group" and self.current_group_id:
+            return group_id == str(self.current_group_id or "")
+        if self.current_chat_mode != "direct" or not self.current_peer_id:
+            return False
+        sender = str((msg or {}).get("sender_peer_id") or "").strip()
+        receiver = str((msg or {}).get("receiver_peer_id") or "").strip()
+        if self.current_peer_id in (sender, receiver):
+            return True
+        conv = str((msg or {}).get("conversation_id") or "").strip()
+        if conv and self.message_service is not None:
+            try:
+                return conv == self.message_service.create_direct_conversation(self.current_peer_id)
+            except Exception:
+                return False
+        return False
+
+    def _append_text_message_live(self, msg: Dict[str, object]) -> bool:
+        data = dict(msg or {})
+        if str(data.get("body_type") or "text") != "text":
+            return False
+        if self._is_screen_control_chat(data) or not self._message_matches_current_chat(data):
+            return False
+        if self._is_chat_message_rendered(data):
+            return False
+        try:
+            created_at = float(data.get("created_at") or data.get("sent_at") or data.get("received_at") or time.time())
+        except Exception:
+            created_at = time.time()
+        sender_id = str(data.get("sender_peer_id") or "")
+        mine = sender_id == str(self.chat_local_peer_id or "")
+        timestamp = time.strftime("%H:%M", time.localtime(created_at))
+        sender_name = self._display_name_for_peer(sender_id)
+        self.main_messages_box.add_message(
+            mine=mine,
+            sender=sender_name,
+            text=str(data.get("text") or ""),
+            timestamp=timestamp,
+            summary="",
+            body_type="text",
+            message_id=str(data.get("message_id") or ""),
+            show_sender=self.current_chat_mode == "group",
+        )
+        self._mark_chat_message_rendered(data)
+        return True
+
     def _chat_card_matches_current(self, card: Dict[str, object]) -> bool:
         meta = dict((card or {}).get("meta") or {})
         if self.current_chat_mode == "group" and self.current_group_id:
@@ -3634,12 +3733,14 @@ class RUDPTransferRoot(BoxLayout):
             meta["direction"] = direction
             meta["side"] = direction
         should_update_widget = card_type not in (CARD_FILE_OFFER, CARD_FILE_TRANSFER)
+        raw_ts = data.get("timestamp")
+        explicit_ts = raw_ts not in (None, "", 0, 0.0, "0")
         try:
-            ts = float(data.get("timestamp") or 0.0)
+            ts = float(raw_ts or 0.0)
         except Exception:
             ts = 0.0
         if ts <= 0:
-            ts = time.time()
+            ts = self._chat_message_created_at(str(meta.get("message_id") or message_id or "")) or time.time()
             data["timestamp"] = ts
         if not str(data.get("card_id") or "").strip():
             base = str(meta.get("message_id") or f"{ts:.3f}")
@@ -3650,6 +3751,15 @@ class RUDPTransferRoot(BoxLayout):
                 if str(old.get("card_id") or "") == card_id:
                     old_meta = dict(old.get("meta") or {})
                     old_direction = str(old.get("direction") or old.get("side") or old_meta.get("direction") or old_meta.get("side") or "").strip().lower()
+                    if not explicit_ts:
+                        try:
+                            data["timestamp"] = float(old.get("timestamp") or data.get("timestamp") or ts)
+                        except Exception:
+                            data["timestamp"] = data.get("timestamp") or ts
+                    old_sequence = old_meta.get("render_sequence") or old_meta.get("sequence")
+                    if old_sequence not in (None, ""):
+                        meta["render_sequence"] = old_sequence
+                        data["render_sequence"] = old_sequence
                     if card_type in (CARD_FILE_OFFER, CARD_FILE_TRANSFER, CARD_SCREEN_OFFER, CARD_SCREEN_STATE) and old_direction in ("incoming", "outgoing", "system"):
                         data["direction"] = old_direction
                         data["side"] = old_direction
@@ -3660,6 +3770,10 @@ class RUDPTransferRoot(BoxLayout):
                     if should_update_widget:
                         self._update_runtime_chat_card_widget(data)
                     return data
+        if meta.get("render_sequence") in (None, ""):
+            meta["render_sequence"] = self._next_runtime_card_sequence()
+        data["render_sequence"] = meta.get("render_sequence")
+        data["meta"] = meta
         self.chat_runtime_cards.append(data)
         if len(self.chat_runtime_cards) > 160:
             self.chat_runtime_cards = self.chat_runtime_cards[-160:]
@@ -3686,13 +3800,43 @@ class RUDPTransferRoot(BoxLayout):
         except Exception:
             pass
 
+    def _current_runtime_chat_cards_sorted(self) -> List[Dict[str, object]]:
+        return sorted(
+            [dict(card) for card in self.chat_runtime_cards if self._chat_card_matches_current(dict(card))],
+            key=self._runtime_card_sort_key,
+        )
+
+    def _render_runtime_chat_cards_before(self, cutoff_ts: float, rendered_ids: set) -> None:
+        try:
+            cutoff = float(cutoff_ts or 0.0)
+        except Exception:
+            cutoff = 0.0
+        for card in self._current_runtime_chat_cards_sorted():
+            cid = str(card.get("card_id") or "")
+            if cid and cid in rendered_ids:
+                continue
+            try:
+                ts = float(card.get("timestamp") or 0.0)
+            except Exception:
+                ts = 0.0
+            if cutoff > 0 and ts > cutoff:
+                continue
+            self.main_messages_box.add_card(card)
+            if cid:
+                rendered_ids.add(cid)
+
+    def _render_remaining_runtime_chat_cards(self, rendered_ids: set) -> None:
+        for card in self._current_runtime_chat_cards_sorted():
+            cid = str(card.get("card_id") or "")
+            if cid and cid in rendered_ids:
+                continue
+            self.main_messages_box.add_card(card)
+            if cid:
+                rendered_ids.add(cid)
+
     def _render_runtime_chat_cards(self) -> None:
         try:
-            cards = sorted(
-                [dict(card) for card in self.chat_runtime_cards if self._chat_card_matches_current(dict(card))],
-                key=lambda item: float(item.get("timestamp") or 0.0),
-            )
-            for card in cards:
+            for card in self._current_runtime_chat_cards_sorted():
                 self.main_messages_box.add_card(card)
         except Exception as exc:
             try:
@@ -3702,11 +3846,7 @@ class RUDPTransferRoot(BoxLayout):
 
     def _sync_runtime_chat_cards(self) -> None:
         try:
-            cards = sorted(
-                [dict(card) for card in self.chat_runtime_cards if self._chat_card_matches_current(dict(card))],
-                key=lambda item: float(item.get("timestamp") or 0.0),
-            )
-            for card in cards:
+            for card in self._current_runtime_chat_cards_sorted():
                 self.main_messages_box.update_card(card)
         except Exception as exc:
             try:
@@ -3963,7 +4103,6 @@ class RUDPTransferRoot(BoxLayout):
             meta=meta,
         )
         self._add_runtime_chat_card(card, peer_id=peer_id or self.screen_share_peer_id or self.current_peer_id)
-        self._schedule_force_chat_refresh(0.0)
 
     def _screen_detail_text(self, profile: object = "", port: object = "") -> str:
         return screen_detail_text(profile, port)
@@ -4383,6 +4522,7 @@ class RUDPTransferRoot(BoxLayout):
 
     def render_current_chat(self) -> None:
         self.main_messages_box.clear()
+        self._rendered_chat_message_ids = set()
         self.right_info_box.clear()
         if hasattr(self, "shared_files_box"):
             self.shared_files_box.clear_widgets()
@@ -4404,6 +4544,7 @@ class RUDPTransferRoot(BoxLayout):
             self.main_messages_box.add_card(system_card("Chat database is locked."))
             return
         self._mark_current_chat_read_and_notify()
+        rendered_runtime_card_ids = set()
         try:
             if self.current_chat_mode == "group" and self.current_group_id:
                 members = self.group_service.members(self.current_group_id, include_inactive=True)
@@ -4436,6 +4577,7 @@ class RUDPTransferRoot(BoxLayout):
                         last_ts_for_grouping = 0.0
                         last_sender = ""
                         last_ts_for_grouping = 0.0
+                    self._render_runtime_chat_cards_before(msg_created_ts, rendered_runtime_card_ids)
                     ts_source = msg.get('sent_at') if mine_msg else msg.get('received_at')
                     ts = time.strftime("%H:%M", time.localtime(float(ts_source or msg_created_ts)))
                     body_type = str(msg.get('body_type') or 'text')
@@ -4466,6 +4608,7 @@ class RUDPTransferRoot(BoxLayout):
                     compact = (sender_id == last_sender and (msg_created_ts - last_ts_for_grouping) <= 300 and body_type != 'file')
                     sender_name = self._display_name_for_peer(sender_id, members)
                     self.main_messages_box.add_message(mine=mine_msg, sender=sender_name, text=text, timestamp=ts, summary=summary, body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size, show_sender=True)
+                    self._mark_chat_message_rendered(msg)
                     last_sender = sender_id
                     last_ts_for_grouping = msg_created_ts
                 for live in self._live_messages_for_current_chat(seen_message_ids):
@@ -4475,6 +4618,7 @@ class RUDPTransferRoot(BoxLayout):
                     if self._is_screen_control_chat(live):
                         continue
                     msg_created_ts = float(live.get("created_at") or time.time())
+                    self._render_runtime_chat_cards_before(msg_created_ts, rendered_runtime_card_ids)
                     ts = time.strftime("%H:%M", time.localtime(msg_created_ts))
                     body_type = str(live.get("body_type") or "text")
                     text_live = str(live.get("text") or "")
@@ -4493,7 +4637,8 @@ class RUDPTransferRoot(BoxLayout):
                         continue
                     live_sender_id = str(live.get("sender_peer_id") or "")
                     self.main_messages_box.add_message(mine=False, sender=self._display_name_for_peer(live_sender_id, members), text=text_live, timestamp=ts, summary="", body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size, show_sender=True)
-                self._render_runtime_chat_cards()
+                    self._mark_chat_message_rendered(live)
+                self._render_remaining_runtime_chat_cards(rendered_runtime_card_ids)
                 active_count = sum(1 for m in members if str(m.get("member_state") or "active") == "active")
                 total_count = len(members)
                 if hasattr(self, "right_title"):
@@ -4538,6 +4683,7 @@ class RUDPTransferRoot(BoxLayout):
                     if msg_date_key != last_date_key:
                         self.main_messages_box.add_date_separator(self._date_separator_label(msg_created_ts))
                         last_date_key = msg_date_key
+                    self._render_runtime_chat_cards_before(msg_created_ts, rendered_runtime_card_ids)
                     ts_source = msg.get('sent_at') if mine_msg else msg.get('received_at')
                     ts = time.strftime("%H:%M", time.localtime(float(ts_source or msg_created_ts)))
                     body_type = str(msg.get('body_type') or 'text')
@@ -4569,6 +4715,7 @@ class RUDPTransferRoot(BoxLayout):
                     if mid:
                         seen_message_ids.add(mid)
                     self.main_messages_box.add_message(mine=mine_msg, sender=sender_id, text=text, timestamp=ts, summary=summary, body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size)
+                    self._mark_chat_message_rendered(msg)
                     last_sender = sender_id
                     last_ts_for_grouping = msg_created_ts
                 for live in self._live_messages_for_current_chat(seen_message_ids):
@@ -4578,6 +4725,7 @@ class RUDPTransferRoot(BoxLayout):
                     if self._is_screen_control_chat(live):
                         continue
                     msg_created_ts = float(live.get("created_at") or time.time())
+                    self._render_runtime_chat_cards_before(msg_created_ts, rendered_runtime_card_ids)
                     ts = time.strftime("%H:%M", time.localtime(msg_created_ts))
                     body_type = str(live.get("body_type") or "text")
                     text_live = str(live.get("text") or "")
@@ -4595,7 +4743,8 @@ class RUDPTransferRoot(BoxLayout):
                     if body_type == "file" and self._has_runtime_file_card(mid):
                         continue
                     self.main_messages_box.add_message(mine=False, sender=str(live.get("sender_peer_id") or ""), text=text_live, timestamp=ts, summary="", body_type=body_type, file_path=file_path, message_id=mid, progress_text=progress_text, total_size=total_size)
-                self._render_runtime_chat_cards()
+                    self._mark_chat_message_rendered(live)
+                self._render_remaining_runtime_chat_cards(rendered_runtime_card_ids)
                 contact_text = ""
                 seen_contact = False
                 for c in self.contact_service.list_contacts(trusted_only=False):
@@ -6029,7 +6178,6 @@ class RUDPTransferRoot(BoxLayout):
         mid = str(msg.get("message_id") or "")
         conv_id = str(msg.get("conversation_id") or "")
         created_at = float(msg.get("created_at") or time.time())
-        self.render_current_chat()
 
         def _mark_sent(pid: str) -> None:
             try:
@@ -6084,10 +6232,9 @@ class RUDPTransferRoot(BoxLayout):
                         self._clear_current_screen_context()
                         self._set_screen_share_ui_state("idle")
                     self._set_screen_share_status(self._screen_start_failed_text("invalid endpoint"))
-                    self._force_chat_refresh()
                 Clock.schedule_once(_invalid_endpoint, 0)
                 return
-            Clock.schedule_once(lambda _dt: (_mark_sent(peer_id), self._force_chat_refresh()), 0)
+            Clock.schedule_once(lambda _dt: _mark_sent(peer_id), 0)
             try:
                 ok = self._send_chat_to_endpoint(
                     ip=ip,
@@ -6103,7 +6250,7 @@ class RUDPTransferRoot(BoxLayout):
                 ok = False
                 self._append_debug_line(f"screen control send failed: {exc}", protocol=True)
             if ok:
-                Clock.schedule_once(lambda _dt: (_mark_delivered(peer_id), self._force_chat_refresh()), 0)
+                Clock.schedule_once(lambda _dt: _mark_delivered(peer_id), 0)
             else:
                 def _send_failed(_dt):
                     _mark_failed(peer_id, "screen_control_send_failed")
@@ -6126,7 +6273,6 @@ class RUDPTransferRoot(BoxLayout):
                         self._clear_current_screen_context()
                         self._set_screen_share_ui_state("idle")
                     self._set_screen_share_status(self._screen_start_failed_text("screen control send failed"))
-                    self._force_chat_refresh()
                 Clock.schedule_once(_send_failed, 0)
         threading.Thread(target=_run, daemon=True).start()
         return True
@@ -7525,7 +7671,14 @@ class RUDPTransferRoot(BoxLayout):
 
         mid = str(msg.get("message_id") or "")
         created_at = float(msg.get("created_at") or time.time())
-        self.render_current_chat()
+        live_msg = dict(msg)
+        live_msg.setdefault("text", text)
+        live_msg.setdefault("body_type", "text")
+        live_msg.setdefault("created_at", created_at)
+        live_msg.setdefault("group_id", group_id)
+        live_msg.setdefault("conversation_id", conversation_id)
+        live_msg.setdefault("sender_peer_id", self.chat_local_peer_id)
+        self._append_text_message_live(live_msg)
 
         def _mark_sent(pid: str) -> None:
             try:
@@ -7562,7 +7715,7 @@ class RUDPTransferRoot(BoxLayout):
 
                 # Important: SQLite/Kivy operations must stay on the UI thread.
                 # The background thread only performs the blocking subprocess send.
-                Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_sent(pid), self._force_chat_refresh()), 0)
+                Clock.schedule_once(lambda _dt, pid=peer_id: _mark_sent(pid), 0)
                 try:
                     ok = self._send_chat_to_endpoint(
                         ip=ip,
@@ -7579,10 +7732,9 @@ class RUDPTransferRoot(BoxLayout):
                     ok = False
                     self._append_debug_line(f"_send_chat_to_endpoint exception: {exc}", protocol=True)
                 if ok:
-                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_delivered(pid), self._force_chat_refresh()), 0)
+                    Clock.schedule_once(lambda _dt, pid=peer_id: _mark_delivered(pid), 0)
                 else:
-                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_failed(pid, "send_failed"), self._force_chat_refresh()), 0)
-            Clock.schedule_once(lambda _dt: self.render_current_chat(), 0)
+                    Clock.schedule_once(lambda _dt, pid=peer_id: _mark_failed(pid, "send_failed"), 0)
         threading.Thread(target=_run, daemon=True).start()
 
 
@@ -8604,7 +8756,7 @@ class RUDPTransferRoot(BoxLayout):
                         error=error,
                         package_count=package_file_count,
                     )
-                    Clock.schedule_once(lambda _dt, p=pid, e=error: (_mark_failed(p, e), self._force_chat_refresh()), 0)
+                    Clock.schedule_once(lambda _dt, p=pid, e=error: (_mark_failed(p, e), self._schedule_transfer_card_refresh(force=True)), 0)
                 Clock.schedule_once(lambda _dt, e=error: self.sender_log_box.append(f"file send failed: {e}\n"), 0)
                 return
             all_ok = True
@@ -8628,13 +8780,13 @@ class RUDPTransferRoot(BoxLayout):
                         pct=0.0,
                         status=self._file_failed_text("invalid_endpoint"),
                         error="invalid_endpoint",
-                    ), self._force_chat_refresh()), 0)
+                    ), self._schedule_transfer_card_refresh(force=True)), 0)
                     all_ok = False
                     if self.file_transfer_service is not None:
                         self.file_transfer_service.mark_failed(chat_message_id, peer_id=peer_id, direction='outgoing', error='invalid_endpoint')
                     continue
                 try:
-                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_sent(pid), self._force_chat_refresh()), 0)
+                    Clock.schedule_once(lambda _dt, pid=peer_id: _mark_sent(pid), 0)
                     self._send_chat_to_endpoint(
                         ip=ip, port=port, peer_id=peer_id, text=file_meta_text,
                         message_id=chat_message_id,
@@ -8687,10 +8839,10 @@ class RUDPTransferRoot(BoxLayout):
                 )
                 ok = self._run_file_sender_with_progress(args=args, message_id=chat_message_id, peer_id=peer_id, total_size=file_total)
                 if ok:
-                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_delivered(pid), self._force_chat_refresh()), 0)
+                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_delivered(pid), self._schedule_transfer_card_refresh(force=True)), 0)
                 else:
                     all_ok = False
-                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_failed(pid, 'file_send_failed'), self._force_chat_refresh()), 0)
+                    Clock.schedule_once(lambda _dt, pid=peer_id: (_mark_failed(pid, 'file_send_failed'), self._schedule_transfer_card_refresh(force=True)), 0)
                     if self.file_transfer_service is not None:
                         self.file_transfer_service.mark_failed(chat_message_id, peer_id=peer_id, direction='outgoing', error='file_send_failed')
             if delete_after_success and all_ok:
@@ -8701,7 +8853,7 @@ class RUDPTransferRoot(BoxLayout):
                         target.unlink(missing_ok=True)
                 except Exception as exc:
                     self._append_debug_line(f"temporary package cleanup failed: {exc}", protocol=True)
-            Clock.schedule_once(lambda _dt: self._force_chat_refresh(), 0)
+            Clock.schedule_once(lambda _dt: self._schedule_transfer_card_refresh(force=True), 0)
         threading.Thread(target=_run, daemon=True).start()
 
 
@@ -9167,7 +9319,6 @@ class RUDPTransferRoot(BoxLayout):
         try:
             if self.message_service is not None:
                 self.message_service.mark_read(str(obj.get("message_id") or ""), str(obj.get("reader_peer_id") or ""))
-                self._schedule_force_chat_refresh(0.0, 0.2)
         except Exception as exc:
             try:
                 self.receiver_log_box.append(f"Failed to apply CHAT_READ in UI DB: {exc}\n")
@@ -9202,7 +9353,6 @@ class RUDPTransferRoot(BoxLayout):
                         pass
             if is_screen_control:
                 self._handle_screen_control_from_chat(obj)
-                self._schedule_force_chat_refresh(0.0, 0.15, 0.5)
                 return
             try:
                 self.chat_messages_box.append(f"Incoming {obj.get('group_id')}: {obj.get('sender_peer_id')}: {obj.get('text')}\n")
@@ -9244,7 +9394,9 @@ class RUDPTransferRoot(BoxLayout):
                         status=self._file_incoming_text(self._file_peer_label(str(obj.get("sender_peer_id") or ""))),
                         detail=self._file_size_detail(total, peer_label=self._file_peer_label(str(obj.get("sender_peer_id") or ""))),
                     )
-            self._schedule_force_chat_refresh(0.0, 0.15, 0.5)
+                    self._schedule_transfer_card_refresh(force=True)
+                return
+            self._append_text_message_live(obj)
         except Exception as exc:
             try:
                 self.receiver_log_box.append(f"CHAT_MESSAGE UI handler failed: {exc}\n")
@@ -9283,10 +9435,7 @@ class RUDPTransferRoot(BoxLayout):
             self.receiving_file_message_by_conn.pop(int(conn or 0), None)
             if self.current_receiving_file_message_id == mid:
                 self.current_receiving_file_message_id = ""
-            # Rebuild immediately and again after delayed DB/log updates so the
-            # visible circular widget does not remain at the last progress tick.
-            self._force_chat_refresh()
-            self._schedule_force_chat_refresh(0.15, 0.5, 1.2, 2.0)
+            self._schedule_transfer_card_refresh(force=True)
         except Exception as exc:
             try:
                 self.receiver_log_box.append(f"saved-file UI handler failed: {exc}\n")
@@ -9347,8 +9496,7 @@ class RUDPTransferRoot(BoxLayout):
                         )
             self.receiving_file_message_by_conn.clear()
             self.current_receiving_file_message_id = ""
-            self._force_chat_refresh()
-            self._schedule_force_chat_refresh(0.15, 0.5, 1.2, 2.0)
+            self._schedule_transfer_card_refresh(force=True)
         except Exception as exc:
             try:
                 self.receiver_log_box.append(f"complete UI handler failed: {exc}\n")
@@ -9393,7 +9541,7 @@ class RUDPTransferRoot(BoxLayout):
                             status="offered",
                         ),
                     )
-                self._schedule_force_chat_refresh(0.0, 0.15)
+                self._schedule_transfer_card_refresh(force=True)
             self.show_transfer_request(req)
         except Exception as exc:
             try:
@@ -9692,7 +9840,6 @@ class RUDPTransferRoot(BoxLayout):
                     except Exception:
                         pass
             self._schedule_transfer_card_refresh(force=True)
-            self._schedule_force_chat_refresh(0.5)
         else:
             self._schedule_transfer_card_refresh(force=False)
         return True
