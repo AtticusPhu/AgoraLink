@@ -10,34 +10,38 @@ mod bgra_to_nv12;
 mod capture_encode_probe;
 mod capture_probe;
 mod encode_probe;
+mod h264_recv_dump;
+mod h264_send_probe;
 mod nv12_synthetic;
 mod wmf_h264_encoder;
 mod wmf_probe;
 
 const MAGIC: &[u8; 4] = b"AGM1";
 const VERSION: u8 = 1;
-const STREAM_VIDEO: u8 = 1;
-const FLAG_KEYFRAME: u16 = 1 << 0;
-const FLAG_END_OF_FRAME: u16 = 1 << 1;
+pub(crate) const STREAM_VIDEO: u8 = 1;
+pub(crate) const FLAG_KEYFRAME: u16 = 1 << 0;
+pub(crate) const FLAG_END_OF_FRAME: u16 = 1 << 1;
+pub(crate) const FLAG_CONFIG: u16 = 1 << 2;
+pub(crate) const FLAG_H264_ANNEX_B: u16 = 1 << 3;
 const HEADER_LEN: usize = 38;
 const MAX_UDP_PAYLOAD: usize = 1200;
-const MAX_MEDIA_PAYLOAD: usize = MAX_UDP_PAYLOAD - HEADER_LEN;
+pub(crate) const MAX_MEDIA_PAYLOAD: usize = MAX_UDP_PAYLOAD - HEADER_LEN;
 const FRAME_TTL: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, Clone)]
-struct MediaPacket {
-    stream_id: u8,
-    flags: u16,
-    session_id: u64,
-    frame_id: u64,
-    packet_index: u16,
-    packet_count: u16,
-    timestamp_ms: u64,
-    payload: Vec<u8>,
+pub(crate) struct MediaPacket {
+    pub(crate) stream_id: u8,
+    pub(crate) flags: u16,
+    pub(crate) session_id: u64,
+    pub(crate) frame_id: u64,
+    pub(crate) packet_index: u16,
+    pub(crate) packet_count: u16,
+    pub(crate) timestamp_ms: u64,
+    pub(crate) payload: Vec<u8>,
 }
 
 impl MediaPacket {
-    fn encode(&self) -> Result<Vec<u8>, String> {
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, String> {
         if self.payload.len() > MAX_MEDIA_PAYLOAD {
             return Err(format!("payload too large: {}", self.payload.len()));
         }
@@ -66,7 +70,7 @@ impl MediaPacket {
         Ok(out)
     }
 
-    fn decode(buf: &[u8]) -> Result<Self, String> {
+    pub(crate) fn decode(buf: &[u8]) -> Result<Self, String> {
         if buf.len() < HEADER_LEN {
             return Err("packet too short".to_string());
         }
@@ -132,6 +136,8 @@ enum Command {
     WmfProbe,
     EncodeProbe(encode_probe::EncodeProbeConfig),
     CaptureEncodeProbe(capture_encode_probe::CaptureEncodeConfig),
+    H264SendProbe(h264_send_probe::H264SendConfig),
+    H264RecvDump(h264_recv_dump::H264RecvConfig),
     Help,
 }
 
@@ -295,6 +301,18 @@ fn main() {
                 process::exit(1);
             }
         }
+        Ok(Command::H264SendProbe(config)) => {
+            if let Err(err) = h264_send_probe::run(config) {
+                eprintln!("h264-send-probe error: {err}");
+                process::exit(1);
+            }
+        }
+        Ok(Command::H264RecvDump(config)) => {
+            if let Err(err) = h264_recv_dump::run(config) {
+                eprintln!("h264-recv-dump error: {err}");
+                process::exit(1);
+            }
+        }
         Ok(Command::Help) => {
             print_help();
         }
@@ -333,6 +351,8 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         }
         "encode-probe" => parse_encode_probe_args(&args[1..]),
         "capture-encode-probe" => parse_capture_encode_probe_args(&args[1..]),
+        "h264-send-probe" => parse_h264_send_probe_args(&args[1..]),
+        "h264-recv-dump" => parse_h264_recv_dump_args(&args[1..]),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -531,6 +551,94 @@ fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
     ))
 }
 
+fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
+    let mut host = "127.0.0.1".to_string();
+    let mut port = 50130u16;
+    let mut duration_sec = 10u64;
+    let mut target_fps = 30u32;
+    let mut bitrate_mbps = 8.0f64;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" => {
+                i += 1;
+                host = required_value(args, i, "--host")?.to_string();
+            }
+            "--port" => {
+                i += 1;
+                port = parse_port(required_value(args, i, "--port")?)?;
+            }
+            "--duration-sec" => {
+                i += 1;
+                duration_sec = parse_duration_sec(required_value(args, i, "--duration-sec")?)?;
+            }
+            "--target-fps" => {
+                i += 1;
+                target_fps = parse_fps(required_value(args, i, "--target-fps")?)?;
+            }
+            "--bitrate-mbps" => {
+                i += 1;
+                bitrate_mbps = parse_bitrate(required_value(args, i, "--bitrate-mbps")?)?;
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown h264-send-probe argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::H264SendProbe(h264_send_probe::H264SendConfig {
+        host,
+        port,
+        duration_sec,
+        target_fps,
+        bitrate_mbps,
+    }))
+}
+
+fn parse_h264_recv_dump_args(args: &[String]) -> Result<Command, String> {
+    let mut bind = "0.0.0.0".to_string();
+    let mut port = 50130u16;
+    let mut output = "received_capture.h264".to_string();
+    let mut idle_timeout_sec = 3u64;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bind" => {
+                i += 1;
+                bind = required_value(args, i, "--bind")?.to_string();
+            }
+            "--port" => {
+                i += 1;
+                port = parse_port(required_value(args, i, "--port")?)?;
+            }
+            "--output" => {
+                i += 1;
+                output = required_value(args, i, "--output")?.to_string();
+                if output.trim().is_empty() {
+                    return Err("output path must not be empty".to_string());
+                }
+            }
+            "--idle-timeout-sec" => {
+                i += 1;
+                idle_timeout_sec =
+                    parse_idle_timeout(required_value(args, i, "--idle-timeout-sec")?)?;
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown h264-recv-dump argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::H264RecvDump(h264_recv_dump::H264RecvConfig {
+        bind,
+        port,
+        output,
+        idle_timeout_sec,
+    }))
+}
+
 fn required_value<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a str, String> {
     args.get(index)
         .map(String::as_str)
@@ -577,6 +685,17 @@ fn parse_duration_sec(text: &str) -> Result<u64, String> {
     }
 }
 
+fn parse_idle_timeout(text: &str) -> Result<u64, String> {
+    let duration: u64 = text
+        .parse()
+        .map_err(|_| format!("invalid idle-timeout-sec: {text}"))?;
+    if duration <= 3600 {
+        Ok(duration)
+    } else {
+        Err("idle-timeout-sec must be between 0 and 3600".to_string())
+    }
+}
+
 fn parse_dimension(text: &str, name: &str) -> Result<u32, String> {
     let value: u32 = text
         .parse()
@@ -609,13 +728,17 @@ Usage:\n\
   agoralink_media capture-probe --duration-sec <seconds> --target-fps <fps>\n\
   agoralink_media wmf-probe\n\
   agoralink_media encode-probe --width <pixels> --height <pixels> --fps <fps> --duration-sec <seconds> --bitrate-mbps <mbps> --output <path> [--encoder auto|software|hardware]\n\
-  agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --output <path>\n\n\
+  agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --output <path>\n\
+  agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps>\n\
+  agoralink_media h264-recv-dump --bind <ip> --port <port> --output <path> [--idle-timeout-sec <seconds>]\n\n\
 Defaults:\n\
   sender: --host 127.0.0.1 --port 50120 --fps 30 --bitrate-mbps 4\n\
   receiver: --bind 0.0.0.0 --port 50120\n\
   capture-probe: --duration-sec 10 --target-fps 30\n\
   encode-probe: --width 1280 --height 720 --fps 30 --duration-sec 5 --bitrate-mbps 4 --output synthetic_720p30.h264 --encoder auto\n\
-  capture-encode-probe: --duration-sec 5 --target-fps 30 --bitrate-mbps 8 --output capture_1080p30.h264"
+  capture-encode-probe: --duration-sec 5 --target-fps 30 --bitrate-mbps 8 --output capture_1080p30.h264\n\
+  h264-send-probe: --host 127.0.0.1 --port 50130 --duration-sec 10 --target-fps 30 --bitrate-mbps 8\n\
+  h264-recv-dump: --bind 0.0.0.0 --port 50130 --output received_capture.h264 --idle-timeout-sec 3"
     );
 }
 
@@ -795,16 +918,53 @@ fn build_frame_packets(
     Ok(packets)
 }
 
+pub(crate) fn packetize_media_payload(
+    session_id: u64,
+    frame_id: u64,
+    timestamp_ms: u64,
+    payload: &[u8],
+    frame_flags: u16,
+) -> Result<Vec<Vec<u8>>, String> {
+    let packet_count = payload.len().div_ceil(MAX_MEDIA_PAYLOAD).max(1);
+    if packet_count > u16::MAX as usize {
+        return Err(format!("encoded frame too large: {packet_count} packets"));
+    }
+
+    let mut packets = Vec::with_capacity(packet_count);
+    for packet_index in 0..packet_count {
+        let start = packet_index * MAX_MEDIA_PAYLOAD;
+        let end = (start + MAX_MEDIA_PAYLOAD).min(payload.len());
+        let mut flags = if packet_index == 0 { frame_flags } else { 0 };
+        if packet_index + 1 == packet_count {
+            flags |= FLAG_END_OF_FRAME;
+        }
+        packets.push(
+            MediaPacket {
+                stream_id: STREAM_VIDEO,
+                flags,
+                session_id,
+                frame_id,
+                packet_index: packet_index as u16,
+                packet_count: packet_count as u16,
+                timestamp_ms,
+                payload: payload[start..end].to_vec(),
+            }
+            .encode()?,
+        );
+    }
+    Ok(packets)
+}
+
 fn estimate_frame_payload_bytes(fps: u32, bitrate_mbps: f64) -> usize {
     let bytes_per_second = bitrate_mbps * 1_000_000.0 / 8.0;
     (bytes_per_second / fps as f64).round().max(1.0) as usize
 }
 
-fn make_session_id() -> u64 {
+pub(crate) fn make_session_id() -> u64 {
     now_millis() ^ ((process::id() as u64) << 32)
 }
 
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -813,6 +973,7 @@ fn now_millis() -> u64 {
 
 fn run_self_test() -> Result<(), String> {
     bgra_to_nv12::run_self_test()?;
+    h264_recv_dump::run_self_test()?;
     let nv12_size = nv12_synthetic::buffer_size(16, 16)?;
     if nv12_size != 16 * 16 * 3 / 2 {
         return Err("NV12 buffer size mismatch".to_string());
@@ -857,6 +1018,29 @@ fn run_self_test() -> Result<(), String> {
         .any(|item| item.len() > MAX_UDP_PAYLOAD)
     {
         return Err("packet exceeded UDP payload limit".to_string());
+    }
+
+    let encoded_payload = vec![0x55; 5000];
+    let encoded_packets = packetize_media_payload(
+        3,
+        11,
+        3000,
+        &encoded_payload,
+        FLAG_KEYFRAME | FLAG_CONFIG | FLAG_H264_ANNEX_B,
+    )?;
+    if encoded_packets.len() != 5 {
+        return Err(format!(
+            "expected 5 encoded media packets, got {}",
+            encoded_packets.len()
+        ));
+    }
+    let first_encoded = MediaPacket::decode(&encoded_packets[0])?;
+    let last_encoded = MediaPacket::decode(encoded_packets.last().unwrap())?;
+    if first_encoded.flags & (FLAG_KEYFRAME | FLAG_CONFIG | FLAG_H264_ANNEX_B)
+        != FLAG_KEYFRAME | FLAG_CONFIG | FLAG_H264_ANNEX_B
+        || last_encoded.flags & FLAG_END_OF_FRAME == 0
+    {
+        return Err("encoded media packet flags mismatch".to_string());
     }
 
     let mut reassembler = Reassembler::new(FRAME_TTL);

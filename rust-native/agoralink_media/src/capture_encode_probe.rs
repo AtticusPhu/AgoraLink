@@ -8,7 +8,9 @@ pub struct CaptureEncodeConfig {
 
 #[cfg(windows)]
 mod platform {
+    use std::fs::File;
     use std::io::{self, Write};
+    use std::path::Path;
     use std::slice;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -46,7 +48,7 @@ mod platform {
 
     use super::CaptureEncodeConfig;
     use crate::bgra_to_nv12;
-    use crate::wmf_h264_encoder::{EncoderStats, WmfH264Encoder, ENCODER_NAME};
+    use crate::wmf_h264_encoder::{EncodedSample, EncoderStats, WmfH264Encoder, ENCODER_NAME};
 
     const PIXEL_FORMAT: DirectXPixelFormat = DirectXPixelFormat::B8G8R8A8UIntNormalized;
     const PIXEL_FORMAT_NAME: &str = "B8G8R8A8";
@@ -76,6 +78,92 @@ mod platform {
         copy_ms_total: f64,
         convert_ms_total: f64,
         encode_ms_total: f64,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct CapturePipelineStats {
+        pub raw_frames: u64,
+        pub accepted_frames: u64,
+        pub skipped_frames: u64,
+        pub converted_frames: u64,
+        pub frames_in: u64,
+        pub samples_out: u64,
+        pub bytes_out: u64,
+        pub raw_fps: f64,
+        pub accepted_fps: f64,
+        pub encode_fps: f64,
+        pub target_fps: u32,
+        pub mbps: f64,
+        pub width: u32,
+        pub height: u32,
+        pub copy_ms_avg: f64,
+        pub convert_ms_avg: f64,
+        pub encode_ms_avg: f64,
+        pub dropped: u64,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct CapturePipelineDone {
+        pub raw_frames: u64,
+        pub accepted_frames: u64,
+        pub skipped_frames: u64,
+        pub converted_frames: u64,
+        pub encoder: EncoderStats,
+        pub media_duration_sec: f64,
+        pub wall_time_sec: f64,
+        pub processing_fps: f64,
+        pub mbps: f64,
+        pub width: u32,
+        pub height: u32,
+        pub copy_ms_avg: f64,
+        pub convert_ms_avg: f64,
+        pub encode_ms_avg: f64,
+        pub dropped: u64,
+        pub stopped_by_console: bool,
+    }
+
+    pub trait CaptureEncodeObserver {
+        fn on_sample(&mut self, sample: EncodedSample) -> Result<(), String>;
+        fn on_stats(&mut self, stats: &CapturePipelineStats) -> Result<(), String>;
+    }
+
+    struct FileProbeObserver {
+        output: File,
+    }
+
+    impl CaptureEncodeObserver for FileProbeObserver {
+        fn on_sample(&mut self, sample: EncodedSample) -> Result<(), String> {
+            self.output
+                .write_all(&sample.bytes)
+                .map_err(|err| format!("write H.264 output failed: {err}"))
+        }
+
+        fn on_stats(&mut self, stats: &CapturePipelineStats) -> Result<(), String> {
+            println!(
+                r#"{{"type":"CAPTURE_ENCODE_STATS","mode":"capture_encode_probe","raw_frames":{},"accepted_frames":{},"skipped_frames":{},"converted_frames":{},"frames_in":{},"samples_out":{},"bytes_out":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"mbps":{:.3},"width":{},"height":{},"format_in":"{}","format_encode":"NV12","copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"dropped":{}}}"#,
+                stats.raw_frames,
+                stats.accepted_frames,
+                stats.skipped_frames,
+                stats.converted_frames,
+                stats.frames_in,
+                stats.samples_out,
+                stats.bytes_out,
+                stats.raw_fps,
+                stats.accepted_fps,
+                stats.encode_fps,
+                stats.target_fps,
+                stats.mbps,
+                stats.width,
+                stats.height,
+                PIXEL_FORMAT_NAME,
+                stats.copy_ms_avg,
+                stats.convert_ms_avg,
+                stats.encode_ms_avg,
+                stats.dropped
+            );
+            io::stdout().flush().ok();
+            Ok(())
+        }
     }
 
     struct WinRtGuard;
@@ -138,6 +226,55 @@ mod platform {
 
     pub fn run(config: CaptureEncodeConfig) -> Result<(), String> {
         validate_config(&config)?;
+        let output = File::create(Path::new(&config.output))
+            .map_err(|err| format!("create output failed: {err}"))?;
+        let mut observer = FileProbeObserver { output };
+        let done = run_with_observer(&config, &mut observer)?;
+        observer
+            .output
+            .flush()
+            .map_err(|err| format!("flush output failed: {err}"))?;
+        println!(
+            r#"{{"type":"CAPTURE_ENCODE_DONE","encoder":"{}","raw_frames":{},"accepted_frames":{},"skipped_frames":{},"converted_frames":{},"frames_in":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"keyframes":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"dropped":{},"output":"{}"}}"#,
+            ENCODER_NAME,
+            done.raw_frames,
+            done.accepted_frames,
+            done.skipped_frames,
+            done.converted_frames,
+            done.encoder.frames_in,
+            done.encoder.samples_out,
+            done.encoder.bytes_out,
+            done.media_duration_sec,
+            done.wall_time_sec,
+            config.target_fps,
+            done.processing_fps,
+            done.mbps,
+            keyframes_json(done.encoder),
+            done.width,
+            done.height,
+            done.copy_ms_avg,
+            done.convert_ms_avg,
+            done.encode_ms_avg,
+            done.dropped,
+            json_escape(&config.output)
+        );
+        io::stdout().flush().ok();
+        eprintln!(
+            "capture-encode-probe stopped reason={}",
+            if done.stopped_by_console {
+                "console-control"
+            } else {
+                "duration-complete"
+            }
+        );
+        Ok(())
+    }
+
+    pub fn run_with_observer(
+        config: &CaptureEncodeConfig,
+        observer: &mut dyn CaptureEncodeObserver,
+    ) -> Result<CapturePipelineDone, String> {
+        validate_stream_config(config)?;
         let _winrt = WinRtGuard::initialize()?;
         let _console_ctrl = ConsoleCtrlGuard::install()?;
         check_capture_support()?;
@@ -161,13 +298,8 @@ mod platform {
             ));
         }
 
-        let mut encoder = WmfH264Encoder::new(
-            width,
-            height,
-            config.target_fps,
-            config.bitrate_mbps,
-            &config.output,
-        )?;
+        let mut encoder =
+            WmfH264Encoder::new_stream(width, height, config.target_fps, config.bitrate_mbps)?;
         let mut readback = ReadbackState {
             staging: None,
             desc: None,
@@ -235,12 +367,13 @@ mod platform {
                     return Err("WGC frame channel disconnected".to_string())
                 }
             }
+            emit_encoded_samples(&mut encoder, observer)?;
 
             let now = Instant::now();
             if now.duration_since(report_at) >= Duration::from_secs(1) {
                 let capture = capture_snapshot(&capture_state);
                 let encoder_stats = encoder.stats();
-                print_stats(
+                let stats = make_stats(
                     width,
                     height,
                     config.target_fps,
@@ -251,6 +384,7 @@ mod platform {
                     timings,
                     now.duration_since(report_at),
                 );
+                observer.on_stats(&stats)?;
                 previous_capture = capture;
                 previous_encoder = encoder_stats;
                 report_at = now;
@@ -267,47 +401,35 @@ mod platform {
             &mut encoder,
             &mut timings,
             &capture_state,
-        );
+            observer,
+        )?;
+        emit_encoded_samples(&mut encoder, observer)?;
 
         let encoder_stats = encoder.finish()?;
+        emit_encoded_samples(&mut encoder, observer)?;
         let capture = capture_snapshot(&capture_state);
         let media_duration_sec = encoder_stats.frames_in as f64 / f64::from(config.target_fps);
         let mbps =
             encoder_stats.bytes_out as f64 * 8.0 / media_duration_sec.max(0.001) / 1_000_000.0;
-        println!(
-            r#"{{"type":"CAPTURE_ENCODE_DONE","encoder":"{}","raw_frames":{},"accepted_frames":{},"skipped_frames":{},"converted_frames":{},"frames_in":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"keyframes":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"dropped":{},"output":"{}"}}"#,
-            ENCODER_NAME,
-            capture.raw_frames,
-            capture.accepted_frames,
-            capture.skipped_frames,
-            timings.converted_frames,
-            encoder_stats.frames_in,
-            encoder_stats.samples_out,
-            encoder_stats.bytes_out,
+        let wall_time_sec = started_at.elapsed().as_secs_f64();
+        Ok(CapturePipelineDone {
+            raw_frames: capture.raw_frames,
+            accepted_frames: capture.accepted_frames,
+            skipped_frames: capture.skipped_frames,
+            converted_frames: timings.converted_frames,
+            encoder: encoder_stats,
             media_duration_sec,
-            started_at.elapsed().as_secs_f64(),
-            config.target_fps,
-            encoder_stats.frames_in as f64 / started_at.elapsed().as_secs_f64().max(0.001),
+            wall_time_sec,
+            processing_fps: encoder_stats.frames_in as f64 / wall_time_sec.max(0.001),
             mbps,
-            keyframes_json(encoder_stats),
             width,
             height,
-            average_ms(timings.copy_ms_total, timings.converted_frames),
-            average_ms(timings.convert_ms_total, timings.converted_frames),
-            average_ms(timings.encode_ms_total, encoder_stats.frames_in),
-            capture.dropped,
-            json_escape(&config.output)
-        );
-        io::stdout().flush().ok();
-        eprintln!(
-            "capture-encode-probe stopped reason={}",
-            if STOP_REQUESTED.load(Ordering::SeqCst) {
-                "console-control"
-            } else {
-                "duration-complete"
-            }
-        );
-        Ok(())
+            copy_ms_avg: average_ms(timings.copy_ms_total, timings.converted_frames),
+            convert_ms_avg: average_ms(timings.convert_ms_total, timings.converted_frames),
+            encode_ms_avg: average_ms(timings.encode_ms_total, encoder_stats.frames_in),
+            dropped: capture.dropped,
+            stopped_by_console: STOP_REQUESTED.load(Ordering::SeqCst),
+        })
     }
 
     fn create_frame_handler(
@@ -511,10 +633,13 @@ mod platform {
         encoder: &mut WmfH264Encoder,
         timings: &mut PipelineTimings,
         capture_state: &Arc<Mutex<CaptureState>>,
-    ) {
+        observer: &mut dyn CaptureEncodeObserver,
+    ) -> Result<(), String> {
         while let Ok(frame) = receiver.try_recv() {
             process_received_frame(frame, devices, readback, encoder, timings, capture_state);
+            emit_encoded_samples(encoder, observer)?;
         }
+        Ok(())
     }
 
     fn create_d3d11_devices() -> Result<D3dDevices, String> {
@@ -603,14 +728,19 @@ mod platform {
     }
 
     fn validate_config(config: &CaptureEncodeConfig) -> Result<(), String> {
+        validate_stream_config(config)?;
+        if config.output.trim().is_empty() {
+            return Err("output path must not be empty".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_stream_config(config: &CaptureEncodeConfig) -> Result<(), String> {
         if config.duration_sec == 0 || config.target_fps == 0 {
             return Err("duration-sec and target-fps must be greater than zero".to_string());
         }
         if !config.bitrate_mbps.is_finite() || config.bitrate_mbps <= 0.0 {
             return Err("bitrate-mbps must be greater than zero".to_string());
-        }
-        if config.output.trim().is_empty() {
-            return Err("output path must not be empty".to_string());
         }
         Ok(())
     }
@@ -628,8 +758,18 @@ mod platform {
             .unwrap_or_default()
     }
 
+    fn emit_encoded_samples(
+        encoder: &mut WmfH264Encoder,
+        observer: &mut dyn CaptureEncodeObserver,
+    ) -> Result<(), String> {
+        for sample in encoder.take_encoded_samples() {
+            observer.on_sample(sample)?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn print_stats(
+    fn make_stats(
         width: u32,
         height: u32,
         target_fps: u32,
@@ -639,7 +779,7 @@ mod platform {
         previous_encoder: EncoderStats,
         timings: PipelineTimings,
         elapsed: Duration,
-    ) {
+    ) -> CapturePipelineStats {
         let elapsed_sec = elapsed.as_secs_f64().max(0.001);
         let raw_fps = capture
             .raw_frames
@@ -654,15 +794,14 @@ mod platform {
         let mbps = encoder.bytes_out.saturating_sub(previous_encoder.bytes_out) as f64 * 8.0
             / elapsed_sec
             / 1_000_000.0;
-        println!(
-            r#"{{"type":"CAPTURE_ENCODE_STATS","mode":"capture_encode_probe","raw_frames":{},"accepted_frames":{},"skipped_frames":{},"converted_frames":{},"frames_in":{},"samples_out":{},"bytes_out":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"mbps":{:.3},"width":{},"height":{},"format_in":"{}","format_encode":"NV12","copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"dropped":{}}}"#,
-            capture.raw_frames,
-            capture.accepted_frames,
-            capture.skipped_frames,
-            timings.converted_frames,
-            encoder.frames_in,
-            encoder.samples_out,
-            encoder.bytes_out,
+        CapturePipelineStats {
+            raw_frames: capture.raw_frames,
+            accepted_frames: capture.accepted_frames,
+            skipped_frames: capture.skipped_frames,
+            converted_frames: timings.converted_frames,
+            frames_in: encoder.frames_in,
+            samples_out: encoder.samples_out,
+            bytes_out: encoder.bytes_out,
             raw_fps,
             accepted_fps,
             encode_fps,
@@ -670,13 +809,11 @@ mod platform {
             mbps,
             width,
             height,
-            PIXEL_FORMAT_NAME,
-            average_ms(timings.copy_ms_total, timings.converted_frames),
-            average_ms(timings.convert_ms_total, timings.converted_frames),
-            average_ms(timings.encode_ms_total, encoder.frames_in),
-            capture.dropped
-        );
-        io::stdout().flush().ok();
+            copy_ms_avg: average_ms(timings.copy_ms_total, timings.converted_frames),
+            convert_ms_avg: average_ms(timings.convert_ms_total, timings.converted_frames),
+            encode_ms_avg: average_ms(timings.encode_ms_total, encoder.frames_in),
+            dropped: capture.dropped,
+        }
     }
 
     fn average_ms(total: f64, count: u64) -> f64 {
@@ -704,7 +841,9 @@ mod platform {
 }
 
 #[cfg(windows)]
-pub use platform::run;
+pub use platform::{
+    run, run_with_observer, CaptureEncodeObserver, CapturePipelineDone, CapturePipelineStats,
+};
 
 #[cfg(not(windows))]
 pub fn run(_config: CaptureEncodeConfig) -> Result<(), String> {

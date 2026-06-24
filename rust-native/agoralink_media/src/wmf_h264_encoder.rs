@@ -1,5 +1,6 @@
 #[cfg(windows)]
 mod platform {
+    use std::collections::VecDeque;
     use std::fs::File;
     use std::io::Write;
     use std::mem::ManuallyDrop;
@@ -41,6 +42,12 @@ mod platform {
         pub bytes_out: u64,
         pub keyframes: u64,
         pub keyframe_detection_available: bool,
+    }
+
+    #[derive(Debug)]
+    pub struct EncodedSample {
+        pub bytes: Vec<u8>,
+        pub keyframe: Option<bool>,
     }
 
     struct ComGuard;
@@ -85,7 +92,9 @@ mod platform {
         transform: IMFTransform,
         output_info: MFT_OUTPUT_STREAM_INFO,
         output_buffer_size: u32,
-        output: File,
+        output: Option<File>,
+        collect_samples: bool,
+        pending_samples: VecDeque<EncodedSample>,
         frame_size: usize,
         fps: u32,
         stats: EncoderStats,
@@ -102,6 +111,28 @@ mod platform {
             fps: u32,
             bitrate_mbps: f64,
             output_path: &str,
+        ) -> Result<Self, String> {
+            let output = File::create(Path::new(output_path))
+                .map_err(|err| format!("create output failed: {err}"))?;
+            Self::new_internal(width, height, fps, bitrate_mbps, Some(output), false)
+        }
+
+        pub fn new_stream(
+            width: u32,
+            height: u32,
+            fps: u32,
+            bitrate_mbps: f64,
+        ) -> Result<Self, String> {
+            Self::new_internal(width, height, fps, bitrate_mbps, None, true)
+        }
+
+        fn new_internal(
+            width: u32,
+            height: u32,
+            fps: u32,
+            bitrate_mbps: f64,
+            output: Option<File>,
+            collect_samples: bool,
         ) -> Result<Self, String> {
             if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
                 return Err("encoder width and height must be non-zero even values".to_string());
@@ -158,8 +189,6 @@ mod platform {
                 .map_err(|err| format!("GetOutputStreamInfo failed: {err}"))?;
             let output_buffer_size =
                 output_buffer_size(width, height, frame_size, bitrate_bps, &output_info)?;
-            let output = File::create(Path::new(output_path))
-                .map_err(|err| format!("create output failed: {err}"))?;
 
             unsafe {
                 transform
@@ -175,6 +204,8 @@ mod platform {
                 output_info,
                 output_buffer_size,
                 output,
+                collect_samples,
+                pending_samples: VecDeque::new(),
                 frame_size,
                 fps,
                 stats: EncoderStats::default(),
@@ -208,6 +239,8 @@ mod platform {
                 &self.output_info,
                 self.output_buffer_size,
                 &mut self.output,
+                self.collect_samples,
+                &mut self.pending_samples,
                 &mut self.stats,
             )?;
             self.stats.frames_in += 1;
@@ -216,6 +249,8 @@ mod platform {
                 &self.output_info,
                 self.output_buffer_size,
                 &mut self.output,
+                self.collect_samples,
+                &mut self.pending_samples,
                 &mut self.stats,
             )?;
             Ok(())
@@ -238,17 +273,25 @@ mod platform {
                 &self.output_info,
                 self.output_buffer_size,
                 &mut self.output,
+                self.collect_samples,
+                &mut self.pending_samples,
                 &mut self.stats,
             )?;
             let _ = unsafe {
                 self.transform
                     .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0)
             };
-            self.output
-                .flush()
-                .map_err(|err| format!("flush output failed: {err}"))?;
+            if let Some(output) = self.output.as_mut() {
+                output
+                    .flush()
+                    .map_err(|err| format!("flush output failed: {err}"))?;
+            }
             self.finished = true;
             Ok(self.stats)
+        }
+
+        pub fn take_encoded_samples(&mut self) -> Vec<EncodedSample> {
+            self.pending_samples.drain(..).collect()
         }
 
         pub fn stats(&self) -> EncoderStats {
@@ -271,7 +314,9 @@ mod platform {
                     self.transform
                         .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0)
                 };
-                let _ = self.output.flush();
+                if let Some(output) = self.output.as_mut() {
+                    let _ = output.flush();
+                }
             }
         }
     }
@@ -366,15 +411,24 @@ mod platform {
         sample: &IMFSample,
         output_info: &MFT_OUTPUT_STREAM_INFO,
         output_buffer_size: u32,
-        output: &mut File,
+        output: &mut Option<File>,
+        collect_samples: bool,
+        pending_samples: &mut VecDeque<EncodedSample>,
         stats: &mut EncoderStats,
     ) -> Result<(), String> {
         loop {
             match unsafe { transform.ProcessInput(0, sample, 0) } {
                 Ok(()) => return Ok(()),
                 Err(err) if err.code() == MF_E_NOTACCEPTING => {
-                    if !drain_available(transform, output_info, output_buffer_size, output, stats)?
-                    {
+                    if !drain_available(
+                        transform,
+                        output_info,
+                        output_buffer_size,
+                        output,
+                        collect_samples,
+                        pending_samples,
+                        stats,
+                    )? {
                         return Err(
                             "encoder rejected input but produced no pending output".to_string()
                         );
@@ -389,12 +443,22 @@ mod platform {
         transform: &IMFTransform,
         output_info: &MFT_OUTPUT_STREAM_INFO,
         output_buffer_size: u32,
-        output: &mut File,
+        output: &mut Option<File>,
+        collect_samples: bool,
+        pending_samples: &mut VecDeque<EncodedSample>,
         stats: &mut EncoderStats,
     ) -> Result<bool, String> {
         let mut produced_any = false;
         loop {
-            match process_one_output(transform, output_info, output_buffer_size, output, stats)? {
+            match process_one_output(
+                transform,
+                output_info,
+                output_buffer_size,
+                output,
+                collect_samples,
+                pending_samples,
+                stats,
+            )? {
                 OutputResult::Produced => produced_any = true,
                 OutputResult::NeedMoreInput => return Ok(produced_any),
             }
@@ -405,7 +469,9 @@ mod platform {
         transform: &IMFTransform,
         output_info: &MFT_OUTPUT_STREAM_INFO,
         output_buffer_size: u32,
-        output: &mut File,
+        output: &mut Option<File>,
+        collect_samples: bool,
+        pending_samples: &mut VecDeque<EncodedSample>,
         stats: &mut EncoderStats,
     ) -> Result<OutputResult, String> {
         let transform_provides_sample = output_info.dwFlags
@@ -440,16 +506,22 @@ mod platform {
                 if bytes.is_empty() {
                     return Err("encoder produced an empty output sample".to_string());
                 }
-                output
-                    .write_all(&bytes)
-                    .map_err(|err| format!("write H.264 output failed: {err}"))?;
+                if let Some(output) = output.as_mut() {
+                    output
+                        .write_all(&bytes)
+                        .map_err(|err| format!("write H.264 output failed: {err}"))?;
+                }
                 stats.samples_out += 1;
                 stats.bytes_out += bytes.len() as u64;
-                if let Some(keyframe) = detect_keyframe(&sample, &bytes) {
+                let keyframe = detect_keyframe(&sample, &bytes);
+                if let Some(keyframe) = keyframe {
                     stats.keyframe_detection_available = true;
                     if keyframe {
                         stats.keyframes += 1;
                     }
+                }
+                if collect_samples {
+                    pending_samples.push_back(EncodedSample { bytes, keyframe });
                 }
                 Ok(OutputResult::Produced)
             }
@@ -557,4 +629,4 @@ mod platform {
 }
 
 #[cfg(windows)]
-pub use platform::{EncoderStats, WmfH264Encoder, ENCODER_NAME};
+pub use platform::{EncodedSample, EncoderStats, WmfH264Encoder, ENCODER_NAME};
