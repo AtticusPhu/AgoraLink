@@ -39,3 +39,5 @@ rust-native/agoralink_media/*.wav
 dshow_devices.txt
 stereo_mix_level.txt
 stereo_mix_test.wav
+
+rust-native/agoralink_media/*.h264

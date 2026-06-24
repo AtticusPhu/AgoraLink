@@ -6,9 +6,12 @@ use std::process;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod bgra_to_nv12;
+mod capture_encode_probe;
 mod capture_probe;
 mod encode_probe;
 mod nv12_synthetic;
+mod wmf_h264_encoder;
 mod wmf_probe;
 
 const MAGIC: &[u8; 4] = b"AGM1";
@@ -128,6 +131,7 @@ enum Command {
     },
     WmfProbe,
     EncodeProbe(encode_probe::EncodeProbeConfig),
+    CaptureEncodeProbe(capture_encode_probe::CaptureEncodeConfig),
     Help,
 }
 
@@ -285,6 +289,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        Ok(Command::CaptureEncodeProbe(config)) => {
+            if let Err(err) = capture_encode_probe::run(config) {
+                eprintln!("capture-encode-probe error: {err}");
+                process::exit(1);
+            }
+        }
         Ok(Command::Help) => {
             print_help();
         }
@@ -322,6 +332,7 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
             }
         }
         "encode-probe" => parse_encode_probe_args(&args[1..]),
+        "capture-encode-probe" => parse_capture_encode_probe_args(&args[1..]),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -476,6 +487,50 @@ fn parse_encode_probe_args(args: &[String]) -> Result<Command, String> {
     }))
 }
 
+fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
+    let mut duration_sec = 5u64;
+    let mut target_fps = 30u32;
+    let mut bitrate_mbps = 8.0f64;
+    let mut output = "capture_1080p30.h264".to_string();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--duration-sec" => {
+                i += 1;
+                duration_sec = parse_duration_sec(required_value(args, i, "--duration-sec")?)?;
+            }
+            "--target-fps" => {
+                i += 1;
+                target_fps = parse_fps(required_value(args, i, "--target-fps")?)?;
+            }
+            "--bitrate-mbps" => {
+                i += 1;
+                bitrate_mbps = parse_bitrate(required_value(args, i, "--bitrate-mbps")?)?;
+            }
+            "--output" => {
+                i += 1;
+                output = required_value(args, i, "--output")?.to_string();
+                if output.trim().is_empty() {
+                    return Err("output path must not be empty".to_string());
+                }
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown capture-encode-probe argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::CaptureEncodeProbe(
+        capture_encode_probe::CaptureEncodeConfig {
+            duration_sec,
+            target_fps,
+            bitrate_mbps,
+            output,
+        },
+    ))
+}
+
 fn required_value<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a str, String> {
     args.get(index)
         .map(String::as_str)
@@ -553,12 +608,14 @@ Usage:\n\
   agoralink_media receiver --bind <ip> --port <port>\n\
   agoralink_media capture-probe --duration-sec <seconds> --target-fps <fps>\n\
   agoralink_media wmf-probe\n\
-  agoralink_media encode-probe --width <pixels> --height <pixels> --fps <fps> --duration-sec <seconds> --bitrate-mbps <mbps> --output <path> [--encoder auto|software|hardware]\n\n\
+  agoralink_media encode-probe --width <pixels> --height <pixels> --fps <fps> --duration-sec <seconds> --bitrate-mbps <mbps> --output <path> [--encoder auto|software|hardware]\n\
+  agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --output <path>\n\n\
 Defaults:\n\
   sender: --host 127.0.0.1 --port 50120 --fps 30 --bitrate-mbps 4\n\
   receiver: --bind 0.0.0.0 --port 50120\n\
   capture-probe: --duration-sec 10 --target-fps 30\n\
-  encode-probe: --width 1280 --height 720 --fps 30 --duration-sec 5 --bitrate-mbps 4 --output synthetic_720p30.h264 --encoder auto"
+  encode-probe: --width 1280 --height 720 --fps 30 --duration-sec 5 --bitrate-mbps 4 --output synthetic_720p30.h264 --encoder auto\n\
+  capture-encode-probe: --duration-sec 5 --target-fps 30 --bitrate-mbps 8 --output capture_1080p30.h264"
     );
 }
 
@@ -755,6 +812,7 @@ fn now_millis() -> u64 {
 }
 
 fn run_self_test() -> Result<(), String> {
+    bgra_to_nv12::run_self_test()?;
     let nv12_size = nv12_synthetic::buffer_size(16, 16)?;
     if nv12_size != 16 * 16 * 3 / 2 {
         return Err("NV12 buffer size mismatch".to_string());

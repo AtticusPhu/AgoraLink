@@ -3,6 +3,9 @@ name = "agoralink_media"
 version = "0.1.0"
 edition = "2021"
 
+[profile.dev]
+opt-level = 2
+
 [dependencies]
 
 [target.'cfg(windows)'.dependencies]
@@ -16,6 +19,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
