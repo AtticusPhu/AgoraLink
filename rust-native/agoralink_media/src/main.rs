@@ -1,0 +1,653 @@
+use std::collections::HashMap;
+use std::env;
+use std::io::{self, Write};
+use std::net::UdpSocket;
+use std::process;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const MAGIC: &[u8; 4] = b"AGM1";
+const VERSION: u8 = 1;
+const STREAM_VIDEO: u8 = 1;
+const FLAG_KEYFRAME: u16 = 1 << 0;
+const FLAG_END_OF_FRAME: u16 = 1 << 1;
+const HEADER_LEN: usize = 38;
+const MAX_UDP_PAYLOAD: usize = 1200;
+const MAX_MEDIA_PAYLOAD: usize = MAX_UDP_PAYLOAD - HEADER_LEN;
+const FRAME_TTL: Duration = Duration::from_millis(1000);
+
+#[derive(Debug, Clone)]
+struct MediaPacket {
+    stream_id: u8,
+    flags: u16,
+    session_id: u64,
+    frame_id: u64,
+    packet_index: u16,
+    packet_count: u16,
+    timestamp_ms: u64,
+    payload: Vec<u8>,
+}
+
+impl MediaPacket {
+    fn encode(&self) -> Result<Vec<u8>, String> {
+        if self.payload.len() > MAX_MEDIA_PAYLOAD {
+            return Err(format!("payload too large: {}", self.payload.len()));
+        }
+        if self.payload.len() > u16::MAX as usize {
+            return Err("payload length exceeds u16".to_string());
+        }
+        if self.packet_count == 0 {
+            return Err("packet_count must be greater than zero".to_string());
+        }
+        if self.packet_index >= self.packet_count {
+            return Err("packet_index must be less than packet_count".to_string());
+        }
+
+        let mut out = Vec::with_capacity(HEADER_LEN + self.payload.len());
+        out.extend_from_slice(MAGIC);
+        out.push(VERSION);
+        out.push(self.stream_id);
+        out.extend_from_slice(&self.flags.to_be_bytes());
+        out.extend_from_slice(&self.session_id.to_be_bytes());
+        out.extend_from_slice(&self.frame_id.to_be_bytes());
+        out.extend_from_slice(&self.packet_index.to_be_bytes());
+        out.extend_from_slice(&self.packet_count.to_be_bytes());
+        out.extend_from_slice(&self.timestamp_ms.to_be_bytes());
+        out.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(&self.payload);
+        Ok(out)
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self, String> {
+        if buf.len() < HEADER_LEN {
+            return Err("packet too short".to_string());
+        }
+        if &buf[0..4] != MAGIC {
+            return Err("bad magic".to_string());
+        }
+        if buf[4] != VERSION {
+            return Err(format!("unsupported version: {}", buf[4]));
+        }
+
+        let stream_id = buf[5];
+        let flags = u16::from_be_bytes([buf[6], buf[7]]);
+        let session_id = u64::from_be_bytes(buf[8..16].try_into().unwrap());
+        let frame_id = u64::from_be_bytes(buf[16..24].try_into().unwrap());
+        let packet_index = u16::from_be_bytes([buf[24], buf[25]]);
+        let packet_count = u16::from_be_bytes([buf[26], buf[27]]);
+        let timestamp_ms = u64::from_be_bytes(buf[28..36].try_into().unwrap());
+        let payload_len = u16::from_be_bytes([buf[36], buf[37]]) as usize;
+
+        if packet_count == 0 {
+            return Err("packet_count is zero".to_string());
+        }
+        if packet_index >= packet_count {
+            return Err("packet_index out of range".to_string());
+        }
+        if payload_len > MAX_MEDIA_PAYLOAD {
+            return Err(format!("payload_len exceeds limit: {}", payload_len));
+        }
+        if HEADER_LEN + payload_len > buf.len() {
+            return Err("payload_len exceeds datagram length".to_string());
+        }
+
+        Ok(Self {
+            stream_id,
+            flags,
+            session_id,
+            frame_id,
+            packet_index,
+            packet_count,
+            timestamp_ms,
+            payload: buf[HEADER_LEN..HEADER_LEN + payload_len].to_vec(),
+        })
+    }
+}
+
+#[derive(Debug)]
+enum Command {
+    SelfTest,
+    Sender {
+        host: String,
+        port: u16,
+        fps: u32,
+        bitrate_mbps: f64,
+    },
+    Receiver {
+        bind: String,
+        port: u16,
+    },
+    Help,
+}
+
+#[derive(Debug, Default)]
+struct ReceiverStats {
+    packets_received: u64,
+    packets_dropped_or_lost_estimate: u64,
+    frames_complete: u64,
+    frames_incomplete_expired: u64,
+    last_frame_id: u64,
+}
+
+#[derive(Debug)]
+struct FrameAssembly {
+    packet_count: u16,
+    received: Vec<bool>,
+    received_count: u16,
+    first_seen: Instant,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct Reassembler {
+    frames: HashMap<u64, FrameAssembly>,
+    ttl: Duration,
+    stats: ReceiverStats,
+}
+
+impl Reassembler {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            frames: HashMap::new(),
+            ttl,
+            stats: ReceiverStats::default(),
+        }
+    }
+
+    fn accept(&mut self, packet: MediaPacket, now: Instant) -> bool {
+        self.stats.packets_received += 1;
+        if packet.stream_id != STREAM_VIDEO || packet.packet_count == 0 {
+            self.stats.packets_dropped_or_lost_estimate += 1;
+            return false;
+        }
+
+        let entry = self
+            .frames
+            .entry(packet.frame_id)
+            .or_insert_with(|| FrameAssembly {
+                packet_count: packet.packet_count,
+                received: vec![false; packet.packet_count as usize],
+                received_count: 0,
+                first_seen: now,
+                bytes: 0,
+            });
+
+        if entry.packet_count != packet.packet_count {
+            self.stats.packets_dropped_or_lost_estimate += 1;
+            return false;
+        }
+
+        let index = packet.packet_index as usize;
+        if index >= entry.received.len() {
+            self.stats.packets_dropped_or_lost_estimate += 1;
+            return false;
+        }
+
+        if !entry.received[index] {
+            entry.received[index] = true;
+            entry.received_count += 1;
+            entry.bytes += packet.payload.len();
+        }
+
+        if entry.received_count == entry.packet_count {
+            self.frames.remove(&packet.frame_id);
+            self.stats.frames_complete += 1;
+            self.stats.last_frame_id = packet.frame_id;
+            return true;
+        }
+        false
+    }
+
+    fn expire(&mut self, now: Instant) {
+        let ttl = self.ttl;
+        let expired: Vec<u64> = self
+            .frames
+            .iter()
+            .filter_map(|(frame_id, frame)| {
+                if now.duration_since(frame.first_seen) > ttl {
+                    Some(*frame_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for frame_id in expired {
+            if let Some(frame) = self.frames.remove(&frame_id) {
+                self.stats.frames_incomplete_expired += 1;
+                self.stats.packets_dropped_or_lost_estimate +=
+                    u64::from(frame.packet_count.saturating_sub(frame.received_count));
+                self.stats.last_frame_id = frame_id;
+            }
+        }
+    }
+}
+
+fn main() {
+    match parse_args(env::args().skip(1).collect()) {
+        Ok(Command::SelfTest) => {
+            if let Err(err) = run_self_test() {
+                eprintln!("self-test failed: {err}");
+                println!(
+                    r#"{{"type":"SELF_TEST","ok":false,"error":"{}"}}"#,
+                    json_escape(&err)
+                );
+                process::exit(1);
+            }
+            println!(r#"{{"type":"SELF_TEST","ok":true,"packet_format":"AGM1"}}"#);
+        }
+        Ok(Command::Sender {
+            host,
+            port,
+            fps,
+            bitrate_mbps,
+        }) => {
+            if let Err(err) = run_sender(&host, port, fps, bitrate_mbps) {
+                eprintln!("sender error: {err}");
+                process::exit(1);
+            }
+        }
+        Ok(Command::Receiver { bind, port }) => {
+            if let Err(err) = run_receiver(&bind, port) {
+                eprintln!("receiver error: {err}");
+                process::exit(1);
+            }
+        }
+        Ok(Command::Help) => {
+            print_help();
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            eprintln!();
+            print_help();
+            process::exit(2);
+        }
+    }
+}
+
+fn parse_args(args: Vec<String>) -> Result<Command, String> {
+    if args.is_empty() {
+        return Ok(Command::Help);
+    }
+
+    match args[0].as_str() {
+        "-h" | "--help" | "help" => Ok(Command::Help),
+        "self-test" => {
+            if args.len() == 1 {
+                Ok(Command::SelfTest)
+            } else {
+                Err("self-test does not accept extra arguments".to_string())
+            }
+        }
+        "sender" => parse_sender_args(&args[1..]),
+        "receiver" => parse_receiver_args(&args[1..]),
+        other => Err(format!("unknown command: {other}")),
+    }
+}
+
+fn parse_sender_args(args: &[String]) -> Result<Command, String> {
+    let mut host = "127.0.0.1".to_string();
+    let mut port: u16 = 50120;
+    let mut fps: u32 = 30;
+    let mut bitrate_mbps: f64 = 4.0;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" => {
+                i += 1;
+                host = required_value(args, i, "--host")?.to_string();
+            }
+            "--port" => {
+                i += 1;
+                port = parse_port(required_value(args, i, "--port")?)?;
+            }
+            "--fps" => {
+                i += 1;
+                fps = parse_fps(required_value(args, i, "--fps")?)?;
+            }
+            "--bitrate-mbps" => {
+                i += 1;
+                bitrate_mbps = parse_bitrate(required_value(args, i, "--bitrate-mbps")?)?;
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown sender argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::Sender {
+        host,
+        port,
+        fps,
+        bitrate_mbps,
+    })
+}
+
+fn parse_receiver_args(args: &[String]) -> Result<Command, String> {
+    let mut bind = "0.0.0.0".to_string();
+    let mut port: u16 = 50120;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bind" => {
+                i += 1;
+                bind = required_value(args, i, "--bind")?.to_string();
+            }
+            "--port" => {
+                i += 1;
+                port = parse_port(required_value(args, i, "--port")?)?;
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown receiver argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::Receiver { bind, port })
+}
+
+fn required_value<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a str, String> {
+    args.get(index)
+        .map(String::as_str)
+        .ok_or_else(|| format!("missing value for {name}"))
+}
+
+fn parse_port(text: &str) -> Result<u16, String> {
+    let port: u16 = text.parse().map_err(|_| format!("invalid port: {text}"))?;
+    if port == 0 {
+        Err("port must be greater than zero".to_string())
+    } else {
+        Ok(port)
+    }
+}
+
+fn parse_fps(text: &str) -> Result<u32, String> {
+    let fps: u32 = text.parse().map_err(|_| format!("invalid fps: {text}"))?;
+    if (1..=240).contains(&fps) {
+        Ok(fps)
+    } else {
+        Err("fps must be between 1 and 240".to_string())
+    }
+}
+
+fn parse_bitrate(text: &str) -> Result<f64, String> {
+    let bitrate: f64 = text
+        .parse()
+        .map_err(|_| format!("invalid bitrate-mbps: {text}"))?;
+    if bitrate.is_finite() && bitrate > 0.0 && bitrate <= 1000.0 {
+        Ok(bitrate)
+    } else {
+        Err("bitrate-mbps must be > 0 and <= 1000".to_string())
+    }
+}
+
+fn print_help() {
+    println!(
+        "AgoraLink Native Media prototype\n\n\
+Usage:\n\
+  agoralink_media self-test\n\
+  agoralink_media sender --host <ip> --port <port> --fps <fps> --bitrate-mbps <mbps>\n\
+  agoralink_media receiver --bind <ip> --port <port>\n\n\
+Defaults:\n\
+  sender: --host 127.0.0.1 --port 50120 --fps 30 --bitrate-mbps 4\n\
+  receiver: --bind 0.0.0.0 --port 50120"
+    );
+}
+
+fn run_sender(host: &str, port: u16, fps: u32, bitrate_mbps: f64) -> io::Result<()> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    let target = format!("{host}:{port}");
+    socket.connect(&target)?;
+
+    eprintln!(
+        "agoralink_media sender target={} fps={} bitrate_mbps={}",
+        target, fps, bitrate_mbps
+    );
+
+    let session_id = make_session_id();
+    let frame_interval = Duration::from_nanos(1_000_000_000u64 / u64::from(fps));
+    let bytes_per_frame = estimate_frame_payload_bytes(fps, bitrate_mbps);
+    let mut frame_id = 0u64;
+    let mut packets_sent = 0u64;
+    let mut frames_sent = 0u64;
+    let mut window_packets = 0u64;
+    let mut window_frames = 0u64;
+    let mut window_bytes = 0u64;
+    let mut next_frame_at = Instant::now();
+    let mut stats_at = Instant::now();
+
+    loop {
+        let now = Instant::now();
+        if now < next_frame_at {
+            thread::sleep(next_frame_at.duration_since(now));
+        }
+
+        let keyframe = frame_id % u64::from(fps) == 0;
+        let timestamp_ms = now_millis();
+        let packets = build_frame_packets(
+            session_id,
+            frame_id,
+            timestamp_ms,
+            bytes_per_frame,
+            keyframe,
+        )
+        .map_err(io::Error::other)?;
+
+        for packet in packets {
+            let sent = socket.send(&packet)?;
+            packets_sent += 1;
+            window_packets += 1;
+            window_bytes += sent as u64;
+        }
+
+        frames_sent += 1;
+        window_frames += 1;
+        frame_id += 1;
+
+        let elapsed = stats_at.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            let elapsed_sec = elapsed.as_secs_f64().max(0.001);
+            let mbps = (window_bytes as f64 * 8.0) / elapsed_sec / 1_000_000.0;
+            let measured_fps = window_frames as f64 / elapsed_sec;
+            println!(
+                r#"{{"type":"MEDIA_STATS","mode":"sender","packets_sent":{},"frames_sent":{},"mbps":{:.3},"fps":{:.2},"target_bitrate_mbps":{:.3}}}"#,
+                packets_sent, frames_sent, mbps, measured_fps, bitrate_mbps
+            );
+            io::stdout().flush().ok();
+            window_packets = 0;
+            window_frames = 0;
+            window_bytes = 0;
+            stats_at = Instant::now();
+        }
+
+        let after_send = Instant::now();
+        next_frame_at += frame_interval;
+        if next_frame_at < after_send {
+            next_frame_at = after_send + frame_interval;
+        }
+
+        let _ = window_packets;
+    }
+}
+
+fn run_receiver(bind: &str, port: u16) -> io::Result<()> {
+    let socket = UdpSocket::bind(format!("{bind}:{port}"))?;
+    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+    eprintln!("agoralink_media receiver bind={bind}:{port}");
+
+    let mut buf = [0u8; 2048];
+    let mut reassembler = Reassembler::new(FRAME_TTL);
+    let mut stats_at = Instant::now();
+    let mut window_bytes = 0u64;
+    let mut window_frames = 0u64;
+
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((len, _addr)) => match MediaPacket::decode(&buf[..len]) {
+                Ok(packet) => {
+                    let now = Instant::now();
+                    window_bytes += len as u64;
+                    if reassembler.accept(packet, now) {
+                        window_frames += 1;
+                    }
+                }
+                Err(_err) => {
+                    reassembler.stats.packets_dropped_or_lost_estimate += 1;
+                }
+            },
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::TimedOut => {}
+            Err(err) => return Err(err),
+        }
+
+        let now = Instant::now();
+        reassembler.expire(now);
+
+        let elapsed = stats_at.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            let elapsed_sec = elapsed.as_secs_f64().max(0.001);
+            let mbps = (window_bytes as f64 * 8.0) / elapsed_sec / 1_000_000.0;
+            let fps = window_frames as f64 / elapsed_sec;
+            let stats = &reassembler.stats;
+            println!(
+                r#"{{"type":"MEDIA_STATS","mode":"receiver","packets_received":{},"packets_dropped_or_lost_estimate":{},"frames_complete":{},"frames_incomplete_expired":{},"mbps":{:.3},"fps":{:.2},"last_frame_id":{},"inflight_frames":{}}}"#,
+                stats.packets_received,
+                stats.packets_dropped_or_lost_estimate,
+                stats.frames_complete,
+                stats.frames_incomplete_expired,
+                mbps,
+                fps,
+                stats.last_frame_id,
+                reassembler.frames.len()
+            );
+            io::stdout().flush().ok();
+            stats_at = Instant::now();
+            window_bytes = 0;
+            window_frames = 0;
+        }
+    }
+}
+
+fn build_frame_packets(
+    session_id: u64,
+    frame_id: u64,
+    timestamp_ms: u64,
+    payload_size: usize,
+    keyframe: bool,
+) -> Result<Vec<Vec<u8>>, String> {
+    let packet_count = payload_size.div_ceil(MAX_MEDIA_PAYLOAD).max(1);
+    if packet_count > u16::MAX as usize {
+        return Err(format!("frame too large: {} packets", packet_count));
+    }
+
+    let mut packets = Vec::with_capacity(packet_count);
+    let mut remaining = payload_size;
+    for packet_index in 0..packet_count {
+        let chunk_len = remaining.min(MAX_MEDIA_PAYLOAD);
+        remaining = remaining.saturating_sub(chunk_len);
+        let mut flags = 0u16;
+        if keyframe {
+            flags |= FLAG_KEYFRAME;
+        }
+        if packet_index + 1 == packet_count {
+            flags |= FLAG_END_OF_FRAME;
+        }
+        let fill = (frame_id as u8).wrapping_add(packet_index as u8);
+        let packet = MediaPacket {
+            stream_id: STREAM_VIDEO,
+            flags,
+            session_id,
+            frame_id,
+            packet_index: packet_index as u16,
+            packet_count: packet_count as u16,
+            timestamp_ms,
+            payload: vec![fill; chunk_len],
+        };
+        packets.push(packet.encode()?);
+    }
+
+    Ok(packets)
+}
+
+fn estimate_frame_payload_bytes(fps: u32, bitrate_mbps: f64) -> usize {
+    let bytes_per_second = bitrate_mbps * 1_000_000.0 / 8.0;
+    (bytes_per_second / fps as f64).round().max(1.0) as usize
+}
+
+fn make_session_id() -> u64 {
+    now_millis() ^ ((process::id() as u64) << 32)
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn run_self_test() -> Result<(), String> {
+    let packet = MediaPacket {
+        stream_id: STREAM_VIDEO,
+        flags: FLAG_KEYFRAME | FLAG_END_OF_FRAME,
+        session_id: 123,
+        frame_id: 456,
+        packet_index: 0,
+        packet_count: 1,
+        timestamp_ms: 789,
+        payload: vec![7; 32],
+    };
+    let encoded = packet.encode()?;
+    if encoded.len() != HEADER_LEN + 32 {
+        return Err("encoded length mismatch".to_string());
+    }
+    let decoded = MediaPacket::decode(&encoded)?;
+    if decoded.session_id != packet.session_id
+        || decoded.frame_id != packet.frame_id
+        || decoded.flags != packet.flags
+        || decoded.payload != packet.payload
+    {
+        return Err("packet roundtrip mismatch".to_string());
+    }
+
+    let frame_packets = build_frame_packets(1, 9, 1000, 5000, true)?;
+    if frame_packets.len() != 5 {
+        return Err(format!("expected 5 packets, got {}", frame_packets.len()));
+    }
+    if frame_packets
+        .iter()
+        .any(|item| item.len() > MAX_UDP_PAYLOAD)
+    {
+        return Err("packet exceeded UDP payload limit".to_string());
+    }
+
+    let mut reassembler = Reassembler::new(FRAME_TTL);
+    let now = Instant::now();
+    for raw in frame_packets.iter().rev() {
+        let packet = MediaPacket::decode(raw)?;
+        reassembler.accept(packet, now);
+    }
+    if reassembler.stats.frames_complete != 1 {
+        return Err("reassembler did not complete frame".to_string());
+    }
+
+    let mut expiring = Reassembler::new(Duration::from_millis(1));
+    let incomplete = build_frame_packets(2, 10, 2000, 3000, false)?;
+    let first = MediaPacket::decode(&incomplete[0])?;
+    expiring.accept(first, Instant::now() - Duration::from_millis(10));
+    expiring.expire(Instant::now());
+    if expiring.stats.frames_incomplete_expired != 1 {
+        return Err("expired incomplete frame was not counted".to_string());
+    }
+    if expiring.stats.packets_dropped_or_lost_estimate == 0 {
+        return Err("lost packet estimate was not updated".to_string());
+    }
+
+    Ok(())
+}
+
+fn json_escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}

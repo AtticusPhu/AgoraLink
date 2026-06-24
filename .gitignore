@@ -27,6 +27,7 @@ __pycache__/
 *.pyo
 *.zip
 *.exe
+rust-native/**/target/
 
 # Bundled local FFmpeg binaries for packaging only
 tools/ffmpeg/bin/*.exe
