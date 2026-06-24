@@ -7,6 +7,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod capture_probe;
+mod encode_probe;
+mod nv12_synthetic;
+mod wmf_probe;
 
 const MAGIC: &[u8; 4] = b"AGM1";
 const VERSION: u8 = 1;
@@ -121,7 +124,10 @@ enum Command {
     },
     CaptureProbe {
         duration_sec: u64,
+        target_fps: u32,
     },
+    WmfProbe,
+    EncodeProbe(encode_probe::EncodeProbeConfig),
     Help,
 }
 
@@ -258,9 +264,24 @@ fn main() {
                 process::exit(1);
             }
         }
-        Ok(Command::CaptureProbe { duration_sec }) => {
-            if let Err(err) = capture_probe::run(duration_sec) {
+        Ok(Command::CaptureProbe {
+            duration_sec,
+            target_fps,
+        }) => {
+            if let Err(err) = capture_probe::run(duration_sec, target_fps) {
                 eprintln!("capture-probe error: {err}");
+                process::exit(1);
+            }
+        }
+        Ok(Command::WmfProbe) => {
+            if let Err(err) = wmf_probe::run() {
+                eprintln!("wmf-probe error: {err}");
+                process::exit(1);
+            }
+        }
+        Ok(Command::EncodeProbe(config)) => {
+            if let Err(err) = encode_probe::run(config) {
+                eprintln!("encode-probe error: {err}");
                 process::exit(1);
             }
         }
@@ -293,6 +314,14 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         "sender" => parse_sender_args(&args[1..]),
         "receiver" => parse_receiver_args(&args[1..]),
         "capture-probe" => parse_capture_probe_args(&args[1..]),
+        "wmf-probe" => {
+            if args.len() == 1 {
+                Ok(Command::WmfProbe)
+            } else {
+                Err("wmf-probe does not accept extra arguments".to_string())
+            }
+        }
+        "encode-probe" => parse_encode_probe_args(&args[1..]),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -362,6 +391,7 @@ fn parse_receiver_args(args: &[String]) -> Result<Command, String> {
 
 fn parse_capture_probe_args(args: &[String]) -> Result<Command, String> {
     let mut duration_sec = 10u64;
+    let mut target_fps = 30u32;
     let mut i = 0;
 
     while i < args.len() {
@@ -370,13 +400,80 @@ fn parse_capture_probe_args(args: &[String]) -> Result<Command, String> {
                 i += 1;
                 duration_sec = parse_duration_sec(required_value(args, i, "--duration-sec")?)?;
             }
+            "--target-fps" => {
+                i += 1;
+                target_fps = parse_fps(required_value(args, i, "--target-fps")?)?;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unknown capture-probe argument: {other}")),
         }
         i += 1;
     }
 
-    Ok(Command::CaptureProbe { duration_sec })
+    Ok(Command::CaptureProbe {
+        duration_sec,
+        target_fps,
+    })
+}
+
+fn parse_encode_probe_args(args: &[String]) -> Result<Command, String> {
+    let mut width = 1280u32;
+    let mut height = 720u32;
+    let mut fps = 30u32;
+    let mut duration_sec = 5u64;
+    let mut bitrate_mbps = 4.0f64;
+    let mut output = "synthetic_720p30.h264".to_string();
+    let mut encoder = encode_probe::EncoderChoice::Auto;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--width" => {
+                i += 1;
+                width = parse_dimension(required_value(args, i, "--width")?, "width")?;
+            }
+            "--height" => {
+                i += 1;
+                height = parse_dimension(required_value(args, i, "--height")?, "height")?;
+            }
+            "--fps" => {
+                i += 1;
+                fps = parse_fps(required_value(args, i, "--fps")?)?;
+            }
+            "--duration-sec" => {
+                i += 1;
+                duration_sec = parse_duration_sec(required_value(args, i, "--duration-sec")?)?;
+            }
+            "--bitrate-mbps" => {
+                i += 1;
+                bitrate_mbps = parse_bitrate(required_value(args, i, "--bitrate-mbps")?)?;
+            }
+            "--output" => {
+                i += 1;
+                output = required_value(args, i, "--output")?.to_string();
+                if output.trim().is_empty() {
+                    return Err("output path must not be empty".to_string());
+                }
+            }
+            "--encoder" => {
+                i += 1;
+                encoder = parse_encoder_choice(required_value(args, i, "--encoder")?)?;
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown encode-probe argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::EncodeProbe(encode_probe::EncodeProbeConfig {
+        width,
+        height,
+        fps,
+        duration_sec,
+        bitrate_mbps,
+        output,
+        encoder,
+    }))
 }
 
 fn required_value<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a str, String> {
@@ -425,6 +522,28 @@ fn parse_duration_sec(text: &str) -> Result<u64, String> {
     }
 }
 
+fn parse_dimension(text: &str, name: &str) -> Result<u32, String> {
+    let value: u32 = text
+        .parse()
+        .map_err(|_| format!("invalid {name}: {text}"))?;
+    if value < 16 || value > 8192 {
+        return Err(format!("{name} must be between 16 and 8192"));
+    }
+    if value % 2 != 0 {
+        return Err(format!("{name} must be even for NV12"));
+    }
+    Ok(value)
+}
+
+fn parse_encoder_choice(text: &str) -> Result<encode_probe::EncoderChoice, String> {
+    match text {
+        "auto" => Ok(encode_probe::EncoderChoice::Auto),
+        "software" => Ok(encode_probe::EncoderChoice::Software),
+        "hardware" => Ok(encode_probe::EncoderChoice::Hardware),
+        _ => Err("encoder must be auto, software, or hardware".to_string()),
+    }
+}
+
 fn print_help() {
     println!(
         "AgoraLink Native Media prototype\n\n\
@@ -432,11 +551,14 @@ Usage:\n\
   agoralink_media self-test\n\
   agoralink_media sender --host <ip> --port <port> --fps <fps> --bitrate-mbps <mbps>\n\
   agoralink_media receiver --bind <ip> --port <port>\n\
-  agoralink_media capture-probe --duration-sec <seconds>\n\n\
+  agoralink_media capture-probe --duration-sec <seconds> --target-fps <fps>\n\
+  agoralink_media wmf-probe\n\
+  agoralink_media encode-probe --width <pixels> --height <pixels> --fps <fps> --duration-sec <seconds> --bitrate-mbps <mbps> --output <path> [--encoder auto|software|hardware]\n\n\
 Defaults:\n\
   sender: --host 127.0.0.1 --port 50120 --fps 30 --bitrate-mbps 4\n\
   receiver: --bind 0.0.0.0 --port 50120\n\
-  capture-probe: --duration-sec 10"
+  capture-probe: --duration-sec 10 --target-fps 30\n\
+  encode-probe: --width 1280 --height 720 --fps 30 --duration-sec 5 --bitrate-mbps 4 --output synthetic_720p30.h264 --encoder auto"
     );
 }
 
@@ -633,6 +755,18 @@ fn now_millis() -> u64 {
 }
 
 fn run_self_test() -> Result<(), String> {
+    let nv12_size = nv12_synthetic::buffer_size(16, 16)?;
+    if nv12_size != 16 * 16 * 3 / 2 {
+        return Err("NV12 buffer size mismatch".to_string());
+    }
+    let mut first_nv12 = vec![0u8; nv12_size];
+    let mut second_nv12 = vec![0u8; nv12_size];
+    nv12_synthetic::fill_frame(&mut first_nv12, 16, 16, 0)?;
+    nv12_synthetic::fill_frame(&mut second_nv12, 16, 16, 1)?;
+    if first_nv12 == second_nv12 {
+        return Err("synthetic NV12 frames did not change over time".to_string());
+    }
+
     let packet = MediaPacket {
         stream_id: STREAM_VIDEO,
         flags: FLAG_KEYFRAME | FLAG_END_OF_FRAME,
