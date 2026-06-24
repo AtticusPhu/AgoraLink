@@ -6,6 +6,8 @@ use std::process;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod capture_probe;
+
 const MAGIC: &[u8; 4] = b"AGM1";
 const VERSION: u8 = 1;
 const STREAM_VIDEO: u8 = 1;
@@ -116,6 +118,9 @@ enum Command {
     Receiver {
         bind: String,
         port: u16,
+    },
+    CaptureProbe {
+        duration_sec: u64,
     },
     Help,
 }
@@ -253,6 +258,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        Ok(Command::CaptureProbe { duration_sec }) => {
+            if let Err(err) = capture_probe::run(duration_sec) {
+                eprintln!("capture-probe error: {err}");
+                process::exit(1);
+            }
+        }
         Ok(Command::Help) => {
             print_help();
         }
@@ -281,6 +292,7 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         }
         "sender" => parse_sender_args(&args[1..]),
         "receiver" => parse_receiver_args(&args[1..]),
+        "capture-probe" => parse_capture_probe_args(&args[1..]),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -348,6 +360,25 @@ fn parse_receiver_args(args: &[String]) -> Result<Command, String> {
     Ok(Command::Receiver { bind, port })
 }
 
+fn parse_capture_probe_args(args: &[String]) -> Result<Command, String> {
+    let mut duration_sec = 10u64;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--duration-sec" => {
+                i += 1;
+                duration_sec = parse_duration_sec(required_value(args, i, "--duration-sec")?)?;
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown capture-probe argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::CaptureProbe { duration_sec })
+}
+
 fn required_value<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a str, String> {
     args.get(index)
         .map(String::as_str)
@@ -383,16 +414,29 @@ fn parse_bitrate(text: &str) -> Result<f64, String> {
     }
 }
 
+fn parse_duration_sec(text: &str) -> Result<u64, String> {
+    let duration: u64 = text
+        .parse()
+        .map_err(|_| format!("invalid duration-sec: {text}"))?;
+    if (1..=3600).contains(&duration) {
+        Ok(duration)
+    } else {
+        Err("duration-sec must be between 1 and 3600".to_string())
+    }
+}
+
 fn print_help() {
     println!(
         "AgoraLink Native Media prototype\n\n\
 Usage:\n\
   agoralink_media self-test\n\
   agoralink_media sender --host <ip> --port <port> --fps <fps> --bitrate-mbps <mbps>\n\
-  agoralink_media receiver --bind <ip> --port <port>\n\n\
+  agoralink_media receiver --bind <ip> --port <port>\n\
+  agoralink_media capture-probe --duration-sec <seconds>\n\n\
 Defaults:\n\
   sender: --host 127.0.0.1 --port 50120 --fps 30 --bitrate-mbps 4\n\
-  receiver: --bind 0.0.0.0 --port 50120"
+  receiver: --bind 0.0.0.0 --port 50120\n\
+  capture-probe: --duration-sec 10"
     );
 }
 
