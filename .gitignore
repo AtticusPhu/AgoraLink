@@ -41,3 +41,5 @@ stereo_mix_level.txt
 stereo_mix_test.wav
 
 rust-native/agoralink_media/*.h264
+
+rust-native/agoralink_media/*.h264
