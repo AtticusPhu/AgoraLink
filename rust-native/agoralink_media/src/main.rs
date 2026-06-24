@@ -10,9 +10,14 @@ mod bgra_to_nv12;
 mod capture_encode_probe;
 mod capture_probe;
 mod encode_probe;
+mod h264_annex_b;
+mod h264_file_viewer;
 mod h264_recv_dump;
 mod h264_send_probe;
 mod nv12_synthetic;
+mod nv12_to_bgra;
+mod win32_gdi_viewer;
+mod wmf_h264_decoder;
 mod wmf_h264_encoder;
 mod wmf_probe;
 
@@ -138,6 +143,7 @@ enum Command {
     CaptureEncodeProbe(capture_encode_probe::CaptureEncodeConfig),
     H264SendProbe(h264_send_probe::H264SendConfig),
     H264RecvDump(h264_recv_dump::H264RecvConfig),
+    H264FileViewer(h264_file_viewer::H264FileViewerConfig),
     Help,
 }
 
@@ -313,6 +319,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        Ok(Command::H264FileViewer(config)) => {
+            if let Err(err) = h264_file_viewer::run(config) {
+                eprintln!("h264-file-viewer error: {err}");
+                process::exit(1);
+            }
+        }
         Ok(Command::Help) => {
             print_help();
         }
@@ -353,6 +365,7 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         "capture-encode-probe" => parse_capture_encode_probe_args(&args[1..]),
         "h264-send-probe" => parse_h264_send_probe_args(&args[1..]),
         "h264-recv-dump" => parse_h264_recv_dump_args(&args[1..]),
+        "h264-file-viewer" => parse_h264_file_viewer_args(&args[1..]),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -639,6 +652,29 @@ fn parse_h264_recv_dump_args(args: &[String]) -> Result<Command, String> {
     }))
 }
 
+fn parse_h264_file_viewer_args(args: &[String]) -> Result<Command, String> {
+    let mut input = String::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--input" => {
+                i += 1;
+                input = required_value(args, i, "--input")?.to_string();
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown h264-file-viewer argument: {other}")),
+        }
+        i += 1;
+    }
+    if input.trim().is_empty() {
+        return Err("h264-file-viewer requires --input <path>".to_string());
+    }
+    Ok(Command::H264FileViewer(
+        h264_file_viewer::H264FileViewerConfig { input },
+    ))
+}
+
 fn required_value<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a str, String> {
     args.get(index)
         .map(String::as_str)
@@ -731,6 +767,7 @@ Usage:\n\
   agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --output <path>\n\
   agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps>\n\
   agoralink_media h264-recv-dump --bind <ip> --port <port> --output <path> [--idle-timeout-sec <seconds>]\n\n\
+  agoralink_media h264-file-viewer --input <path>\n\n\
 Defaults:\n\
   sender: --host 127.0.0.1 --port 50120 --fps 30 --bitrate-mbps 4\n\
   receiver: --bind 0.0.0.0 --port 50120\n\
@@ -738,7 +775,8 @@ Defaults:\n\
   encode-probe: --width 1280 --height 720 --fps 30 --duration-sec 5 --bitrate-mbps 4 --output synthetic_720p30.h264 --encoder auto\n\
   capture-encode-probe: --duration-sec 5 --target-fps 30 --bitrate-mbps 8 --output capture_1080p30.h264\n\
   h264-send-probe: --host 127.0.0.1 --port 50130 --duration-sec 10 --target-fps 30 --bitrate-mbps 8\n\
-  h264-recv-dump: --bind 0.0.0.0 --port 50130 --output received_capture.h264 --idle-timeout-sec 3"
+  h264-recv-dump: --bind 0.0.0.0 --port 50130 --output received_capture.h264 --idle-timeout-sec 3\n\
+  h264-file-viewer: --input received_capture_lan.h264"
     );
 }
 
@@ -973,7 +1011,9 @@ pub(crate) fn now_millis() -> u64 {
 
 fn run_self_test() -> Result<(), String> {
     bgra_to_nv12::run_self_test()?;
+    h264_annex_b::run_self_test()?;
     h264_recv_dump::run_self_test()?;
+    nv12_to_bgra::run_self_test()?;
     let nv12_size = nv12_synthetic::buffer_size(16, 16)?;
     if nv12_size != 16 * 16 * 3 / 2 {
         return Err("NV12 buffer size mismatch".to_string());
