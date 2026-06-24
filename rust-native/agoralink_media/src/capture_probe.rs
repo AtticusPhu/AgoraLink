@@ -35,10 +35,19 @@ mod platform {
 
     #[derive(Clone, Copy, Debug, Default)]
     struct CaptureCounters {
-        frames: u64,
+        raw_frames: u64,
+        accepted_frames: u64,
+        skipped_frames: u64,
         dropped: u64,
         width: i32,
         height: i32,
+    }
+
+    #[derive(Debug)]
+    struct CaptureState {
+        counters: CaptureCounters,
+        pacing_started_at: Instant,
+        target_fps: u32,
     }
 
     struct WinRtGuard;
@@ -86,9 +95,12 @@ mod platform {
         }
     }
 
-    pub fn run(duration_sec: u64) -> Result<(), String> {
+    pub fn run(duration_sec: u64, target_fps: u32) -> Result<(), String> {
         if duration_sec == 0 {
             return Err("duration-sec must be greater than zero".to_string());
+        }
+        if target_fps == 0 {
+            return Err("target-fps must be greater than zero".to_string());
         }
 
         let _winrt = WinRtGuard::initialize()?;
@@ -119,8 +131,8 @@ mod platform {
         }
 
         eprintln!(
-            "capture-probe target=primary-monitor size={}x{} format={} d3d_driver={}",
-            initial_size.Width, initial_size.Height, PIXEL_FORMAT_NAME, driver_name
+            "capture-probe target=primary-monitor size={}x{} format={} d3d_driver={} target_fps={}",
+            initial_size.Width, initial_size.Height, PIXEL_FORMAT_NAME, driver_name, target_fps
         );
 
         let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
@@ -131,10 +143,14 @@ mod platform {
         )
         .map_err(|err| format!("CreateFreeThreaded frame pool failed: {err}"))?;
 
-        let counters = Arc::new(Mutex::new(CaptureCounters {
-            width: initial_size.Width,
-            height: initial_size.Height,
-            ..CaptureCounters::default()
+        let counters = Arc::new(Mutex::new(CaptureState {
+            counters: CaptureCounters {
+                width: initial_size.Width,
+                height: initial_size.Height,
+                ..CaptureCounters::default()
+            },
+            pacing_started_at: Instant::now(),
+            target_fps,
         }));
         let callback_counters = Arc::clone(&counters);
         let frame_handler: TypedEventHandler<Direct3D11CaptureFramePool, IInspectable> =
@@ -156,9 +172,19 @@ mod platform {
                             match frame_result {
                                 Ok(size) => {
                                     if let Ok(mut state) = callback_counters.lock() {
-                                        state.frames += 1;
-                                        state.width = size.Width;
-                                        state.height = size.Height;
+                                        state.counters.raw_frames += 1;
+                                        state.counters.width = size.Width;
+                                        state.counters.height = size.Height;
+
+                                        let elapsed =
+                                            state.pacing_started_at.elapsed().as_secs_f64();
+                                        let accepted_budget =
+                                            (elapsed * f64::from(state.target_fps)).floor() as u64;
+                                        if state.counters.accepted_frames < accepted_budget {
+                                            state.counters.accepted_frames += 1;
+                                        } else {
+                                            state.counters.skipped_frames += 1;
+                                        }
                                     }
                                 }
                                 Err(_) => increment_dropped(&callback_counters),
@@ -183,7 +209,8 @@ mod platform {
 
         let started_at = Instant::now();
         let mut report_at = started_at;
-        let mut previous_frames = 0u64;
+        let mut previous_raw_frames = 0u64;
+        let mut previous_accepted_frames = 0u64;
         let mut previous_report_at = started_at;
 
         while started_at.elapsed() < Duration::from_secs(duration_sec)
@@ -197,9 +224,16 @@ mod platform {
                     .duration_since(previous_report_at)
                     .as_secs_f64()
                     .max(0.001);
-                let fps = snapshot.frames.saturating_sub(previous_frames) as f64 / elapsed;
-                print_stats(snapshot, fps);
-                previous_frames = snapshot.frames;
+                let raw_fps =
+                    snapshot.raw_frames.saturating_sub(previous_raw_frames) as f64 / elapsed;
+                let accepted_fps = snapshot
+                    .accepted_frames
+                    .saturating_sub(previous_accepted_frames)
+                    as f64
+                    / elapsed;
+                print_stats(snapshot, raw_fps, accepted_fps, target_fps);
+                previous_raw_frames = snapshot.raw_frames;
+                previous_accepted_frames = snapshot.accepted_frames;
                 previous_report_at = now;
                 report_at = now;
             }
@@ -209,9 +243,13 @@ mod platform {
         let final_elapsed = stopped_at.duration_since(previous_report_at).as_secs_f64();
         if final_elapsed >= 0.1 {
             let snapshot = capture_snapshot(&counters);
-            let fps =
-                snapshot.frames.saturating_sub(previous_frames) as f64 / final_elapsed.max(0.001);
-            print_stats(snapshot, fps);
+            let raw_fps = snapshot.raw_frames.saturating_sub(previous_raw_frames) as f64
+                / final_elapsed.max(0.001);
+            let accepted_fps = snapshot
+                .accepted_frames
+                .saturating_sub(previous_accepted_frames) as f64
+                / final_elapsed.max(0.001);
+            print_stats(snapshot, raw_fps, accepted_fps, target_fps);
         }
 
         let _ = frame_pool.RemoveFrameArrived(frame_token);
@@ -292,21 +330,28 @@ mod platform {
             .map_err(|err| format!("CreateForMonitor failed: {err}"))
     }
 
-    fn increment_dropped(counters: &Arc<Mutex<CaptureCounters>>) {
+    fn increment_dropped(counters: &Arc<Mutex<CaptureState>>) {
         if let Ok(mut state) = counters.lock() {
-            state.dropped += 1;
+            state.counters.dropped += 1;
         }
     }
 
-    fn capture_snapshot(counters: &Arc<Mutex<CaptureCounters>>) -> CaptureCounters {
-        counters.lock().map(|state| *state).unwrap_or_default()
+    fn capture_snapshot(counters: &Arc<Mutex<CaptureState>>) -> CaptureCounters {
+        counters
+            .lock()
+            .map(|state| state.counters)
+            .unwrap_or_default()
     }
 
-    fn print_stats(snapshot: CaptureCounters, fps: f64) {
+    fn print_stats(snapshot: CaptureCounters, raw_fps: f64, accepted_fps: f64, target_fps: u32) {
         println!(
-            r#"{{"type":"CAPTURE_STATS","mode":"capture_probe","frames":{},"fps":{:.2},"width":{},"height":{},"format":"{}","dropped":{}}}"#,
-            snapshot.frames,
-            fps,
+            r#"{{"type":"CAPTURE_STATS","mode":"capture_probe","raw_frames":{},"accepted_frames":{},"skipped_frames":{},"raw_fps":{:.2},"accepted_fps":{:.2},"target_fps":{},"width":{},"height":{},"format":"{}","dropped":{}}}"#,
+            snapshot.raw_frames,
+            snapshot.accepted_frames,
+            snapshot.skipped_frames,
+            raw_fps,
+            accepted_fps,
+            target_fps,
             snapshot.width,
             snapshot.height,
             PIXEL_FORMAT_NAME,
@@ -320,6 +365,6 @@ mod platform {
 pub use platform::run;
 
 #[cfg(not(windows))]
-pub fn run(_duration_sec: u64) -> Result<(), String> {
+pub fn run(_duration_sec: u64, _target_fps: u32) -> Result<(), String> {
     Err("capture-probe is only supported on Windows".to_string())
 }
