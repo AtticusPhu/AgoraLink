@@ -5,6 +5,7 @@ pub struct H264RecvViewConfig {
     pub frame_timeout_ms: u64,
     pub max_inflight_frames: usize,
     pub max_decode_queue: usize,
+    pub strict_decode_order: bool,
     pub json_interval_ms: u64,
     pub title: String,
 }
@@ -72,14 +73,83 @@ mod platform {
         }
     }
 
+    enum DecodeQueueItem {
+        Reset,
+        Frame(EncodedFrame),
+    }
+
+    #[derive(Default)]
+    struct DecodeQueue {
+        items: VecDeque<DecodeQueueItem>,
+        waiting_for_keyframe: bool,
+        frames_predecode_dropped: u64,
+        frames_waiting_keyframe_dropped: u64,
+        keyframe_recovery_count: u64,
+        decode_queue_peak: usize,
+        last_keyframe_id: Option<u64>,
+    }
+
+    impl DecodeQueue {
+        fn frame_len(&self) -> usize {
+            self.items
+                .iter()
+                .filter(|item| matches!(item, DecodeQueueItem::Frame(_)))
+                .count()
+        }
+
+        fn begin_keyframe_recovery(&mut self) {
+            let dropped = self.frame_len() as u64;
+            self.frames_predecode_dropped += dropped;
+            self.items.clear();
+            self.items.push_back(DecodeQueueItem::Reset);
+            self.waiting_for_keyframe = true;
+            self.keyframe_recovery_count += 1;
+        }
+
+        fn enqueue_frame(&mut self, frame: EncodedFrame, max_decode_queue: usize) {
+            if self.waiting_for_keyframe {
+                if !frame.is_keyframe() {
+                    self.frames_predecode_dropped += 1;
+                    self.frames_waiting_keyframe_dropped += 1;
+                    return;
+                }
+                self.last_keyframe_id = Some(frame.frame_id);
+                self.waiting_for_keyframe = false;
+                self.items.push_back(DecodeQueueItem::Frame(frame));
+                self.decode_queue_peak = self.decode_queue_peak.max(self.frame_len());
+                return;
+            }
+
+            if self.frame_len() >= max_decode_queue {
+                self.begin_keyframe_recovery();
+                if !frame.is_keyframe() {
+                    self.frames_predecode_dropped += 1;
+                    self.frames_waiting_keyframe_dropped += 1;
+                    return;
+                }
+            }
+            if frame.is_keyframe() {
+                self.last_keyframe_id = Some(frame.frame_id);
+                self.waiting_for_keyframe = false;
+            }
+            self.items.push_back(DecodeQueueItem::Frame(frame));
+            self.decode_queue_peak = self.decode_queue_peak.max(self.frame_len());
+        }
+    }
+
     #[derive(Clone, Copy, Default)]
     struct NetworkSnapshot {
         reassembly: ReassemblyStats,
         session_id: Option<u64>,
         inflight_frames: usize,
         completed_waiting: usize,
-        frames_queue_dropped: u64,
-        discontinuity_epoch: u64,
+        decode_queue: usize,
+        decode_queue_peak: usize,
+        frames_predecode_dropped: u64,
+        frames_waiting_keyframe_dropped: u64,
+        keyframe_recovery_count: u64,
+        last_keyframe_id: Option<u64>,
+        waiting_keyframe: bool,
     }
 
     #[derive(Default)]
@@ -93,11 +163,20 @@ mod platform {
         frames_decoded: u64,
         frames_rendered: u64,
         frames_render_skipped: u64,
+        frames_decoded_not_rendered: u64,
+        frames_predecode_dropped: u64,
         frames_waiting_keyframe_dropped: u64,
+        keyframe_recovery_count: u64,
         decoder_errors: u64,
         decoder_resets: u64,
+        render_queue_peak: usize,
         decode_ms_total: f64,
         render_ms_total: f64,
+    }
+
+    struct PendingRender {
+        frame_id: u64,
+        nv12: Vec<u8>,
     }
 
     struct DecodeState {
@@ -105,6 +184,8 @@ mod platform {
         dimensions: Option<VideoDimensions>,
         waiting_for_keyframe: bool,
         input_index: u64,
+        last_keyframe_id: Option<u64>,
+        pending_render: Option<PendingRender>,
         bgra: Vec<u8>,
     }
 
@@ -115,16 +196,25 @@ mod platform {
                 dimensions: None,
                 waiting_for_keyframe: true,
                 input_index: 0,
+                last_keyframe_id: None,
+                pending_render: None,
                 bgra: Vec::new(),
             }
         }
 
-        fn mark_discontinuity(&mut self, stats: &mut ViewerStats) {
+        fn mark_discontinuity(&mut self, stats: &mut ViewerStats, count_recovery: bool) {
             if self.decoder.take().is_some() {
                 stats.decoder_resets += 1;
             }
+            if count_recovery {
+                stats.keyframe_recovery_count += 1;
+            }
             self.waiting_for_keyframe = true;
             self.input_index = 0;
+            if self.pending_render.take().is_some() {
+                stats.frames_decoded_not_rendered += 1;
+                stats.frames_render_skipped += 1;
+            }
         }
     }
 
@@ -138,7 +228,10 @@ mod platform {
             .set_nonblocking(true)
             .map_err(|err| format!("set UDP nonblocking failed: {err}"))?;
         let mut window = GdiViewerWindow::create(&config.title)?;
-        let queue = Arc::new(Mutex::new(VecDeque::with_capacity(config.max_decode_queue)));
+        let queue = Arc::new(Mutex::new(DecodeQueue {
+            items: VecDeque::with_capacity(config.max_decode_queue + 1),
+            ..DecodeQueue::default()
+        }));
         let network_state = Arc::new(Mutex::new(SharedNetworkState::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let network_thread = spawn_network_thread(
@@ -152,12 +245,13 @@ mod platform {
         )?;
 
         eprintln!(
-            "h264-recv-view bind={}:{} frame_timeout_ms={} max_inflight_frames={} max_decode_queue={} udp_receive_buffer={} decoder=\"{}\" output=NV12 render=GDI title=\"{}\"",
+            "h264-recv-view bind={}:{} frame_timeout_ms={} max_inflight_frames={} max_decode_queue={} strict_decode_order={} udp_receive_buffer={} decoder=\"{}\" output=NV12 render=GDI title=\"{}\"",
             config.bind,
             config.port,
             config.frame_timeout_ms,
             config.max_inflight_frames,
             config.max_decode_queue,
+            config.strict_decode_order,
             UDP_RECEIVE_BUFFER_BYTES,
             DECODER_NAME,
             config.title
@@ -168,7 +262,6 @@ mod platform {
         let mut previous_network = ReassemblyStats::default();
         let mut previous_decoded = 0u64;
         let mut previous_rendered = 0u64;
-        let mut observed_discontinuity_epoch = 0u64;
         let mut decode_state = DecodeState::new();
         let mut stats = ViewerStats::default();
         let mut closed_by_user = false;
@@ -182,37 +275,48 @@ mod platform {
                 break;
             }
 
-            let snapshot = network_snapshot(&network_state);
-            if snapshot.discontinuity_epoch != observed_discontinuity_epoch {
-                observed_discontinuity_epoch = snapshot.discontinuity_epoch;
-                decode_state.mark_discontinuity(&mut stats);
-            }
-
-            let frame = queue.lock().ok().and_then(|mut queue| {
-                let frame = queue.pop_front()?;
-                Some((frame, queue.is_empty()))
-            });
-            if let Some((frame, render_latest)) = frame {
-                process_encoded_frame(
-                    frame,
-                    render_latest,
-                    &mut decode_state,
-                    &mut window,
-                    &mut stats,
-                );
-            } else {
+            let items = queue.lock().map_or_else(
+                |_| Vec::new(),
+                |mut queue| queue.items.drain(..).collect::<Vec<_>>(),
+            );
+            if items.is_empty() {
+                render_latest_decoded(&mut decode_state, &mut window, &mut stats);
                 thread::sleep(Duration::from_millis(1));
+            } else {
+                let mut remaining_frames = items
+                    .iter()
+                    .filter(|item| matches!(item, DecodeQueueItem::Frame(_)))
+                    .count();
+                let skip_stale_renders = remaining_frames > (config.max_decode_queue / 2).max(2);
+                for item in items {
+                    match item {
+                        DecodeQueueItem::Reset => {
+                            decode_state.mark_discontinuity(&mut stats, false);
+                        }
+                        DecodeQueueItem::Frame(frame) => {
+                            remaining_frames = remaining_frames.saturating_sub(1);
+                            process_encoded_frame(
+                                frame,
+                                !skip_stale_renders || remaining_frames == 0,
+                                &mut decode_state,
+                                &mut window,
+                                &mut stats,
+                            );
+                        }
+                    }
+                }
             }
 
             let now = Instant::now();
             if now.duration_since(report_at) >= Duration::from_millis(config.json_interval_ms) {
                 let snapshot = network_snapshot(&network_state);
-                let queue_len = queue.lock().map_or(0, |queue| queue.len());
                 print_stats(
                     snapshot,
                     &stats,
-                    queue_len,
                     decode_state.dimensions,
+                    decode_state.waiting_for_keyframe,
+                    decode_state.last_keyframe_id,
+                    config.strict_decode_order,
                     previous_network,
                     previous_decoded,
                     previous_rendered,
@@ -240,7 +344,8 @@ mod platform {
             height: 0,
         });
         println!(
-            r#"{{"type":"H264_RECV_VIEW_DONE","mode":"h264_recv_view","session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_decoded":{},"frames_rendered":{},"frames_render_skipped":{},"frames_incomplete_expired":{},"frames_queue_dropped":{},"frames_waiting_keyframe_dropped":{},"decoder_errors":{},"decoder_resets":{},"decode_ms_avg":{:.3},"render_ms_avg":{:.3},"width":{},"height":{},"last_frame_id":{},"closed_by_user":{},"stopped_by_console":{},"duration_sec":{:.3}}}"#,
+            r#"{{"type":"H264_RECV_VIEW_DONE","mode":"h264_recv_view","strict_decode_order":{},"session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_decoded":{},"frames_rendered":{},"frames_render_skipped":{},"frames_decoded_not_rendered":{},"frames_incomplete_expired":{},"frames_predecode_dropped":{},"frames_queue_dropped":{},"frames_waiting_keyframe_dropped":{},"keyframe_recovery_count":{},"decoder_errors":{},"decoder_resets":{},"decode_queue_peak":{},"render_queue_peak":{},"last_keyframe_id":{},"waiting_keyframe":{},"decode_ms_avg":{:.3},"render_ms_avg":{:.3},"width":{},"height":{},"last_frame_id":{},"closed_by_user":{},"stopped_by_console":{},"duration_sec":{:.3}}}"#,
+            config.strict_decode_order,
             optional_u64_json(snapshot.session_id),
             snapshot.reassembly.packets_received,
             snapshot.reassembly.packets_invalid,
@@ -249,11 +354,18 @@ mod platform {
             stats.frames_decoded,
             stats.frames_rendered,
             stats.frames_render_skipped,
+            stats.frames_decoded_not_rendered,
             snapshot.reassembly.frames_incomplete_expired,
-            snapshot.frames_queue_dropped,
-            stats.frames_waiting_keyframe_dropped,
+            snapshot.frames_predecode_dropped + stats.frames_predecode_dropped,
+            snapshot.frames_predecode_dropped + stats.frames_predecode_dropped,
+            snapshot.frames_waiting_keyframe_dropped + stats.frames_waiting_keyframe_dropped,
+            snapshot.keyframe_recovery_count + stats.keyframe_recovery_count,
             stats.decoder_errors,
             stats.decoder_resets,
+            snapshot.decode_queue_peak,
+            stats.render_queue_peak,
+            optional_u64_json(decode_state.last_keyframe_id.or(snapshot.last_keyframe_id)),
+            decode_state.waiting_for_keyframe || snapshot.waiting_keyframe,
             average(stats.decode_ms_total, stats.frames_decoded),
             average(stats.render_ms_total, stats.frames_rendered),
             dimensions.width,
@@ -283,7 +395,7 @@ mod platform {
 
     fn spawn_network_thread(
         socket: UdpSocket,
-        queue: Arc<Mutex<VecDeque<EncodedFrame>>>,
+        queue: Arc<Mutex<DecodeQueue>>,
         state: Arc<Mutex<SharedNetworkState>>,
         stop: Arc<AtomicBool>,
         frame_timeout_ms: u64,
@@ -313,7 +425,7 @@ mod platform {
 
     fn receive_loop(
         socket: UdpSocket,
-        queue: &Arc<Mutex<VecDeque<EncodedFrame>>>,
+        queue: &Arc<Mutex<DecodeQueue>>,
         state: &Arc<Mutex<SharedNetworkState>>,
         stop: &Arc<AtomicBool>,
         frame_timeout_ms: u64,
@@ -325,8 +437,6 @@ mod platform {
             max_inflight_frames,
         })?;
         let mut datagram = [0u8; MAX_DATAGRAM_SIZE];
-        let mut frames_queue_dropped = 0u64;
-        let mut discontinuity_epoch = 0u64;
         let mut previous_expired = 0u64;
 
         while !stop.load(Ordering::SeqCst) {
@@ -336,13 +446,14 @@ mod platform {
                     Ok((length, _peer)) => {
                         did_work = true;
                         match reassembler.accept_datagram(&datagram[..length], Instant::now()) {
-                            Ok(frames) => enqueue_network_frames(
-                                frames,
-                                queue,
-                                max_decode_queue,
-                                &mut frames_queue_dropped,
-                                &mut discontinuity_epoch,
-                            )?,
+                            Ok(frames) => {
+                                let current_expired = reassembler.stats().frames_incomplete_expired;
+                                if current_expired > previous_expired {
+                                    begin_queue_recovery(queue)?;
+                                    previous_expired = current_expired;
+                                }
+                                enqueue_network_frames(frames, queue, max_decode_queue)?;
+                            }
                             Err(err) => eprintln!("discarding invalid AGM1 packet: {err}"),
                         }
                     }
@@ -354,40 +465,22 @@ mod platform {
             let frames = reassembler.expire(Instant::now());
             let current_expired = reassembler.stats().frames_incomplete_expired;
             if current_expired > previous_expired {
-                discontinuity_epoch += 1;
+                begin_queue_recovery(queue)?;
                 previous_expired = current_expired;
             }
-            enqueue_network_frames(
-                frames,
-                queue,
-                max_decode_queue,
-                &mut frames_queue_dropped,
-                &mut discontinuity_epoch,
-            )?;
-            update_network_snapshot(
-                state,
-                &reassembler,
-                frames_queue_dropped,
-                discontinuity_epoch,
-            )?;
+            enqueue_network_frames(frames, queue, max_decode_queue)?;
+            update_network_snapshot(state, &reassembler, queue)?;
             if !did_work {
                 thread::sleep(Duration::from_millis(1));
             }
         }
-        update_network_snapshot(
-            state,
-            &reassembler,
-            frames_queue_dropped,
-            discontinuity_epoch,
-        )
+        update_network_snapshot(state, &reassembler, queue)
     }
 
     fn enqueue_network_frames(
         frames: Vec<EncodedFrame>,
-        queue: &Arc<Mutex<VecDeque<EncodedFrame>>>,
+        queue: &Arc<Mutex<DecodeQueue>>,
         max_decode_queue: usize,
-        frames_queue_dropped: &mut u64,
-        discontinuity_epoch: &mut u64,
     ) -> Result<(), String> {
         if frames.is_empty() {
             return Ok(());
@@ -396,32 +489,27 @@ mod platform {
             .lock()
             .map_err(|_| "decode queue lock was poisoned".to_string())?;
         for frame in frames {
-            if queue.len() >= max_decode_queue {
-                let dropped = if frame.is_keyframe() {
-                    let count = queue.len() as u64;
-                    queue.clear();
-                    count
-                } else if let Some(index) = queue.iter().position(|queued| !queued.is_keyframe()) {
-                    queue.remove(index);
-                    1
-                } else {
-                    queue.pop_front();
-                    1
-                };
-                *frames_queue_dropped += dropped;
-                *discontinuity_epoch += 1;
-            }
-            queue.push_back(frame);
+            queue.enqueue_frame(frame, max_decode_queue);
         }
+        Ok(())
+    }
+
+    fn begin_queue_recovery(queue: &Arc<Mutex<DecodeQueue>>) -> Result<(), String> {
+        queue
+            .lock()
+            .map_err(|_| "decode queue lock was poisoned".to_string())?
+            .begin_keyframe_recovery();
         Ok(())
     }
 
     fn update_network_snapshot(
         state: &Arc<Mutex<SharedNetworkState>>,
         reassembler: &H264Reassembler,
-        frames_queue_dropped: u64,
-        discontinuity_epoch: u64,
+        queue: &Arc<Mutex<DecodeQueue>>,
     ) -> Result<(), String> {
+        let queue = queue
+            .lock()
+            .map_err(|_| "decode queue lock was poisoned".to_string())?;
         let mut state = state
             .lock()
             .map_err(|_| "network state lock was poisoned".to_string())?;
@@ -430,19 +518,27 @@ mod platform {
             session_id: reassembler.session_id(),
             inflight_frames: reassembler.inflight_len(),
             completed_waiting: reassembler.completed_waiting_len(),
-            frames_queue_dropped,
-            discontinuity_epoch,
+            decode_queue: queue.frame_len(),
+            decode_queue_peak: queue.decode_queue_peak,
+            frames_predecode_dropped: queue.frames_predecode_dropped,
+            frames_waiting_keyframe_dropped: queue.frames_waiting_keyframe_dropped,
+            keyframe_recovery_count: queue.keyframe_recovery_count,
+            last_keyframe_id: queue.last_keyframe_id,
+            waiting_keyframe: queue.waiting_for_keyframe,
         };
         Ok(())
     }
 
     fn process_encoded_frame(
         frame: EncodedFrame,
-        render_latest: bool,
+        render_output: bool,
         decode_state: &mut DecodeState,
         window: &mut GdiViewerWindow,
         stats: &mut ViewerStats,
     ) {
+        if frame.is_keyframe() {
+            decode_state.last_keyframe_id = Some(frame.frame_id);
+        }
         if decode_state.waiting_for_keyframe {
             if !frame.is_keyframe() {
                 stats.frames_waiting_keyframe_dropped += 1;
@@ -465,6 +561,7 @@ mod platform {
                     decode_state.dimensions = Some(dimensions);
                     decode_state.waiting_for_keyframe = false;
                     decode_state.input_index = 0;
+                    decode_state.last_keyframe_id = Some(frame.frame_id);
                 }
                 Err(err) => {
                     stats.decoder_errors += 1;
@@ -491,7 +588,7 @@ mod platform {
                     "decoder rejected frame {} timestamp_ms={}: {err}; waiting for next keyframe",
                     frame.frame_id, frame.timestamp_ms
                 );
-                decode_state.mark_discontinuity(stats);
+                decode_state.mark_discontinuity(stats, true);
                 return;
             }
         };
@@ -501,38 +598,57 @@ mod platform {
             stats.frames_decoded += decoded.len() as u64;
         }
 
+        for decoded_frame in decoded {
+            if decode_state.pending_render.is_some() {
+                stats.frames_decoded_not_rendered += 1;
+                stats.frames_render_skipped += 1;
+            }
+            decode_state.pending_render = Some(PendingRender {
+                frame_id: frame.frame_id,
+                nv12: decoded_frame.nv12,
+            });
+            stats.render_queue_peak = stats.render_queue_peak.max(1);
+            if render_output {
+                render_latest_decoded(decode_state, window, stats);
+            }
+        }
+    }
+
+    fn render_latest_decoded(
+        decode_state: &mut DecodeState,
+        window: &mut GdiViewerWindow,
+        stats: &mut ViewerStats,
+    ) {
+        let Some(pending) = decode_state.pending_render.take() else {
+            return;
+        };
         let Some(dimensions) = decode_state.dimensions else {
             return;
         };
-        for decoded_frame in decoded {
-            if !render_latest {
-                stats.frames_render_skipped += 1;
-                continue;
-            }
-            let render_started = Instant::now();
-            if let Err(err) = nv12_to_bgra::convert(
-                &decoded_frame.nv12,
-                dimensions.width,
-                dimensions.height,
-                &mut decode_state.bgra,
-            )
-            .and_then(|_| {
-                window.render_bgra(&decode_state.bgra, dimensions.width, dimensions.height)
-            }) {
-                eprintln!("render frame {} failed: {err}", frame.frame_id);
-                return;
-            }
-            stats.render_ms_total += render_started.elapsed().as_secs_f64() * 1000.0;
-            stats.frames_rendered += 1;
+        let render_started = Instant::now();
+        if let Err(err) = nv12_to_bgra::convert(
+            &pending.nv12,
+            dimensions.width,
+            dimensions.height,
+            &mut decode_state.bgra,
+        )
+        .and_then(|_| window.render_bgra(&decode_state.bgra, dimensions.width, dimensions.height))
+        {
+            eprintln!("render frame {} failed: {err}", pending.frame_id);
+            return;
         }
+        stats.render_ms_total += render_started.elapsed().as_secs_f64() * 1000.0;
+        stats.frames_rendered += 1;
     }
 
     #[allow(clippy::too_many_arguments)]
     fn print_stats(
         snapshot: NetworkSnapshot,
         stats: &ViewerStats,
-        decode_queue: usize,
         dimensions: Option<VideoDimensions>,
+        decoder_waiting_keyframe: bool,
+        decoder_last_keyframe_id: Option<u64>,
+        strict_decode_order: bool,
         previous_network: ReassemblyStats,
         previous_decoded: u64,
         previous_rendered: u64,
@@ -544,7 +660,8 @@ mod platform {
             height: 0,
         });
         println!(
-            r#"{{"type":"H264_RECV_VIEW_STATS","mode":"h264_recv_view","session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_decoded":{},"frames_rendered":{},"frames_render_skipped":{},"frames_incomplete_expired":{},"frames_queue_dropped":{},"frames_waiting_keyframe_dropped":{},"decoder_errors":{},"decoder_resets":{},"decode_queue":{},"fps_decode":{:.2},"fps_render":{:.2},"mbps":{:.3},"last_frame_id":{},"inflight_frames":{},"completed_waiting":{},"decode_ms_avg":{:.3},"render_ms_avg":{:.3},"width":{},"height":{}}}"#,
+            r#"{{"type":"H264_RECV_VIEW_STATS","mode":"h264_recv_view","strict_decode_order":{},"session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_decoded":{},"frames_rendered":{},"frames_render_skipped":{},"frames_decoded_not_rendered":{},"frames_incomplete_expired":{},"frames_predecode_dropped":{},"frames_queue_dropped":{},"frames_waiting_keyframe_dropped":{},"keyframe_recovery_count":{},"decoder_errors":{},"decoder_resets":{},"decode_queue":{},"decode_queue_peak":{},"render_queue_peak":{},"fps_decode":{:.2},"fps_render":{:.2},"mbps":{:.3},"last_frame_id":{},"last_keyframe_id":{},"waiting_keyframe":{},"inflight_frames":{},"completed_waiting":{},"decode_ms_avg":{:.3},"render_ms_avg":{:.3},"width":{},"height":{}}}"#,
+            strict_decode_order,
             optional_u64_json(snapshot.session_id),
             snapshot.reassembly.packets_received,
             snapshot.reassembly.packets_invalid,
@@ -553,12 +670,17 @@ mod platform {
             stats.frames_decoded,
             stats.frames_rendered,
             stats.frames_render_skipped,
+            stats.frames_decoded_not_rendered,
             snapshot.reassembly.frames_incomplete_expired,
-            snapshot.frames_queue_dropped,
-            stats.frames_waiting_keyframe_dropped,
+            snapshot.frames_predecode_dropped + stats.frames_predecode_dropped,
+            snapshot.frames_predecode_dropped + stats.frames_predecode_dropped,
+            snapshot.frames_waiting_keyframe_dropped + stats.frames_waiting_keyframe_dropped,
+            snapshot.keyframe_recovery_count + stats.keyframe_recovery_count,
             stats.decoder_errors,
             stats.decoder_resets,
-            decode_queue,
+            snapshot.decode_queue,
+            snapshot.decode_queue_peak,
+            stats.render_queue_peak,
             stats.frames_decoded.saturating_sub(previous_decoded) as f64 / elapsed_sec,
             stats.frames_rendered.saturating_sub(previous_rendered) as f64 / elapsed_sec,
             snapshot
@@ -569,6 +691,8 @@ mod platform {
                 / elapsed_sec
                 / 1_000_000.0,
             optional_u64_json(snapshot.reassembly.last_frame_id),
+            optional_u64_json(decoder_last_keyframe_id.or(snapshot.last_keyframe_id)),
+            decoder_waiting_keyframe || snapshot.waiting_keyframe,
             snapshot.inflight_frames,
             snapshot.completed_waiting,
             average(stats.decode_ms_total, stats.frames_decoded),
@@ -631,12 +755,53 @@ mod platform {
     fn optional_u64_json(value: Option<u64>) -> String {
         value.map_or_else(|| "null".to_string(), |value| value.to_string())
     }
+
+    pub fn run_self_test() -> Result<(), String> {
+        fn frame(frame_id: u64, keyframe: bool) -> EncodedFrame {
+            EncodedFrame {
+                frame_id,
+                flags: if keyframe { crate::FLAG_KEYFRAME } else { 0 },
+                timestamp_ms: frame_id * 33,
+                bytes: vec![frame_id as u8],
+            }
+        }
+
+        let mut queue = DecodeQueue::default();
+        queue.enqueue_frame(frame(0, true), 2);
+        queue.enqueue_frame(frame(1, false), 2);
+        queue.enqueue_frame(frame(2, false), 2);
+        if !queue.waiting_for_keyframe
+            || queue.keyframe_recovery_count != 1
+            || !matches!(queue.items.front(), Some(DecodeQueueItem::Reset))
+        {
+            return Err("decode queue overflow did not enter keyframe recovery".to_string());
+        }
+        queue.enqueue_frame(frame(3, false), 2);
+        queue.enqueue_frame(frame(4, true), 2);
+        if queue.waiting_for_keyframe
+            || queue.frames_predecode_dropped != 4
+            || queue.items.len() != 2
+            || !matches!(queue.items.front(), Some(DecodeQueueItem::Reset))
+            || !matches!(
+                queue.items.back(),
+                Some(DecodeQueueItem::Frame(frame)) if frame.frame_id == 4
+            )
+        {
+            return Err("decode queue keyframe recovery ordering failed".to_string());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
-pub use platform::run;
+pub use platform::{run, run_self_test};
 
 #[cfg(not(windows))]
 pub fn run(_config: H264RecvViewConfig) -> Result<(), String> {
     Err("h264-recv-view is only supported on Windows".to_string())
+}
+
+#[cfg(not(windows))]
+pub fn run_self_test() -> Result<(), String> {
+    Ok(())
 }

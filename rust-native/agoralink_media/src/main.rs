@@ -717,7 +717,8 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
     let mut port = None;
     let mut frame_timeout_ms = 300u64;
     let mut max_inflight_frames = 120usize;
-    let mut max_decode_queue = 5usize;
+    let mut max_decode_queue = 30usize;
+    let mut strict_decode_order = true;
     let mut json_interval_ms = 1000u64;
     let mut title = "AgoraLink Native Viewer".to_string();
     let mut i = 0;
@@ -759,6 +760,11 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
                     1000,
                 )?;
             }
+            "--strict-decode-order" => {
+                i += 1;
+                strict_decode_order =
+                    parse_bool(required_value(args, i, "--strict-decode-order")?)?;
+            }
             "--json-interval-ms" => {
                 i += 1;
                 json_interval_ms = parse_milliseconds(
@@ -787,6 +793,7 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
         frame_timeout_ms,
         max_inflight_frames,
         max_decode_queue,
+        strict_decode_order,
         json_interval_ms,
         title,
     }))
@@ -804,6 +811,14 @@ fn parse_port(text: &str) -> Result<u16, String> {
         Err("port must be greater than zero".to_string())
     } else {
         Ok(port)
+    }
+}
+
+fn parse_bool(text: &str) -> Result<bool, String> {
+    match text.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(format!("invalid boolean value: {text}")),
     }
 }
 
@@ -906,7 +921,7 @@ Usage:\n\
   agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels> --output <path>\n\
   agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels>\n\
   agoralink_media h264-recv-dump --bind <ip> --port <port> --output <path> [--idle-timeout-sec <seconds>]\n\
-  agoralink_media h264-recv-view --bind <ip> --port <port> [--frame-timeout-ms <ms>] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--json-interval-ms <ms>] [--title <text>]\n\
+  agoralink_media h264-recv-view --bind <ip> --port <port> [--frame-timeout-ms <ms>] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--json-interval-ms <ms>] [--title <text>]\n\
   agoralink_media h264-file-viewer --input <path>\n\n\
 Defaults:\n\
   sender: --host 127.0.0.1 --port 50120 --fps 30 --bitrate-mbps 4\n\
@@ -916,7 +931,7 @@ Defaults:\n\
   capture-encode-probe: --duration-sec 5 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --output capture_720p30.h264\n\
   h264-send-probe: --host 127.0.0.1 --port 50130 --duration-sec 10 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720\n\
   h264-recv-dump: --bind 0.0.0.0 --port 50130 --output received_capture.h264 --idle-timeout-sec 3\n\
-  h264-recv-view: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --max-inflight-frames 120 --max-decode-queue 5 --json-interval-ms 1000 --title \"AgoraLink Native Viewer\"\n\
+  h264-recv-view: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --json-interval-ms 1000 --title \"AgoraLink Native Viewer\"\n\
   h264-file-viewer: --input received_capture_lan.h264"
     );
 }
@@ -1154,6 +1169,7 @@ fn run_self_test() -> Result<(), String> {
     bgra_to_nv12::run_self_test()?;
     h264_annex_b::run_self_test()?;
     h264_recv_dump::run_self_test()?;
+    h264_recv_view::run_self_test()?;
     nv12_to_bgra::run_self_test()?;
     let nv12_size = nv12_synthetic::buffer_size(16, 16)?;
     if nv12_size != 16 * 16 * 3 / 2 {
