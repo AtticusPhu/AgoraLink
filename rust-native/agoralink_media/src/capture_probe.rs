@@ -46,8 +46,8 @@ mod platform {
     #[derive(Debug)]
     struct CaptureState {
         counters: CaptureCounters,
-        pacing_started_at: Instant,
-        target_fps: u32,
+        next_accept_time: Instant,
+        frame_interval: Duration,
     }
 
     struct WinRtGuard;
@@ -143,14 +143,15 @@ mod platform {
         )
         .map_err(|err| format!("CreateFreeThreaded frame pool failed: {err}"))?;
 
+        let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(target_fps));
         let counters = Arc::new(Mutex::new(CaptureState {
             counters: CaptureCounters {
                 width: initial_size.Width,
                 height: initial_size.Height,
                 ..CaptureCounters::default()
             },
-            pacing_started_at: Instant::now(),
-            target_fps,
+            next_accept_time: Instant::now() + frame_interval,
+            frame_interval,
         }));
         let callback_counters = Arc::clone(&counters);
         let frame_handler: TypedEventHandler<Direct3D11CaptureFramePool, IInspectable> =
@@ -176,12 +177,14 @@ mod platform {
                                         state.counters.width = size.Width;
                                         state.counters.height = size.Height;
 
-                                        let elapsed =
-                                            state.pacing_started_at.elapsed().as_secs_f64();
-                                        let accepted_budget =
-                                            (elapsed * f64::from(state.target_fps)).floor() as u64;
-                                        if state.counters.accepted_frames < accepted_budget {
+                                        let now = Instant::now();
+                                        if now >= state.next_accept_time {
                                             state.counters.accepted_frames += 1;
+                                            let interval = state.frame_interval;
+                                            state.next_accept_time += interval;
+                                            if now > state.next_accept_time + interval {
+                                                state.next_accept_time = now + interval;
+                                            }
                                         } else {
                                             state.counters.skipped_frames += 1;
                                         }

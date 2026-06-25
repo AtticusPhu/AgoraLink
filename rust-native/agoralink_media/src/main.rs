@@ -12,10 +12,13 @@ mod capture_probe;
 mod encode_probe;
 mod h264_annex_b;
 mod h264_file_viewer;
+mod h264_reassembly;
 mod h264_recv_dump;
+mod h264_recv_view;
 mod h264_send_probe;
 mod nv12_synthetic;
 mod nv12_to_bgra;
+mod wgc_latest_capture;
 mod win32_gdi_viewer;
 mod wmf_h264_decoder;
 mod wmf_h264_encoder;
@@ -143,6 +146,7 @@ enum Command {
     CaptureEncodeProbe(capture_encode_probe::CaptureEncodeConfig),
     H264SendProbe(h264_send_probe::H264SendConfig),
     H264RecvDump(h264_recv_dump::H264RecvConfig),
+    H264RecvView(h264_recv_view::H264RecvViewConfig),
     H264FileViewer(h264_file_viewer::H264FileViewerConfig),
     Help,
 }
@@ -319,6 +323,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        Ok(Command::H264RecvView(config)) => {
+            if let Err(err) = h264_recv_view::run(config) {
+                eprintln!("h264-recv-view error: {err}");
+                process::exit(1);
+            }
+        }
         Ok(Command::H264FileViewer(config)) => {
             if let Err(err) = h264_file_viewer::run(config) {
                 eprintln!("h264-file-viewer error: {err}");
@@ -365,6 +375,7 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         "capture-encode-probe" => parse_capture_encode_probe_args(&args[1..]),
         "h264-send-probe" => parse_h264_send_probe_args(&args[1..]),
         "h264-recv-dump" => parse_h264_recv_dump_args(&args[1..]),
+        "h264-recv-view" => parse_h264_recv_view_args(&args[1..]),
         "h264-file-viewer" => parse_h264_file_viewer_args(&args[1..]),
         other => Err(format!("unknown command: {other}")),
     }
@@ -523,8 +534,10 @@ fn parse_encode_probe_args(args: &[String]) -> Result<Command, String> {
 fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
     let mut duration_sec = 5u64;
     let mut target_fps = 30u32;
-    let mut bitrate_mbps = 8.0f64;
-    let mut output = "capture_1080p30.h264".to_string();
+    let mut bitrate_mbps = 4.0f64;
+    let mut out_width = 1280u32;
+    let mut out_height = 720u32;
+    let mut output = "capture_720p30.h264".to_string();
     let mut i = 0;
 
     while i < args.len() {
@@ -540,6 +553,15 @@ fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
             "--bitrate-mbps" => {
                 i += 1;
                 bitrate_mbps = parse_bitrate(required_value(args, i, "--bitrate-mbps")?)?;
+            }
+            "--out-width" => {
+                i += 1;
+                out_width = parse_dimension(required_value(args, i, "--out-width")?, "out-width")?;
+            }
+            "--out-height" => {
+                i += 1;
+                out_height =
+                    parse_dimension(required_value(args, i, "--out-height")?, "out-height")?;
             }
             "--output" => {
                 i += 1;
@@ -559,6 +581,8 @@ fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
             duration_sec,
             target_fps,
             bitrate_mbps,
+            out_width,
+            out_height,
             output,
         },
     ))
@@ -569,7 +593,9 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
     let mut port = 50130u16;
     let mut duration_sec = 10u64;
     let mut target_fps = 30u32;
-    let mut bitrate_mbps = 8.0f64;
+    let mut bitrate_mbps = 4.0f64;
+    let mut out_width = 1280u32;
+    let mut out_height = 720u32;
     let mut i = 0;
 
     while i < args.len() {
@@ -594,6 +620,15 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
                 i += 1;
                 bitrate_mbps = parse_bitrate(required_value(args, i, "--bitrate-mbps")?)?;
             }
+            "--out-width" => {
+                i += 1;
+                out_width = parse_dimension(required_value(args, i, "--out-width")?, "out-width")?;
+            }
+            "--out-height" => {
+                i += 1;
+                out_height =
+                    parse_dimension(required_value(args, i, "--out-height")?, "out-height")?;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unknown h264-send-probe argument: {other}")),
         }
@@ -606,6 +641,8 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
         duration_sec,
         target_fps,
         bitrate_mbps,
+        out_width,
+        out_height,
     }))
 }
 
@@ -675,6 +712,86 @@ fn parse_h264_file_viewer_args(args: &[String]) -> Result<Command, String> {
     ))
 }
 
+fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
+    let mut bind = "0.0.0.0".to_string();
+    let mut port = None;
+    let mut frame_timeout_ms = 300u64;
+    let mut max_inflight_frames = 120usize;
+    let mut max_decode_queue = 5usize;
+    let mut json_interval_ms = 1000u64;
+    let mut title = "AgoraLink Native Viewer".to_string();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bind" => {
+                i += 1;
+                bind = required_value(args, i, "--bind")?.to_string();
+            }
+            "--port" => {
+                i += 1;
+                port = Some(parse_port(required_value(args, i, "--port")?)?);
+            }
+            "--frame-timeout-ms" => {
+                i += 1;
+                frame_timeout_ms = parse_milliseconds(
+                    required_value(args, i, "--frame-timeout-ms")?,
+                    "frame-timeout-ms",
+                    1,
+                    60_000,
+                )?;
+            }
+            "--max-inflight-frames" => {
+                i += 1;
+                max_inflight_frames = parse_count(
+                    required_value(args, i, "--max-inflight-frames")?,
+                    "max-inflight-frames",
+                    1,
+                    10_000,
+                )?;
+            }
+            "--max-decode-queue" => {
+                i += 1;
+                max_decode_queue = parse_count(
+                    required_value(args, i, "--max-decode-queue")?,
+                    "max-decode-queue",
+                    1,
+                    1000,
+                )?;
+            }
+            "--json-interval-ms" => {
+                i += 1;
+                json_interval_ms = parse_milliseconds(
+                    required_value(args, i, "--json-interval-ms")?,
+                    "json-interval-ms",
+                    100,
+                    60_000,
+                )?;
+            }
+            "--title" => {
+                i += 1;
+                title = required_value(args, i, "--title")?.to_string();
+                if title.trim().is_empty() {
+                    return Err("title must not be empty".to_string());
+                }
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown h264-recv-view argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::H264RecvView(h264_recv_view::H264RecvViewConfig {
+        bind,
+        port: port.ok_or_else(|| "h264-recv-view requires --port <port>".to_string())?,
+        frame_timeout_ms,
+        max_inflight_frames,
+        max_decode_queue,
+        json_interval_ms,
+        title,
+    }))
+}
+
 fn required_value<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a str, String> {
     args.get(index)
         .map(String::as_str)
@@ -732,6 +849,28 @@ fn parse_idle_timeout(text: &str) -> Result<u64, String> {
     }
 }
 
+fn parse_milliseconds(text: &str, name: &str, minimum: u64, maximum: u64) -> Result<u64, String> {
+    let value: u64 = text
+        .parse()
+        .map_err(|_| format!("invalid {name}: {text}"))?;
+    if (minimum..=maximum).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{name} must be between {minimum} and {maximum}"))
+    }
+}
+
+fn parse_count(text: &str, name: &str, minimum: usize, maximum: usize) -> Result<usize, String> {
+    let value: usize = text
+        .parse()
+        .map_err(|_| format!("invalid {name}: {text}"))?;
+    if (minimum..=maximum).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{name} must be between {minimum} and {maximum}"))
+    }
+}
+
 fn parse_dimension(text: &str, name: &str) -> Result<u32, String> {
     let value: u32 = text
         .parse()
@@ -764,18 +903,20 @@ Usage:\n\
   agoralink_media capture-probe --duration-sec <seconds> --target-fps <fps>\n\
   agoralink_media wmf-probe\n\
   agoralink_media encode-probe --width <pixels> --height <pixels> --fps <fps> --duration-sec <seconds> --bitrate-mbps <mbps> --output <path> [--encoder auto|software|hardware]\n\
-  agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --output <path>\n\
-  agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps>\n\
-  agoralink_media h264-recv-dump --bind <ip> --port <port> --output <path> [--idle-timeout-sec <seconds>]\n\n\
+  agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels> --output <path>\n\
+  agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels>\n\
+  agoralink_media h264-recv-dump --bind <ip> --port <port> --output <path> [--idle-timeout-sec <seconds>]\n\
+  agoralink_media h264-recv-view --bind <ip> --port <port> [--frame-timeout-ms <ms>] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--json-interval-ms <ms>] [--title <text>]\n\
   agoralink_media h264-file-viewer --input <path>\n\n\
 Defaults:\n\
   sender: --host 127.0.0.1 --port 50120 --fps 30 --bitrate-mbps 4\n\
   receiver: --bind 0.0.0.0 --port 50120\n\
   capture-probe: --duration-sec 10 --target-fps 30\n\
   encode-probe: --width 1280 --height 720 --fps 30 --duration-sec 5 --bitrate-mbps 4 --output synthetic_720p30.h264 --encoder auto\n\
-  capture-encode-probe: --duration-sec 5 --target-fps 30 --bitrate-mbps 8 --output capture_1080p30.h264\n\
-  h264-send-probe: --host 127.0.0.1 --port 50130 --duration-sec 10 --target-fps 30 --bitrate-mbps 8\n\
+  capture-encode-probe: --duration-sec 5 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --output capture_720p30.h264\n\
+  h264-send-probe: --host 127.0.0.1 --port 50130 --duration-sec 10 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720\n\
   h264-recv-dump: --bind 0.0.0.0 --port 50130 --output received_capture.h264 --idle-timeout-sec 3\n\
+  h264-recv-view: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --max-inflight-frames 120 --max-decode-queue 5 --json-interval-ms 1000 --title \"AgoraLink Native Viewer\"\n\
   h264-file-viewer: --input received_capture_lan.h264"
     );
 }

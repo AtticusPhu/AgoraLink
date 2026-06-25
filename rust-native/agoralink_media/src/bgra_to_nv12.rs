@@ -96,6 +96,93 @@ pub fn convert(
     Ok(())
 }
 
+pub fn convert_scaled(
+    bgra: &[u8],
+    row_pitch: usize,
+    source_width: u32,
+    source_height: u32,
+    output_width: u32,
+    output_height: u32,
+    nv12: &mut [u8],
+) -> Result<(), String> {
+    let output_size = buffer_size(output_width, output_height)?;
+    if nv12.len() != output_size {
+        return Err(format!(
+            "scaled NV12 output length mismatch: expected {output_size}, got {}",
+            nv12.len()
+        ));
+    }
+    if source_width == 0 || source_height == 0 {
+        return Err("source dimensions must be non-zero".to_string());
+    }
+    let source_width_usize = source_width as usize;
+    let source_height_usize = source_height as usize;
+    let source_row_bytes = source_width_usize
+        .checked_mul(4)
+        .ok_or_else(|| "source BGRA row size overflow".to_string())?;
+    if row_pitch < source_row_bytes {
+        return Err(format!(
+            "BGRA row pitch {row_pitch} is smaller than source row bytes {source_row_bytes}"
+        ));
+    }
+    let required_input = row_pitch
+        .checked_mul(source_height_usize)
+        .ok_or_else(|| "source BGRA input size overflow".to_string())?;
+    if bgra.len() < required_input {
+        return Err(format!(
+            "BGRA input too short: need {required_input}, got {}",
+            bgra.len()
+        ));
+    }
+    if source_width == output_width && source_height == output_height {
+        return convert(bgra, row_pitch, source_width, source_height, nv12);
+    }
+
+    let output_width_usize = output_width as usize;
+    let output_height_usize = output_height as usize;
+    let y_plane_len = output_width_usize * output_height_usize;
+    for output_y in (0..output_height_usize).step_by(2) {
+        let source_y0 = output_y * source_height_usize / output_height_usize;
+        let source_y1 = (output_y + 1) * source_height_usize / output_height_usize;
+        let y_row0 = output_y * output_width_usize;
+        let y_row1 = (output_y + 1) * output_width_usize;
+        let uv_row = y_plane_len + (output_y / 2) * output_width_usize;
+        for output_x in (0..output_width_usize).step_by(2) {
+            let source_x0 = output_x * source_width_usize / output_width_usize;
+            let source_x1 = (output_x + 1) * source_width_usize / output_width_usize;
+            let p00 = pixel(bgra, row_pitch, source_x0, source_y0);
+            let p01 = pixel(bgra, row_pitch, source_x1, source_y0);
+            let p10 = pixel(bgra, row_pitch, source_x0, source_y1);
+            let p11 = pixel(bgra, row_pitch, source_x1, source_y1);
+
+            nv12[y_row0 + output_x] = rgb_to_y(p00.2, p00.1, p00.0);
+            nv12[y_row0 + output_x + 1] = rgb_to_y(p01.2, p01.1, p01.0);
+            nv12[y_row1 + output_x] = rgb_to_y(p10.2, p10.1, p10.0);
+            nv12[y_row1 + output_x + 1] = rgb_to_y(p11.2, p11.1, p11.0);
+
+            let red =
+                ((u32::from(p00.2) + u32::from(p01.2) + u32::from(p10.2) + u32::from(p11.2) + 2)
+                    >> 2) as u8;
+            let green =
+                ((u32::from(p00.1) + u32::from(p01.1) + u32::from(p10.1) + u32::from(p11.1) + 2)
+                    >> 2) as u8;
+            let blue =
+                ((u32::from(p00.0) + u32::from(p01.0) + u32::from(p10.0) + u32::from(p11.0) + 2)
+                    >> 2) as u8;
+            let (u, v) = rgb_to_uv(red, green, blue);
+            nv12[uv_row + output_x] = u;
+            nv12[uv_row + output_x + 1] = v;
+        }
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn pixel(bgra: &[u8], row_pitch: usize, x: usize, y: usize) -> (u8, u8, u8) {
+    let offset = y * row_pitch + x * 4;
+    (bgra[offset], bgra[offset + 1], bgra[offset + 2])
+}
+
 #[inline(always)]
 fn rgb_to_y(red: u8, green: u8, blue: u8) -> u8 {
     let value = 66i32
@@ -162,6 +249,18 @@ pub fn run_self_test() -> Result<(), String> {
     convert(&padded, 12, 2, 2, &mut padded_nv12)?;
     if padded_nv12 != black_nv12 {
         return Err("row-pitch padding changed BGRA conversion output".to_string());
+    }
+
+    let source = [
+        0u8, 0, 0, 255, 0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255, 255, 0,
+        255, 255, 255, 255, 0, 255, 0, 255, 255, 255, 128, 128, 128, 255, 64, 64, 64, 255, 192,
+        192, 192, 255, 32, 32, 32, 255, 224, 224, 224, 255, 16, 16, 16, 255, 240, 240, 240, 255,
+        96, 96, 96, 255,
+    ];
+    let mut scaled = vec![0u8; buffer_size(2, 2)?];
+    convert_scaled(&source, 16, 4, 4, 2, 2, &mut scaled)?;
+    if scaled.len() != 6 {
+        return Err("scaled BGRA conversion returned wrong NV12 size".to_string());
     }
     Ok(())
 }
