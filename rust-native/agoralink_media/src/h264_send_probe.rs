@@ -2,12 +2,19 @@
 pub struct H264SendConfig {
     pub host: String,
     pub port: u16,
-    pub duration_sec: u64,
+    pub duration_sec: Option<u64>,
     pub target_fps: u32,
     pub bitrate_mbps: f64,
     pub out_width: u32,
     pub out_height: u32,
     pub color_spec: crate::color_spec::ColorSpec,
+    pub mode: H264SendMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum H264SendMode {
+    Probe,
+    Screen,
 }
 
 #[cfg(windows)]
@@ -17,9 +24,10 @@ mod platform {
     use std::thread;
     use std::time::Instant;
 
-    use super::H264SendConfig;
+    use super::{H264SendConfig, H264SendMode};
     use crate::capture_encode_probe::{
-        self, CaptureEncodeObserver, CapturePipelineDone, CapturePipelineStats,
+        self, CaptureEncodeObserver, CapturePipelineDone, CapturePipelineStarted,
+        CapturePipelineStats,
     };
     use crate::wmf_h264_encoder::{EncodedSample, ENCODER_NAME};
     use crate::{
@@ -30,7 +38,11 @@ mod platform {
     struct UdpObserver {
         socket: UdpSocket,
         target: String,
+        host: String,
+        port: u16,
         session_id: u64,
+        mode: H264SendMode,
+        duration_sec: Option<u64>,
         next_frame_id: u64,
         packets_sent: u64,
         frames_sent: u64,
@@ -45,8 +57,8 @@ mod platform {
     }
 
     impl UdpObserver {
-        fn new(host: &str, port: u16) -> Result<Self, String> {
-            let target = format!("{host}:{port}");
+        fn new(config: &H264SendConfig) -> Result<Self, String> {
+            let target = format!("{}:{}", config.host, config.port);
             let socket =
                 UdpSocket::bind("0.0.0.0:0").map_err(|err| format!("UDP bind failed: {err}"))?;
             socket
@@ -55,7 +67,11 @@ mod platform {
             Ok(Self {
                 socket,
                 target,
+                host: config.host.clone(),
+                port: config.port,
                 session_id: make_session_id(),
+                mode: config.mode,
+                duration_sec: config.duration_sec,
                 next_frame_id: 0,
                 packets_sent: 0,
                 frames_sent: 0,
@@ -70,49 +86,106 @@ mod platform {
             })
         }
 
-        fn print_done(&self, done: CapturePipelineDone) {
+        fn print_started(&self, started: &CapturePipelineStarted) {
+            if self.mode != H264SendMode::Screen {
+                return;
+            }
             println!(
-                r#"{{"type":"H264_SEND_DONE","mode":"h264_send_probe","encoder":"{}","target":"{}","session_id":{},"packets_sent":{},"frames_sent":{},"bytes_sent":{},"h264_bytes":{},"keyframes":{},"config_frames":{},"capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{:.2},"mbps":{:.3},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"packetize_send_ms_avg":{:.3},{},{},{}}}"#,
-                ENCODER_NAME,
-                json_escape(&self.target),
-                self.session_id,
-                self.packets_sent,
-                self.frames_sent,
-                self.bytes_sent,
-                self.h264_bytes,
-                self.keyframes,
-                self.config_frames,
-                done.capture_raw_frames,
-                done.capture_latest_updates,
-                done.capture_callback_skipped,
-                done.capture_dropped,
-                done.encode_ticks,
-                done.no_new_frame_skipped,
-                done.no_new_frame_reused,
-                done.frames_encoded,
-                done.encode_lag_skips,
-                done.encoder.samples_out,
-                done.media_duration_sec,
-                done.wall_time_sec,
-                self.frames_sent as f64 / done.wall_time_sec.max(0.001),
-                self.bytes_sent as f64 * 8.0 / done.wall_time_sec.max(0.001) / 1_000_000.0,
-                done.width,
-                done.height,
-                done.copy_ms_avg,
-                done.convert_ms_avg,
-                done.encode_ms_avg,
-                average_ms(self.packetize_send_ms_total, self.frames_sent),
-                done.color_spec.json_fragment(),
-                done.encoder_input_color_metadata
+                r#"{{"type":"NATIVE_SCREEN_STARTED","role":"sender","mode":"screen-send","host":"{}","port":{},"width":{},"height":{},"fps":{},"bitrate_mbps":{:.3},{},{},{}}}"#,
+                json_escape(&self.host),
+                self.port,
+                started.width,
+                started.height,
+                started.target_fps,
+                started.bitrate_mbps,
+                started.color_spec.json_fragment(),
+                started
+                    .encoder_input_color_metadata
                     .json_fragment("encoder_input"),
-                done.encoder_output_color_metadata
+                started
+                    .encoder_output_color_metadata
                     .json_fragment("encoder_output")
             );
+            io::stdout().flush().ok();
+        }
+
+        fn print_done(&self, done: CapturePipelineDone) {
+            match self.mode {
+                H264SendMode::Probe => {
+                    println!(
+                        r#"{{"type":"H264_SEND_DONE","mode":"h264_send_probe","encoder":"{}","target":"{}","session_id":{},"packets_sent":{},"frames_sent":{},"bytes_sent":{},"h264_bytes":{},"keyframes":{},"config_frames":{},"capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{:.2},"mbps":{:.3},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"packetize_send_ms_avg":{:.3},{},{},{}}}"#,
+                        ENCODER_NAME,
+                        json_escape(&self.target),
+                        self.session_id,
+                        self.packets_sent,
+                        self.frames_sent,
+                        self.bytes_sent,
+                        self.h264_bytes,
+                        self.keyframes,
+                        self.config_frames,
+                        done.capture_raw_frames,
+                        done.capture_latest_updates,
+                        done.capture_callback_skipped,
+                        done.capture_dropped,
+                        done.encode_ticks,
+                        done.no_new_frame_skipped,
+                        done.no_new_frame_reused,
+                        done.frames_encoded,
+                        done.encode_lag_skips,
+                        done.encoder.samples_out,
+                        done.media_duration_sec,
+                        done.wall_time_sec,
+                        self.frames_sent as f64 / done.wall_time_sec.max(0.001),
+                        self.bytes_sent as f64 * 8.0 / done.wall_time_sec.max(0.001) / 1_000_000.0,
+                        done.width,
+                        done.height,
+                        done.copy_ms_avg,
+                        done.convert_ms_avg,
+                        done.encode_ms_avg,
+                        average_ms(self.packetize_send_ms_total, self.frames_sent),
+                        done.color_spec.json_fragment(),
+                        done.encoder_input_color_metadata
+                            .json_fragment("encoder_input"),
+                        done.encoder_output_color_metadata
+                            .json_fragment("encoder_output")
+                    );
+                }
+                H264SendMode::Screen => {
+                    println!(
+                        r#"{{"type":"NATIVE_SCREEN_STOPPED","role":"sender","mode":"screen-send","reason":"{}","host":"{}","port":{},"frames_sent":{},"packets_sent":{},"bytes_sent":{},"duration_sec":{:.3},"fps":{:.2},"mbps":{:.3},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"packetize_send_ms_avg":{:.3},{},{},{}}}"#,
+                        stop_reason(done.stopped_by_console, self.duration_sec),
+                        json_escape(&self.host),
+                        self.port,
+                        self.frames_sent,
+                        self.packets_sent,
+                        self.bytes_sent,
+                        done.wall_time_sec,
+                        self.frames_sent as f64 / done.wall_time_sec.max(0.001),
+                        self.bytes_sent as f64 * 8.0 / done.wall_time_sec.max(0.001) / 1_000_000.0,
+                        done.width,
+                        done.height,
+                        done.copy_ms_avg,
+                        done.convert_ms_avg,
+                        done.encode_ms_avg,
+                        average_ms(self.packetize_send_ms_total, self.frames_sent),
+                        done.color_spec.json_fragment(),
+                        done.encoder_input_color_metadata
+                            .json_fragment("encoder_input"),
+                        done.encoder_output_color_metadata
+                            .json_fragment("encoder_output")
+                    );
+                }
+            }
             io::stdout().flush().ok();
         }
     }
 
     impl CaptureEncodeObserver for UdpObserver {
+        fn on_started(&mut self, started: &CapturePipelineStarted) -> Result<(), String> {
+            self.print_started(started);
+            Ok(())
+        }
+
         fn on_sample(&mut self, sample: EncodedSample) -> Result<(), String> {
             let packetize_started = Instant::now();
             let mut flags = 0;
@@ -169,43 +242,83 @@ mod platform {
             let packets_delta = self.packets_sent.saturating_sub(self.previous_packets);
             let frames_delta = self.frames_sent.saturating_sub(self.previous_frames);
             let bytes_delta = self.bytes_sent.saturating_sub(self.previous_bytes);
-            println!(
-                r#"{{"type":"H264_SEND_STATS","mode":"h264_send_probe","encoder":"{}","target":"{}","session_id":{},"packets_sent":{},"frames_sent":{},"bytes_sent":{},"packets_per_sec":{},"fps":{},"mbps":{:.3},"capture_raw_frames":{},"capture_latest_updates":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"packetize_send_ms_avg":{:.3},"capture_dropped":{},{},{},{}}}"#,
-                ENCODER_NAME,
-                json_escape(&self.target),
-                self.session_id,
-                self.packets_sent,
-                self.frames_sent,
-                self.bytes_sent,
-                packets_delta,
-                frames_delta,
-                bytes_delta as f64 * 8.0 / 1_000_000.0,
-                stats.capture_raw_frames,
-                stats.capture_latest_updates,
-                stats.encode_ticks,
-                stats.no_new_frame_skipped,
-                stats.no_new_frame_reused,
-                stats.frames_encoded,
-                stats.encode_lag_skips,
-                stats.raw_fps,
-                stats.accepted_fps,
-                stats.encode_fps,
-                stats.target_fps,
-                stats.width,
-                stats.height,
-                stats.copy_ms_avg,
-                stats.convert_ms_avg,
-                stats.encode_ms_avg,
-                average_ms(self.packetize_send_ms_total, self.frames_sent),
-                stats.capture_dropped,
-                stats.color_spec.json_fragment(),
-                stats
-                    .encoder_input_color_metadata
-                    .json_fragment("encoder_input"),
-                stats
-                    .encoder_output_color_metadata
-                    .json_fragment("encoder_output")
-            );
+            match self.mode {
+                H264SendMode::Probe => {
+                    println!(
+                        r#"{{"type":"H264_SEND_STATS","mode":"h264_send_probe","encoder":"{}","target":"{}","session_id":{},"packets_sent":{},"frames_sent":{},"bytes_sent":{},"packets_per_sec":{},"fps":{},"mbps":{:.3},"capture_raw_frames":{},"capture_latest_updates":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"packetize_send_ms_avg":{:.3},"capture_dropped":{},{},{},{}}}"#,
+                        ENCODER_NAME,
+                        json_escape(&self.target),
+                        self.session_id,
+                        self.packets_sent,
+                        self.frames_sent,
+                        self.bytes_sent,
+                        packets_delta,
+                        frames_delta,
+                        bytes_delta as f64 * 8.0 / 1_000_000.0,
+                        stats.capture_raw_frames,
+                        stats.capture_latest_updates,
+                        stats.encode_ticks,
+                        stats.no_new_frame_skipped,
+                        stats.no_new_frame_reused,
+                        stats.frames_encoded,
+                        stats.encode_lag_skips,
+                        stats.raw_fps,
+                        stats.accepted_fps,
+                        stats.encode_fps,
+                        stats.target_fps,
+                        stats.width,
+                        stats.height,
+                        stats.copy_ms_avg,
+                        stats.convert_ms_avg,
+                        stats.encode_ms_avg,
+                        average_ms(self.packetize_send_ms_total, self.frames_sent),
+                        stats.capture_dropped,
+                        stats.color_spec.json_fragment(),
+                        stats
+                            .encoder_input_color_metadata
+                            .json_fragment("encoder_input"),
+                        stats
+                            .encoder_output_color_metadata
+                            .json_fragment("encoder_output")
+                    );
+                }
+                H264SendMode::Screen => {
+                    println!(
+                        r#"{{"type":"NATIVE_SCREEN_STATS","role":"sender","mode":"screen-send","host":"{}","port":{},"session_id":{},"frames_sent":{},"packets_sent":{},"bytes_sent":{},"packets_per_sec":{},"fps":{},"mbps":{:.3},"capture_raw_frames":{},"capture_latest_updates":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"target_fps":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"packetize_send_ms_avg":{:.3},"capture_dropped":{},{},{},{}}}"#,
+                        json_escape(&self.host),
+                        self.port,
+                        self.session_id,
+                        self.frames_sent,
+                        self.packets_sent,
+                        self.bytes_sent,
+                        packets_delta,
+                        frames_delta,
+                        bytes_delta as f64 * 8.0 / 1_000_000.0,
+                        stats.capture_raw_frames,
+                        stats.capture_latest_updates,
+                        stats.encode_ticks,
+                        stats.no_new_frame_skipped,
+                        stats.no_new_frame_reused,
+                        stats.frames_encoded,
+                        stats.encode_lag_skips,
+                        stats.target_fps,
+                        stats.width,
+                        stats.height,
+                        stats.copy_ms_avg,
+                        stats.convert_ms_avg,
+                        stats.encode_ms_avg,
+                        average_ms(self.packetize_send_ms_total, self.frames_sent),
+                        stats.capture_dropped,
+                        stats.color_spec.json_fragment(),
+                        stats
+                            .encoder_input_color_metadata
+                            .json_fragment("encoder_input"),
+                        stats
+                            .encoder_output_color_metadata
+                            .json_fragment("encoder_output")
+                    );
+                }
+            }
             io::stdout().flush().ok();
             self.previous_packets = self.packets_sent;
             self.previous_frames = self.frames_sent;
@@ -215,11 +328,12 @@ mod platform {
     }
 
     pub fn run(config: H264SendConfig) -> Result<(), String> {
-        let mut observer = UdpObserver::new(&config.host, config.port)?;
+        validate_config(&config)?;
+        let mut observer = UdpObserver::new(&config)?;
         eprintln!(
             "h264-send-probe target={} duration_sec={} target_fps={} bitrate_mbps={} output={}x{} color_matrix={} range={} packet_payload_max=1200",
             observer.target,
-            config.duration_sec,
+            optional_duration_text(config.duration_sec),
             config.target_fps,
             config.bitrate_mbps,
             config.out_width,
@@ -238,6 +352,16 @@ mod platform {
         };
         let done = capture_encode_probe::run_with_observer(&pipeline_config, &mut observer)?;
         observer.print_done(done);
+        Ok(())
+    }
+
+    fn validate_config(config: &H264SendConfig) -> Result<(), String> {
+        if config.host.trim().is_empty() {
+            return Err("host must not be empty".to_string());
+        }
+        if config.port == 0 {
+            return Err("port must be greater than zero".to_string());
+        }
         Ok(())
     }
 
@@ -266,6 +390,20 @@ mod platform {
             0.0
         } else {
             total / count as f64
+        }
+    }
+
+    fn optional_duration_text(duration_sec: Option<u64>) -> String {
+        duration_sec.map_or_else(|| "unlimited".to_string(), |seconds| seconds.to_string())
+    }
+
+    fn stop_reason(stopped_by_console: bool, duration_sec: Option<u64>) -> &'static str {
+        if stopped_by_console {
+            "ctrl_c"
+        } else if duration_sec.is_some() {
+            "duration"
+        } else {
+            "stopped"
         }
     }
 }

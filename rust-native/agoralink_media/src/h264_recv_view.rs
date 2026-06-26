@@ -2,6 +2,7 @@
 pub struct H264RecvViewConfig {
     pub bind: String,
     pub port: u16,
+    pub duration_sec: Option<u64>,
     pub frame_timeout_ms: u64,
     pub max_inflight_frames: usize,
     pub max_decode_queue: usize,
@@ -10,6 +11,13 @@ pub struct H264RecvViewConfig {
     pub debug_dump_limit: usize,
     pub json_interval_ms: u64,
     pub title: String,
+    pub mode: H264RecvViewMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum H264RecvViewMode {
+    Probe,
+    Screen,
 }
 
 #[cfg(windows)]
@@ -31,7 +39,7 @@ mod platform {
         SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
     };
 
-    use super::H264RecvViewConfig;
+    use super::{H264RecvViewConfig, H264RecvViewMode};
     use crate::color_spec::{ColorSpec, MediaColorMetadata};
     use crate::decoded_frame_renderer::OwnedBgraFrame;
     use crate::h264_annex_b::{dimensions_from_sps, VideoDimensions};
@@ -288,7 +296,7 @@ mod platform {
         )?;
 
         eprintln!(
-            "h264-recv-view bind={}:{} frame_timeout_ms={} max_inflight_frames={} max_decode_queue={} strict_decode_order={} debug_dump_frames={:?} debug_dump_limit={} udp_receive_buffer={} decoder=\"{}\" output=NV12 render=GDI title=\"{}\"",
+            "h264-recv-view bind={}:{} frame_timeout_ms={} max_inflight_frames={} max_decode_queue={} strict_decode_order={} debug_dump_frames={:?} debug_dump_limit={} udp_receive_buffer={} decoder=\"{}\" output=NV12 render=GDI title=\"{}\" duration_sec={}",
             config.bind,
             config.port,
             config.frame_timeout_ms,
@@ -299,8 +307,10 @@ mod platform {
             config.debug_dump_limit,
             UDP_RECEIVE_BUFFER_BYTES,
             DECODER_NAME,
-            config.title
+            config.title,
+            optional_duration_text(config.duration_sec)
         );
+        print_started(&config);
 
         let started_at = Instant::now();
         let mut report_at = started_at;
@@ -315,6 +325,9 @@ mod platform {
 
         loop {
             if STOP_REQUESTED.load(Ordering::SeqCst) || stop.load(Ordering::SeqCst) {
+                break;
+            }
+            if duration_elapsed(started_at, config.duration_sec) {
                 break;
             }
             if !window.pump_messages() {
@@ -374,6 +387,7 @@ mod platform {
                     previous_decoded,
                     previous_rendered,
                     now.duration_since(report_at),
+                    config.mode,
                 );
                 previous_network = snapshot.reassembly;
                 previous_decoded = stats.frames_decoded;
@@ -396,60 +410,21 @@ mod platform {
             width: 0,
             height: 0,
         });
-        println!(
-            r#"{{"type":"H264_RECV_VIEW_DONE","mode":"h264_recv_view","strict_decode_order":{},"session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_decoded":{},"frames_rendered":{},"frames_render_skipped":{},"frames_decoded_not_rendered":{},"frames_incomplete_expired":{},"frames_predecode_dropped":{},"frames_queue_dropped":{},"frames_waiting_keyframe_dropped":{},"keyframe_recovery_count":{},"decoder_errors":{},"decoder_resets":{},"decode_queue_peak":{},"render_queue_peak":{},"render_frame_copies":{},"render_buffer_reused":{},"render_buffer_generation":{},"nv12_y_stride":{},"nv12_uv_stride":{},"nv12_uv_offset":{},"nv12_allocated_height":{},"nv12_buffer_len":{},"expected_tight_len":{},"decoder_used_2d_buffer":{},"last_keyframe_id":{},"waiting_keyframe":{},"decode_ms_avg":{:.3},"render_ms_avg":{:.3},"width":{},"height":{},"last_frame_id":{},"closed_by_user":{},"stopped_by_console":{},"duration_sec":{:.3},{},{}}}"#,
-            config.strict_decode_order,
-            optional_u64_json(snapshot.session_id),
-            snapshot.reassembly.packets_received,
-            snapshot.reassembly.packets_invalid,
-            snapshot.reassembly.packets_lost_estimate,
-            snapshot.reassembly.frames_complete,
-            stats.frames_decoded,
-            stats.frames_rendered,
-            stats.frames_render_skipped,
-            stats.frames_decoded_not_rendered,
-            snapshot.reassembly.frames_incomplete_expired,
-            snapshot.frames_predecode_dropped + stats.frames_predecode_dropped,
-            snapshot.frames_predecode_dropped + stats.frames_predecode_dropped,
-            snapshot.frames_waiting_keyframe_dropped + stats.frames_waiting_keyframe_dropped,
-            snapshot.keyframe_recovery_count + stats.keyframe_recovery_count,
-            stats.decoder_errors,
-            stats.decoder_resets,
-            snapshot.decode_queue_peak,
-            stats.render_queue_peak,
-            stats.render_frame_copies,
-            stats.render_buffer_reused,
-            stats.render_buffer_generation,
-            stats.nv12_y_stride,
-            stats.nv12_uv_stride,
-            stats.nv12_uv_offset,
-            stats.nv12_allocated_height,
-            stats.nv12_buffer_len,
-            stats.expected_tight_len,
-            stats.decoder_used_2d_buffer,
-            optional_u64_json(decode_state.last_keyframe_id.or(snapshot.last_keyframe_id)),
-            decode_state.waiting_for_keyframe || snapshot.waiting_keyframe,
-            average(stats.decode_ms_total, stats.frames_decoded),
-            average(stats.render_ms_total, stats.frames_rendered),
-            dimensions.width,
-            dimensions.height,
-            optional_u64_json(snapshot.reassembly.last_frame_id),
+        print_done(
+            &config,
+            snapshot,
+            &stats,
+            dimensions,
+            decode_state.last_keyframe_id,
+            decode_state.waiting_for_keyframe,
             closed_by_user,
-            STOP_REQUESTED.load(Ordering::SeqCst),
+            network_error.is_some(),
             started_at.elapsed().as_secs_f64(),
-            stats.color_spec.json_fragment(),
-            stats.decoder_color_metadata.json_fragment("decoder_output")
         );
         io::stdout().flush().ok();
         eprintln!(
             "h264-recv-view stopped reason={}",
-            if closed_by_user {
-                "window-closed"
-            } else if network_error.is_some() {
-                "network-error"
-            } else {
-                "console-control"
-            }
+            human_stop_reason(closed_by_user, network_error.is_some(), config.duration_sec)
         );
         if let Some(error) = network_error {
             Err(error)
@@ -740,66 +715,202 @@ mod platform {
         previous_decoded: u64,
         previous_rendered: u64,
         elapsed: Duration,
+        mode: H264RecvViewMode,
     ) {
         let elapsed_sec = elapsed.as_secs_f64().max(0.001);
         let dimensions = dimensions.unwrap_or(VideoDimensions {
             width: 0,
             height: 0,
         });
+        let fps_decode = stats.frames_decoded.saturating_sub(previous_decoded) as f64 / elapsed_sec;
+        let fps_render =
+            stats.frames_rendered.saturating_sub(previous_rendered) as f64 / elapsed_sec;
+        let mbps = snapshot
+            .reassembly
+            .bytes_received
+            .saturating_sub(previous_network.bytes_received) as f64
+            * 8.0
+            / elapsed_sec
+            / 1_000_000.0;
+        match mode {
+            H264RecvViewMode::Probe => {
+                println!(
+                    r#"{{"type":"H264_RECV_VIEW_STATS","mode":"h264_recv_view","strict_decode_order":{},"session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_decoded":{},"frames_rendered":{},"frames_render_skipped":{},"frames_decoded_not_rendered":{},"frames_incomplete_expired":{},"frames_predecode_dropped":{},"frames_queue_dropped":{},"frames_waiting_keyframe_dropped":{},"keyframe_recovery_count":{},"decoder_errors":{},"decoder_resets":{},"decode_queue":{},"decode_queue_peak":{},"render_queue_peak":{},"render_frame_copies":{},"render_buffer_reused":{},"render_buffer_generation":{},"nv12_y_stride":{},"nv12_uv_stride":{},"nv12_uv_offset":{},"nv12_allocated_height":{},"nv12_buffer_len":{},"expected_tight_len":{},"decoder_used_2d_buffer":{},"fps_decode":{:.2},"fps_render":{:.2},"mbps":{:.3},"last_frame_id":{},"last_keyframe_id":{},"waiting_keyframe":{},"inflight_frames":{},"completed_waiting":{},"decode_ms_avg":{:.3},"render_ms_avg":{:.3},"width":{},"height":{},{},{}}}"#,
+                    strict_decode_order,
+                    optional_u64_json(snapshot.session_id),
+                    snapshot.reassembly.packets_received,
+                    snapshot.reassembly.packets_invalid,
+                    snapshot.reassembly.packets_lost_estimate,
+                    snapshot.reassembly.frames_complete,
+                    stats.frames_decoded,
+                    stats.frames_rendered,
+                    stats.frames_render_skipped,
+                    stats.frames_decoded_not_rendered,
+                    snapshot.reassembly.frames_incomplete_expired,
+                    snapshot.frames_predecode_dropped + stats.frames_predecode_dropped,
+                    snapshot.frames_predecode_dropped + stats.frames_predecode_dropped,
+                    snapshot.frames_waiting_keyframe_dropped
+                        + stats.frames_waiting_keyframe_dropped,
+                    snapshot.keyframe_recovery_count + stats.keyframe_recovery_count,
+                    stats.decoder_errors,
+                    stats.decoder_resets,
+                    snapshot.decode_queue,
+                    snapshot.decode_queue_peak,
+                    stats.render_queue_peak,
+                    stats.render_frame_copies,
+                    stats.render_buffer_reused,
+                    stats.render_buffer_generation,
+                    stats.nv12_y_stride,
+                    stats.nv12_uv_stride,
+                    stats.nv12_uv_offset,
+                    stats.nv12_allocated_height,
+                    stats.nv12_buffer_len,
+                    stats.expected_tight_len,
+                    stats.decoder_used_2d_buffer,
+                    fps_decode,
+                    fps_render,
+                    mbps,
+                    optional_u64_json(snapshot.reassembly.last_frame_id),
+                    optional_u64_json(decoder_last_keyframe_id.or(snapshot.last_keyframe_id)),
+                    decoder_waiting_keyframe || snapshot.waiting_keyframe,
+                    snapshot.inflight_frames,
+                    snapshot.completed_waiting,
+                    average(stats.decode_ms_total, stats.frames_decoded),
+                    average(stats.render_ms_total, stats.frames_rendered),
+                    dimensions.width,
+                    dimensions.height,
+                    stats.color_spec.json_fragment(),
+                    stats.decoder_color_metadata.json_fragment("decoder_output")
+                );
+            }
+            H264RecvViewMode::Screen => {
+                println!(
+                    r#"{{"type":"NATIVE_SCREEN_STATS","role":"receiver","mode":"screen-recv","strict_decode_order":{},"session_id":{},"packets_received":{},"packets_lost_estimate":{},"frames_complete":{},"frames_decoded":{},"frames_rendered":{},"frames_incomplete_expired":{},"decoder_errors":{},"decoder_resets":{},"decode_queue":{},"decode_queue_peak":{},"fps_decode":{:.2},"fps_render":{:.2},"mbps":{:.3},"last_frame_id":{},"inflight_frames":{},"decode_ms_avg":{:.3},"render_ms_avg":{:.3},"width":{},"height":{},{},{}}}"#,
+                    strict_decode_order,
+                    optional_u64_json(snapshot.session_id),
+                    snapshot.reassembly.packets_received,
+                    snapshot.reassembly.packets_lost_estimate,
+                    snapshot.reassembly.frames_complete,
+                    stats.frames_decoded,
+                    stats.frames_rendered,
+                    snapshot.reassembly.frames_incomplete_expired,
+                    stats.decoder_errors,
+                    stats.decoder_resets,
+                    snapshot.decode_queue,
+                    snapshot.decode_queue_peak,
+                    fps_decode,
+                    fps_render,
+                    mbps,
+                    optional_u64_json(snapshot.reassembly.last_frame_id),
+                    snapshot.inflight_frames,
+                    average(stats.decode_ms_total, stats.frames_decoded),
+                    average(stats.render_ms_total, stats.frames_rendered),
+                    dimensions.width,
+                    dimensions.height,
+                    stats.color_spec.json_fragment(),
+                    stats.decoder_color_metadata.json_fragment("decoder_output")
+                );
+            }
+        }
+        io::stdout().flush().ok();
+    }
+
+    fn print_started(config: &H264RecvViewConfig) {
+        if config.mode != H264RecvViewMode::Screen {
+            return;
+        }
         println!(
-            r#"{{"type":"H264_RECV_VIEW_STATS","mode":"h264_recv_view","strict_decode_order":{},"session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_decoded":{},"frames_rendered":{},"frames_render_skipped":{},"frames_decoded_not_rendered":{},"frames_incomplete_expired":{},"frames_predecode_dropped":{},"frames_queue_dropped":{},"frames_waiting_keyframe_dropped":{},"keyframe_recovery_count":{},"decoder_errors":{},"decoder_resets":{},"decode_queue":{},"decode_queue_peak":{},"render_queue_peak":{},"render_frame_copies":{},"render_buffer_reused":{},"render_buffer_generation":{},"nv12_y_stride":{},"nv12_uv_stride":{},"nv12_uv_offset":{},"nv12_allocated_height":{},"nv12_buffer_len":{},"expected_tight_len":{},"decoder_used_2d_buffer":{},"fps_decode":{:.2},"fps_render":{:.2},"mbps":{:.3},"last_frame_id":{},"last_keyframe_id":{},"waiting_keyframe":{},"inflight_frames":{},"completed_waiting":{},"decode_ms_avg":{:.3},"render_ms_avg":{:.3},"width":{},"height":{},{},{}}}"#,
-            strict_decode_order,
-            optional_u64_json(snapshot.session_id),
-            snapshot.reassembly.packets_received,
-            snapshot.reassembly.packets_invalid,
-            snapshot.reassembly.packets_lost_estimate,
-            snapshot.reassembly.frames_complete,
-            stats.frames_decoded,
-            stats.frames_rendered,
-            stats.frames_render_skipped,
-            stats.frames_decoded_not_rendered,
-            snapshot.reassembly.frames_incomplete_expired,
-            snapshot.frames_predecode_dropped + stats.frames_predecode_dropped,
-            snapshot.frames_predecode_dropped + stats.frames_predecode_dropped,
-            snapshot.frames_waiting_keyframe_dropped + stats.frames_waiting_keyframe_dropped,
-            snapshot.keyframe_recovery_count + stats.keyframe_recovery_count,
-            stats.decoder_errors,
-            stats.decoder_resets,
-            snapshot.decode_queue,
-            snapshot.decode_queue_peak,
-            stats.render_queue_peak,
-            stats.render_frame_copies,
-            stats.render_buffer_reused,
-            stats.render_buffer_generation,
-            stats.nv12_y_stride,
-            stats.nv12_uv_stride,
-            stats.nv12_uv_offset,
-            stats.nv12_allocated_height,
-            stats.nv12_buffer_len,
-            stats.expected_tight_len,
-            stats.decoder_used_2d_buffer,
-            stats.frames_decoded.saturating_sub(previous_decoded) as f64 / elapsed_sec,
-            stats.frames_rendered.saturating_sub(previous_rendered) as f64 / elapsed_sec,
-            snapshot
-                .reassembly
-                .bytes_received
-                .saturating_sub(previous_network.bytes_received) as f64
-                * 8.0
-                / elapsed_sec
-                / 1_000_000.0,
-            optional_u64_json(snapshot.reassembly.last_frame_id),
-            optional_u64_json(decoder_last_keyframe_id.or(snapshot.last_keyframe_id)),
-            decoder_waiting_keyframe || snapshot.waiting_keyframe,
-            snapshot.inflight_frames,
-            snapshot.completed_waiting,
-            average(stats.decode_ms_total, stats.frames_decoded),
-            average(stats.render_ms_total, stats.frames_rendered),
-            dimensions.width,
-            dimensions.height,
-            stats.color_spec.json_fragment(),
-            stats.decoder_color_metadata.json_fragment("decoder_output")
+            r#"{{"type":"NATIVE_SCREEN_STARTED","role":"receiver","mode":"screen-recv","bind":"{}","port":{},"strict_decode_order":{},"title":"{}"}}"#,
+            json_escape(&config.bind),
+            config.port,
+            config.strict_decode_order,
+            json_escape(&config.title)
         );
         io::stdout().flush().ok();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn print_done(
+        config: &H264RecvViewConfig,
+        snapshot: NetworkSnapshot,
+        stats: &ViewerStats,
+        dimensions: VideoDimensions,
+        decoder_last_keyframe_id: Option<u64>,
+        decoder_waiting_keyframe: bool,
+        closed_by_user: bool,
+        network_error: bool,
+        duration_sec: f64,
+    ) {
+        match config.mode {
+            H264RecvViewMode::Probe => {
+                println!(
+                    r#"{{"type":"H264_RECV_VIEW_DONE","mode":"h264_recv_view","strict_decode_order":{},"session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_decoded":{},"frames_rendered":{},"frames_render_skipped":{},"frames_decoded_not_rendered":{},"frames_incomplete_expired":{},"frames_predecode_dropped":{},"frames_queue_dropped":{},"frames_waiting_keyframe_dropped":{},"keyframe_recovery_count":{},"decoder_errors":{},"decoder_resets":{},"decode_queue_peak":{},"render_queue_peak":{},"render_frame_copies":{},"render_buffer_reused":{},"render_buffer_generation":{},"nv12_y_stride":{},"nv12_uv_stride":{},"nv12_uv_offset":{},"nv12_allocated_height":{},"nv12_buffer_len":{},"expected_tight_len":{},"decoder_used_2d_buffer":{},"last_keyframe_id":{},"waiting_keyframe":{},"decode_ms_avg":{:.3},"render_ms_avg":{:.3},"width":{},"height":{},"last_frame_id":{},"closed_by_user":{},"stopped_by_console":{},"duration_sec":{:.3},{},{}}}"#,
+                    config.strict_decode_order,
+                    optional_u64_json(snapshot.session_id),
+                    snapshot.reassembly.packets_received,
+                    snapshot.reassembly.packets_invalid,
+                    snapshot.reassembly.packets_lost_estimate,
+                    snapshot.reassembly.frames_complete,
+                    stats.frames_decoded,
+                    stats.frames_rendered,
+                    stats.frames_render_skipped,
+                    stats.frames_decoded_not_rendered,
+                    snapshot.reassembly.frames_incomplete_expired,
+                    snapshot.frames_predecode_dropped + stats.frames_predecode_dropped,
+                    snapshot.frames_predecode_dropped + stats.frames_predecode_dropped,
+                    snapshot.frames_waiting_keyframe_dropped
+                        + stats.frames_waiting_keyframe_dropped,
+                    snapshot.keyframe_recovery_count + stats.keyframe_recovery_count,
+                    stats.decoder_errors,
+                    stats.decoder_resets,
+                    snapshot.decode_queue_peak,
+                    stats.render_queue_peak,
+                    stats.render_frame_copies,
+                    stats.render_buffer_reused,
+                    stats.render_buffer_generation,
+                    stats.nv12_y_stride,
+                    stats.nv12_uv_stride,
+                    stats.nv12_uv_offset,
+                    stats.nv12_allocated_height,
+                    stats.nv12_buffer_len,
+                    stats.expected_tight_len,
+                    stats.decoder_used_2d_buffer,
+                    optional_u64_json(decoder_last_keyframe_id.or(snapshot.last_keyframe_id)),
+                    decoder_waiting_keyframe || snapshot.waiting_keyframe,
+                    average(stats.decode_ms_total, stats.frames_decoded),
+                    average(stats.render_ms_total, stats.frames_rendered),
+                    dimensions.width,
+                    dimensions.height,
+                    optional_u64_json(snapshot.reassembly.last_frame_id),
+                    closed_by_user,
+                    STOP_REQUESTED.load(Ordering::SeqCst),
+                    duration_sec,
+                    stats.color_spec.json_fragment(),
+                    stats.decoder_color_metadata.json_fragment("decoder_output")
+                );
+            }
+            H264RecvViewMode::Screen => {
+                println!(
+                    r#"{{"type":"NATIVE_SCREEN_STOPPED","role":"receiver","mode":"screen-recv","reason":"{}","bind":"{}","port":{},"frames_complete":{},"frames_decoded":{},"frames_rendered":{},"packets_received":{},"packets_lost_estimate":{},"decoder_errors":{},"decoder_resets":{},"duration_sec":{:.3},"width":{},"height":{},"last_frame_id":{},{},{}}}"#,
+                    stop_reason(closed_by_user, network_error, config.duration_sec),
+                    json_escape(&config.bind),
+                    config.port,
+                    snapshot.reassembly.frames_complete,
+                    stats.frames_decoded,
+                    stats.frames_rendered,
+                    snapshot.reassembly.packets_received,
+                    snapshot.reassembly.packets_lost_estimate,
+                    stats.decoder_errors,
+                    stats.decoder_resets,
+                    duration_sec,
+                    dimensions.width,
+                    dimensions.height,
+                    optional_u64_json(snapshot.reassembly.last_frame_id),
+                    stats.color_spec.json_fragment(),
+                    stats.decoder_color_metadata.json_fragment("decoder_output")
+                );
+            }
+        }
     }
 
     fn network_snapshot(state: &Arc<Mutex<SharedNetworkState>>) -> NetworkSnapshot {
@@ -863,6 +974,57 @@ mod platform {
 
     fn optional_u64_json(value: Option<u64>) -> String {
         value.map_or_else(|| "null".to_string(), |value| value.to_string())
+    }
+
+    fn duration_elapsed(started_at: Instant, duration_sec: Option<u64>) -> bool {
+        duration_sec
+            .map(|seconds| started_at.elapsed() >= Duration::from_secs(seconds))
+            .unwrap_or(false)
+    }
+
+    fn optional_duration_text(duration_sec: Option<u64>) -> String {
+        duration_sec.map_or_else(|| "unlimited".to_string(), |seconds| seconds.to_string())
+    }
+
+    fn json_escape(text: &str) -> String {
+        text.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\r', "\\r")
+            .replace('\n', "\\n")
+    }
+
+    fn stop_reason(
+        closed_by_user: bool,
+        network_error: bool,
+        duration_sec: Option<u64>,
+    ) -> &'static str {
+        if closed_by_user {
+            "window_closed"
+        } else if STOP_REQUESTED.load(Ordering::SeqCst) {
+            "ctrl_c"
+        } else if duration_sec.is_some() && !network_error {
+            "duration"
+        } else {
+            "stopped"
+        }
+    }
+
+    fn human_stop_reason(
+        closed_by_user: bool,
+        network_error: bool,
+        duration_sec: Option<u64>,
+    ) -> &'static str {
+        if closed_by_user {
+            "window-closed"
+        } else if STOP_REQUESTED.load(Ordering::SeqCst) {
+            "console-control"
+        } else if duration_sec.is_some() && !network_error {
+            "duration-complete"
+        } else if network_error {
+            "network-error"
+        } else {
+            "stopped"
+        }
     }
 
     pub fn run_self_test() -> Result<(), String> {

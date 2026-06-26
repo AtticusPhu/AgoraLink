@@ -1,6 +1,6 @@
 #[derive(Debug)]
 pub struct CaptureEncodeConfig {
-    pub duration_sec: u64,
+    pub duration_sec: Option<u64>,
     pub target_fps: u32,
     pub bitrate_mbps: f64,
     pub out_width: u32,
@@ -60,6 +60,17 @@ mod platform {
     }
 
     #[derive(Clone, Copy, Debug)]
+    pub struct CapturePipelineStarted {
+        pub target_fps: u32,
+        pub bitrate_mbps: f64,
+        pub width: u32,
+        pub height: u32,
+        pub color_spec: ColorSpec,
+        pub encoder_input_color_metadata: MediaColorMetadata,
+        pub encoder_output_color_metadata: MediaColorMetadata,
+    }
+
+    #[derive(Clone, Copy, Debug)]
     pub struct CapturePipelineDone {
         pub capture_raw_frames: u64,
         pub capture_latest_updates: u64,
@@ -87,6 +98,10 @@ mod platform {
     }
 
     pub trait CaptureEncodeObserver {
+        fn on_started(&mut self, _started: &CapturePipelineStarted) -> Result<(), String> {
+            Ok(())
+        }
+
         fn on_sample(&mut self, sample: EncodedSample) -> Result<(), String>;
         fn on_stats(&mut self, stats: &CapturePipelineStats) -> Result<(), String>;
     }
@@ -262,7 +277,7 @@ mod platform {
         let mut have_nv12 = false;
 
         eprintln!(
-            "capture-encode-probe target=primary-monitor source={}x{} output={}x{} input={} encode=NV12 encoder=\"{}\" target_fps={} bitrate_mbps={} color_matrix={} range={} d3d_driver={} output_buffer={} profile_main={} encoder_input_metadata={:?} encoder_output_metadata={:?}",
+            "capture-encode target=primary-monitor source={}x{} output={}x{} input={} encode=NV12 encoder=\"{}\" target_fps={} bitrate_mbps={} color_matrix={} range={} d3d_driver={} output_buffer={} profile_main={} encoder_input_metadata={:?} encoder_output_metadata={:?} duration_sec={}",
             capture_info.width,
             capture_info.height,
             config.out_width,
@@ -277,10 +292,20 @@ mod platform {
             encoder.output_buffer_size(),
             encoder.profile_main(),
             encoder.input_color_metadata(),
-            encoder.output_color_metadata()
+            encoder.output_color_metadata(),
+            optional_duration_text(config.duration_sec)
         );
+        observer.on_started(&CapturePipelineStarted {
+            target_fps: config.target_fps,
+            bitrate_mbps: config.bitrate_mbps,
+            width: config.out_width,
+            height: config.out_height,
+            color_spec: config.color_spec,
+            encoder_input_color_metadata: encoder.input_color_metadata(),
+            encoder_output_color_metadata: encoder.output_color_metadata(),
+        })?;
 
-        while started_at.elapsed() < Duration::from_secs(config.duration_sec)
+        while !duration_elapsed(started_at, config.duration_sec)
             && !STOP_REQUESTED.load(Ordering::SeqCst)
         {
             sleep_until(next_tick);
@@ -455,8 +480,10 @@ mod platform {
     }
 
     fn validate_stream_config(config: &CaptureEncodeConfig) -> Result<(), String> {
-        if config.duration_sec == 0 || config.target_fps == 0 {
-            return Err("duration-sec and target-fps must be greater than zero".to_string());
+        if config.duration_sec == Some(0) || config.target_fps == 0 {
+            return Err(
+                "duration-sec, when provided, and target-fps must be greater than zero".to_string(),
+            );
         }
         if !config.bitrate_mbps.is_finite() || config.bitrate_mbps <= 0.0 {
             return Err("bitrate-mbps must be greater than zero".to_string());
@@ -469,6 +496,16 @@ mod platform {
             return Err("output width and height must be non-zero even values".to_string());
         }
         Ok(())
+    }
+
+    fn duration_elapsed(started_at: Instant, duration_sec: Option<u64>) -> bool {
+        duration_sec
+            .map(|seconds| started_at.elapsed() >= Duration::from_secs(seconds))
+            .unwrap_or(false)
+    }
+
+    fn optional_duration_text(duration_sec: Option<u64>) -> String {
+        duration_sec.map_or_else(|| "unlimited".to_string(), |seconds| seconds.to_string())
     }
 
     fn sleep_until(target: Instant) {
@@ -510,7 +547,8 @@ mod platform {
 
 #[cfg(windows)]
 pub use platform::{
-    run, run_with_observer, CaptureEncodeObserver, CapturePipelineDone, CapturePipelineStats,
+    run, run_with_observer, CaptureEncodeObserver, CapturePipelineDone, CapturePipelineStarted,
+    CapturePipelineStats,
 };
 
 #[cfg(not(windows))]

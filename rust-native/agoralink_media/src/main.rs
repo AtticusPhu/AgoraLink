@@ -150,6 +150,8 @@ enum Command {
     H264SendProbe(h264_send_probe::H264SendConfig),
     H264RecvDump(h264_recv_dump::H264RecvConfig),
     H264RecvView(h264_recv_view::H264RecvViewConfig),
+    ScreenSend(h264_send_probe::H264SendConfig),
+    ScreenRecv(h264_recv_view::H264RecvViewConfig),
     H264FileViewer(h264_file_viewer::H264FileViewerConfig),
     ColorTestPattern(color_test_pattern::ColorTestPatternConfig),
     Help,
@@ -333,6 +335,20 @@ fn main() {
                 process::exit(1);
             }
         }
+        Ok(Command::ScreenSend(config)) => {
+            if let Err(err) = h264_send_probe::run(config) {
+                print_native_screen_error("sender", "screen-send", &err);
+                eprintln!("screen-send error: {err}");
+                process::exit(1);
+            }
+        }
+        Ok(Command::ScreenRecv(config)) => {
+            if let Err(err) = h264_recv_view::run(config) {
+                print_native_screen_error("receiver", "screen-recv", &err);
+                eprintln!("screen-recv error: {err}");
+                process::exit(1);
+            }
+        }
         Ok(Command::H264FileViewer(config)) => {
             if let Err(err) = h264_file_viewer::run(config) {
                 eprintln!("h264-file-viewer error: {err}");
@@ -386,6 +402,8 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         "h264-send-probe" => parse_h264_send_probe_args(&args[1..]),
         "h264-recv-dump" => parse_h264_recv_dump_args(&args[1..]),
         "h264-recv-view" => parse_h264_recv_view_args(&args[1..]),
+        "screen-send" => parse_screen_send_args(&args[1..]),
+        "screen-recv" => parse_screen_recv_args(&args[1..]),
         "h264-file-viewer" => parse_h264_file_viewer_args(&args[1..]),
         "color-test-pattern" => parse_color_test_pattern_args(&args[1..]),
         other => Err(format!("unknown command: {other}")),
@@ -604,7 +622,7 @@ fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
 
     Ok(Command::CaptureEncodeProbe(
         capture_encode_probe::CaptureEncodeConfig {
-            duration_sec,
+            duration_sec: Some(duration_sec),
             target_fps,
             bitrate_mbps,
             out_width,
@@ -672,12 +690,13 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
     Ok(Command::H264SendProbe(h264_send_probe::H264SendConfig {
         host,
         port,
-        duration_sec,
+        duration_sec: Some(duration_sec),
         target_fps,
         bitrate_mbps,
         out_width,
         out_height,
         color_spec,
+        mode: h264_send_probe::H264SendMode::Probe,
     }))
 }
 
@@ -902,6 +921,7 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
     Ok(Command::H264RecvView(h264_recv_view::H264RecvViewConfig {
         bind,
         port: port.ok_or_else(|| "h264-recv-view requires --port <port>".to_string())?,
+        duration_sec: None,
         frame_timeout_ms,
         max_inflight_frames,
         max_decode_queue,
@@ -910,6 +930,199 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
         debug_dump_limit,
         json_interval_ms,
         title,
+        mode: h264_recv_view::H264RecvViewMode::Probe,
+    }))
+}
+
+fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
+    let mut host = None;
+    let mut port = None;
+    let mut duration_sec = None;
+    let mut target_fps = 30u32;
+    let mut bitrate_mbps = 4.0f64;
+    let mut out_width = 1280u32;
+    let mut out_height = 720u32;
+    let mut color_spec = color_spec::ColorSpec::default();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" => {
+                i += 1;
+                host = Some(required_value(args, i, "--host")?.to_string());
+            }
+            "--port" => {
+                i += 1;
+                port = Some(parse_port(required_value(args, i, "--port")?)?);
+            }
+            "--duration-sec" => {
+                i += 1;
+                duration_sec = Some(parse_duration_sec(required_value(
+                    args,
+                    i,
+                    "--duration-sec",
+                )?)?);
+            }
+            "--fps" | "--target-fps" => {
+                i += 1;
+                target_fps = parse_fps(required_value(args, i, args[i - 1].as_str())?)?;
+            }
+            "--bitrate-mbps" => {
+                i += 1;
+                bitrate_mbps = parse_bitrate(required_value(args, i, "--bitrate-mbps")?)?;
+            }
+            "--width" | "--out-width" => {
+                i += 1;
+                out_width =
+                    parse_dimension(required_value(args, i, args[i - 1].as_str())?, "width")?;
+            }
+            "--height" | "--out-height" => {
+                i += 1;
+                out_height =
+                    parse_dimension(required_value(args, i, args[i - 1].as_str())?, "height")?;
+            }
+            "--color-matrix" => {
+                i += 1;
+                color_spec = color_spec::ColorSpec::with_matrix(color_spec::ColorMatrix::parse(
+                    required_value(args, i, "--color-matrix")?,
+                )?);
+            }
+            "--payload-size" => {
+                i += 1;
+                parse_screen_payload_size(required_value(args, i, "--payload-size")?)?;
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown screen-send argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::ScreenSend(h264_send_probe::H264SendConfig {
+        host: host.ok_or_else(|| "screen-send requires --host <ip>".to_string())?,
+        port: port.ok_or_else(|| "screen-send requires --port <port>".to_string())?,
+        duration_sec,
+        target_fps,
+        bitrate_mbps,
+        out_width,
+        out_height,
+        color_spec,
+        mode: h264_send_probe::H264SendMode::Screen,
+    }))
+}
+
+fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
+    let mut bind = "0.0.0.0".to_string();
+    let mut port = None;
+    let mut duration_sec = None;
+    let mut frame_timeout_ms = 300u64;
+    let mut max_inflight_frames = 120usize;
+    let mut max_decode_queue = 30usize;
+    let mut strict_decode_order = true;
+    let mut debug_dump_frames = None;
+    let mut debug_dump_limit = 10usize;
+    let mut json_interval_ms = 1000u64;
+    let mut title = "AgoraLink Native Viewer".to_string();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bind" => {
+                i += 1;
+                bind = required_value(args, i, "--bind")?.to_string();
+            }
+            "--port" => {
+                i += 1;
+                port = Some(parse_port(required_value(args, i, "--port")?)?);
+            }
+            "--duration-sec" => {
+                i += 1;
+                duration_sec = Some(parse_duration_sec(required_value(
+                    args,
+                    i,
+                    "--duration-sec",
+                )?)?);
+            }
+            "--frame-timeout-ms" => {
+                i += 1;
+                frame_timeout_ms = parse_milliseconds(
+                    required_value(args, i, "--frame-timeout-ms")?,
+                    "frame-timeout-ms",
+                    1,
+                    60_000,
+                )?;
+            }
+            "--max-inflight-frames" => {
+                i += 1;
+                max_inflight_frames = parse_count(
+                    required_value(args, i, "--max-inflight-frames")?,
+                    "max-inflight-frames",
+                    1,
+                    10_000,
+                )?;
+            }
+            "--max-decode-queue" => {
+                i += 1;
+                max_decode_queue = parse_count(
+                    required_value(args, i, "--max-decode-queue")?,
+                    "max-decode-queue",
+                    1,
+                    1000,
+                )?;
+            }
+            "--strict-decode-order" => {
+                i += 1;
+                strict_decode_order =
+                    parse_bool(required_value(args, i, "--strict-decode-order")?)?;
+            }
+            "--debug-dump-frames" => {
+                i += 1;
+                debug_dump_frames =
+                    Some(required_value(args, i, "--debug-dump-frames")?.to_string());
+            }
+            "--debug-dump-limit" => {
+                i += 1;
+                debug_dump_limit = parse_count(
+                    required_value(args, i, "--debug-dump-limit")?,
+                    "debug-dump-limit",
+                    1,
+                    10_000,
+                )?;
+            }
+            "--json-interval-ms" => {
+                i += 1;
+                json_interval_ms = parse_milliseconds(
+                    required_value(args, i, "--json-interval-ms")?,
+                    "json-interval-ms",
+                    100,
+                    60_000,
+                )?;
+            }
+            "--title" => {
+                i += 1;
+                title = required_value(args, i, "--title")?.to_string();
+                if title.trim().is_empty() {
+                    return Err("title must not be empty".to_string());
+                }
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown screen-recv argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::ScreenRecv(h264_recv_view::H264RecvViewConfig {
+        bind,
+        port: port.ok_or_else(|| "screen-recv requires --port <port>".to_string())?,
+        duration_sec,
+        frame_timeout_ms,
+        max_inflight_frames,
+        max_decode_queue,
+        strict_decode_order,
+        debug_dump_frames,
+        debug_dump_limit,
+        json_interval_ms,
+        title,
+        mode: h264_recv_view::H264RecvViewMode::Screen,
     }))
 }
 
@@ -1013,6 +1226,20 @@ fn parse_dimension(text: &str, name: &str) -> Result<u32, String> {
     Ok(value)
 }
 
+fn parse_screen_payload_size(text: &str) -> Result<usize, String> {
+    let value: usize = text
+        .parse()
+        .map_err(|_| format!("invalid payload-size: {text}"))?;
+    if value == MAX_UDP_PAYLOAD {
+        Ok(value)
+    } else {
+        Err(format!(
+            "screen-send currently supports --payload-size {} only",
+            MAX_UDP_PAYLOAD
+        ))
+    }
+}
+
 fn parse_encoder_choice(text: &str) -> Result<encode_probe::EncoderChoice, String> {
     match text {
         "auto" => Ok(encode_probe::EncoderChoice::Auto),
@@ -1020,6 +1247,16 @@ fn parse_encoder_choice(text: &str) -> Result<encode_probe::EncoderChoice, Strin
         "hardware" => Ok(encode_probe::EncoderChoice::Hardware),
         _ => Err("encoder must be auto, software, or hardware".to_string()),
     }
+}
+
+fn print_native_screen_error(role: &str, mode: &str, error: &str) {
+    println!(
+        r#"{{"type":"NATIVE_SCREEN_ERROR","role":"{}","mode":"{}","error":"{}"}}"#,
+        json_escape(role),
+        json_escape(mode),
+        json_escape(error)
+    );
+    io::stdout().flush().ok();
 }
 
 fn print_help() {
@@ -1036,6 +1273,8 @@ Usage:\n\
   agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels> [--color-matrix bt601|bt709]\n\
   agoralink_media h264-recv-dump --bind <ip> --port <port> --output <path> [--idle-timeout-sec <seconds>]\n\
   agoralink_media h264-recv-view --bind <ip> --port <port> [--frame-timeout-ms <ms>] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--debug-dump-frames <dir>] [--debug-dump-limit <n>] [--json-interval-ms <ms>] [--title <text>]\n\
+  agoralink_media screen-send --host <ip> --port <port> [--width <pixels>] [--height <pixels>] [--fps <fps>] [--bitrate-mbps <mbps>] [--duration-sec <seconds>] [--color-matrix bt601|bt709] [--payload-size 1200]\n\
+  agoralink_media screen-recv --bind <ip> --port <port> [--duration-sec <seconds>] [--frame-timeout-ms <ms>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--json-interval-ms <ms>] [--title <text>]\n\
   agoralink_media h264-file-viewer --input <path>\n\n\
   agoralink_media color-test-pattern --output <path> --width <pixels> --height <pixels> --duration-sec <seconds> [--fps <fps>] [--bitrate-mbps <mbps>] [--color-matrix bt601|bt709]\n\n\
 Defaults:\n\
@@ -1047,6 +1286,8 @@ Defaults:\n\
   h264-send-probe: --host 127.0.0.1 --port 50130 --duration-sec 10 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --color-matrix bt709\n\
   h264-recv-dump: --bind 0.0.0.0 --port 50130 --output received_capture.h264 --idle-timeout-sec 3\n\
   h264-recv-view: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --debug-dump-limit 10 --json-interval-ms 1000 --title \"AgoraLink Native Viewer\"\n\
+  screen-send: --host required --port required --width 1280 --height 720 --fps 30 --bitrate-mbps 4 --color-matrix bt709 --payload-size 1200 --duration-sec unlimited\n\
+  screen-recv: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --json-interval-ms 1000 --title \"AgoraLink Native Viewer\" --duration-sec unlimited\n\
   h264-file-viewer: --input received_capture_lan.h264\n\
   color-test-pattern: --output color_test_1080p.h264 --width 1920 --height 1080 --fps 30 --duration-sec 3 --bitrate-mbps 8 --color-matrix bt709"
     );
