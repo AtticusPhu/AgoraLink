@@ -6,6 +6,7 @@ pub struct CaptureEncodeConfig {
     pub out_width: u32,
     pub out_height: u32,
     pub output: String,
+    pub color_spec: crate::color_spec::ColorSpec,
 }
 
 #[cfg(windows)]
@@ -23,6 +24,7 @@ mod platform {
 
     use super::CaptureEncodeConfig;
     use crate::bgra_to_nv12;
+    use crate::color_spec::{ColorSpec, MediaColorMetadata};
     use crate::wgc_latest_capture::{LatestCapture, LatestCaptureStats};
     use crate::wmf_h264_encoder::{EncodedSample, EncoderStats, WmfH264Encoder, ENCODER_NAME};
 
@@ -52,6 +54,9 @@ mod platform {
         pub copy_ms_avg: f64,
         pub convert_ms_avg: f64,
         pub encode_ms_avg: f64,
+        pub color_spec: ColorSpec,
+        pub encoder_input_color_metadata: MediaColorMetadata,
+        pub encoder_output_color_metadata: MediaColorMetadata,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -76,6 +81,9 @@ mod platform {
         pub convert_ms_avg: f64,
         pub encode_ms_avg: f64,
         pub stopped_by_console: bool,
+        pub color_spec: ColorSpec,
+        pub encoder_input_color_metadata: MediaColorMetadata,
+        pub encoder_output_color_metadata: MediaColorMetadata,
     }
 
     pub trait CaptureEncodeObserver {
@@ -107,7 +115,7 @@ mod platform {
 
         fn on_stats(&mut self, stats: &CapturePipelineStats) -> Result<(), String> {
             println!(
-                r#"{{"type":"CAPTURE_ENCODE_STATS","mode":"capture_encode_probe","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"mbps":{:.3},"width":{},"height":{},"format_in":"{}","format_encode":"NV12","copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3}}}"#,
+                r#"{{"type":"CAPTURE_ENCODE_STATS","mode":"capture_encode_probe","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"mbps":{:.3},"width":{},"height":{},"format_in":"{}","format_encode":"NV12","copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},{},{},{}}}"#,
                 stats.capture_raw_frames,
                 stats.capture_latest_updates,
                 stats.capture_callback_skipped,
@@ -129,7 +137,14 @@ mod platform {
                 PIXEL_FORMAT_NAME,
                 stats.copy_ms_avg,
                 stats.convert_ms_avg,
-                stats.encode_ms_avg
+                stats.encode_ms_avg,
+                stats.color_spec.json_fragment(),
+                stats
+                    .encoder_input_color_metadata
+                    .json_fragment("encoder_input"),
+                stats
+                    .encoder_output_color_metadata
+                    .json_fragment("encoder_output")
             );
             io::stdout().flush().ok();
             Ok(())
@@ -176,7 +191,7 @@ mod platform {
             .flush()
             .map_err(|err| format!("flush output failed: {err}"))?;
         println!(
-            r#"{{"type":"CAPTURE_ENCODE_DONE","encoder":"{}","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"keyframes":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"output":"{}"}}"#,
+            r#"{{"type":"CAPTURE_ENCODE_DONE","encoder":"{}","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"keyframes":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"output":"{}",{},{},{}}}"#,
             ENCODER_NAME,
             done.capture_raw_frames,
             done.capture_latest_updates,
@@ -200,7 +215,12 @@ mod platform {
             done.copy_ms_avg,
             done.convert_ms_avg,
             done.encode_ms_avg,
-            json_escape(&config.output)
+            json_escape(&config.output),
+            done.color_spec.json_fragment(),
+            done.encoder_input_color_metadata
+                .json_fragment("encoder_input"),
+            done.encoder_output_color_metadata
+                .json_fragment("encoder_output")
         );
         io::stdout().flush().ok();
         eprintln!(
@@ -222,11 +242,12 @@ mod platform {
         let _console_ctrl = ConsoleCtrlGuard::install()?;
         let capture = LatestCapture::start()?;
         let capture_info = capture.info();
-        let mut encoder = WmfH264Encoder::new_stream(
+        let mut encoder = WmfH264Encoder::new_stream_with_color(
             config.out_width,
             config.out_height,
             config.target_fps,
             config.bitrate_mbps,
+            config.color_spec,
         )?;
         let mut nv12 = vec![0u8; bgra_to_nv12::buffer_size(config.out_width, config.out_height)?];
         let frame_interval = Duration::from_nanos(1_000_000_000u64 / u64::from(config.target_fps));
@@ -241,7 +262,7 @@ mod platform {
         let mut have_nv12 = false;
 
         eprintln!(
-            "capture-encode-probe target=primary-monitor source={}x{} output={}x{} input={} encode=NV12 encoder=\"{}\" target_fps={} bitrate_mbps={} d3d_driver={} output_buffer={} profile_main={}",
+            "capture-encode-probe target=primary-monitor source={}x{} output={}x{} input={} encode=NV12 encoder=\"{}\" target_fps={} bitrate_mbps={} color_matrix={} range={} d3d_driver={} output_buffer={} profile_main={} encoder_input_metadata={:?} encoder_output_metadata={:?}",
             capture_info.width,
             capture_info.height,
             config.out_width,
@@ -250,9 +271,13 @@ mod platform {
             ENCODER_NAME,
             config.target_fps,
             config.bitrate_mbps,
+            config.color_spec.yuv_matrix(),
+            config.color_spec.color_range(),
             capture_info.driver_name,
             encoder.output_buffer_size(),
-            encoder.profile_main()
+            encoder.profile_main(),
+            encoder.input_color_metadata(),
+            encoder.output_color_metadata()
         );
 
         while started_at.elapsed() < Duration::from_secs(config.duration_sec)
@@ -266,7 +291,7 @@ mod platform {
             if let Some(frame) = capture.latest() {
                 if frame.version != last_version {
                     let convert_started = Instant::now();
-                    bgra_to_nv12::convert_scaled(
+                    bgra_to_nv12::convert_scaled_with_spec(
                         &frame.bgra,
                         frame.row_pitch,
                         frame.width,
@@ -274,6 +299,7 @@ mod platform {
                         config.out_width,
                         config.out_height,
                         &mut nv12,
+                        config.color_spec,
                     )?;
                     counters.convert_ms_total += convert_started.elapsed().as_secs_f64() * 1000.0;
                     last_version = frame.version;
@@ -312,6 +338,8 @@ mod platform {
                     previous_pipeline,
                     encoder_stats,
                     previous_encoder,
+                    encoder.input_color_metadata(),
+                    encoder.output_color_metadata(),
                     after_work.duration_since(report_at),
                 );
                 observer.on_stats(&stats)?;
@@ -351,6 +379,9 @@ mod platform {
             convert_ms_avg: average_ms(counters.convert_ms_total, counters.frames_encoded),
             encode_ms_avg: average_ms(counters.encode_ms_total, counters.frames_encoded),
             stopped_by_console: STOP_REQUESTED.load(Ordering::SeqCst),
+            color_spec: config.color_spec,
+            encoder_input_color_metadata: encoder.input_color_metadata(),
+            encoder_output_color_metadata: encoder.output_color_metadata(),
         })
     }
 
@@ -363,6 +394,8 @@ mod platform {
         previous_pipeline: PipelineCounters,
         encoder: EncoderStats,
         previous_encoder: EncoderStats,
+        encoder_input_color_metadata: MediaColorMetadata,
+        encoder_output_color_metadata: MediaColorMetadata,
         elapsed: Duration,
     ) -> CapturePipelineStats {
         let elapsed_sec = elapsed.as_secs_f64().max(0.001);
@@ -397,6 +430,9 @@ mod platform {
             copy_ms_avg: average_ms(capture.copy_ms_total, capture.latest_updates),
             convert_ms_avg: average_ms(pipeline.convert_ms_total, pipeline.frames_encoded),
             encode_ms_avg: average_ms(pipeline.encode_ms_total, pipeline.frames_encoded),
+            color_spec: config.color_spec,
+            encoder_input_color_metadata,
+            encoder_output_color_metadata,
         }
     }
 

@@ -4,19 +4,23 @@ mod platform {
     use std::ptr;
     use std::slice;
 
-    use windows::core::{IUnknown, Result as WindowsResult, GUID};
+    use crate::color_spec::{ColorMatrix, ColorSpec, MediaColorMetadata};
+    use windows::core::{IUnknown, Interface, Result as WindowsResult, GUID};
     use windows::Win32::Media::MediaFoundation::{
-        IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MFCreateMediaType,
-        MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFShutdown, MFStartup,
-        MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL,
-        MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-        MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-        MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-        MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_INFO,
+        IMF2DBuffer2, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform,
+        MF2DBuffer_LockFlags_Read, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+        MFMediaType_Video, MFNominalRange_16_235, MFShutdown, MFStartup, MFVideoFormat_H264,
+        MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709,
+        MFVideoPrimaries_SMPTE170M, MFVideoTransFunc_709, MFVideoTransferMatrix_BT601,
+        MFVideoTransferMatrix_BT709, MFSTARTUP_FULL, MFT_MESSAGE_COMMAND_DRAIN,
+        MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+        MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+        MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_INFO,
         MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MF_E_NOTACCEPTING, MF_E_NO_MORE_TYPES,
-        MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_FRAME_RATE,
-        MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
-        MF_MT_SUBTYPE, MF_VERSION,
+        MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_DEFAULT_STRIDE,
+        MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+        MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
+        MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_VERSION,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -29,6 +33,20 @@ mod platform {
 
     pub struct DecodedFrame {
         pub nv12: Vec<u8>,
+        pub y_stride: usize,
+        pub uv_stride: usize,
+        pub uv_offset: usize,
+        pub allocated_height: usize,
+        pub source_buffer_len: usize,
+        pub expected_tight_len: usize,
+        pub used_2d_buffer: bool,
+        pub color_spec: ColorSpec,
+        pub color_metadata: MediaColorMetadata,
+    }
+
+    struct OutputTypeInfo {
+        stride: usize,
+        metadata: MediaColorMetadata,
     }
 
     struct ComGuard;
@@ -74,6 +92,9 @@ mod platform {
         transform: IMFTransform,
         output_info: MFT_OUTPUT_STREAM_INFO,
         output_buffer_size: u32,
+        output_stride: usize,
+        output_color_metadata: MediaColorMetadata,
+        fallback_color: ColorSpec,
         width: u32,
         height: u32,
         fps: u32,
@@ -84,6 +105,15 @@ mod platform {
 
     impl WmfH264Decoder {
         pub fn new(width: u32, height: u32, fps: u32) -> Result<Self, String> {
+            Self::new_with_color(width, height, fps, ColorSpec::default())
+        }
+
+        pub fn new_with_color(
+            width: u32,
+            height: u32,
+            fps: u32,
+            fallback_color: ColorSpec,
+        ) -> Result<Self, String> {
             if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
                 return Err("decoder width and height must be non-zero even values".to_string());
             }
@@ -94,9 +124,10 @@ mod platform {
             let mf = MediaFoundationGuard::startup()?;
             let transform = create_decoder()?;
             let input_type = create_video_type(width, height, fps, MFVideoFormat_H264)?;
+            apply_color_metadata(&input_type, fallback_color);
             unsafe { transform.SetInputType(0, &input_type, 0) }
                 .map_err(|err| format!("SetInputType H.264 failed: {err}"))?;
-            select_nv12_output_type(&transform)?;
+            let output_type = select_nv12_output_type(&transform, width, fallback_color)?;
             let output_info = unsafe { transform.GetOutputStreamInfo(0) }
                 .map_err(|err| format!("GetOutputStreamInfo failed: {err}"))?;
             let frame_size = nv12_size(width, height)?;
@@ -115,6 +146,9 @@ mod platform {
                 transform,
                 output_info,
                 output_buffer_size,
+                output_stride: output_type.stride,
+                output_color_metadata: output_type.metadata,
+                fallback_color,
                 width,
                 height,
                 fps,
@@ -187,6 +221,9 @@ mod platform {
                     self.output_buffer_size,
                     self.width,
                     self.height,
+                    self.output_stride,
+                    self.output_color_metadata,
+                    self.fallback_color,
                 )? {
                     OutputResult::Produced(frame) => {
                         frames.push(frame);
@@ -194,7 +231,13 @@ mod platform {
                     }
                     OutputResult::NeedMoreInput => return Ok(produced_any),
                     OutputResult::StreamChanged => {
-                        select_nv12_output_type(&self.transform)?;
+                        let output_type = select_nv12_output_type(
+                            &self.transform,
+                            self.width,
+                            self.fallback_color,
+                        )?;
+                        self.output_stride = output_type.stride;
+                        self.output_color_metadata = output_type.metadata;
                         self.output_info = unsafe { self.transform.GetOutputStreamInfo(0) }
                             .map_err(|err| {
                                 format!("GetOutputStreamInfo after stream change failed: {err}")
@@ -255,7 +298,52 @@ mod platform {
         Ok(media_type)
     }
 
-    fn select_nv12_output_type(transform: &IMFTransform) -> Result<(), String> {
+    fn apply_color_metadata(media_type: &IMFMediaType, color: ColorSpec) {
+        let primaries = match color.matrix {
+            ColorMatrix::Bt601 => MFVideoPrimaries_SMPTE170M.0 as u32,
+            ColorMatrix::Bt709 => MFVideoPrimaries_BT709.0 as u32,
+        };
+        let matrix = match color.matrix {
+            ColorMatrix::Bt601 => MFVideoTransferMatrix_BT601.0 as u32,
+            ColorMatrix::Bt709 => MFVideoTransferMatrix_BT709.0 as u32,
+        };
+        for (attribute, value, name) in [
+            (&MF_MT_VIDEO_PRIMARIES, primaries, "video primaries"),
+            (
+                &MF_MT_TRANSFER_FUNCTION,
+                MFVideoTransFunc_709.0 as u32,
+                "transfer function",
+            ),
+            (&MF_MT_YUV_MATRIX, matrix, "YUV matrix"),
+            (
+                &MF_MT_VIDEO_NOMINAL_RANGE,
+                MFNominalRange_16_235.0 as u32,
+                "nominal range",
+            ),
+        ] {
+            if let Err(err) = unsafe { media_type.SetUINT32(attribute, value) } {
+                eprintln!("decoder media type could not set {name}: {err}");
+            }
+        }
+    }
+
+    fn read_color_metadata(media_type: &IMFMediaType) -> MediaColorMetadata {
+        MediaColorMetadata {
+            primaries: unsafe { media_type.GetUINT32(&MF_MT_VIDEO_PRIMARIES) }.ok(),
+            transfer: unsafe { media_type.GetUINT32(&MF_MT_TRANSFER_FUNCTION) }.ok(),
+            matrix: unsafe { media_type.GetUINT32(&MF_MT_YUV_MATRIX) }.ok(),
+            nominal_range: unsafe { media_type.GetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE) }.ok(),
+            default_stride: unsafe { media_type.GetUINT32(&MF_MT_DEFAULT_STRIDE) }
+                .ok()
+                .map(|value| value as i32),
+        }
+    }
+
+    fn select_nv12_output_type(
+        transform: &IMFTransform,
+        width: u32,
+        fallback_color: ColorSpec,
+    ) -> Result<OutputTypeInfo, String> {
         let mut index = 0u32;
         let mut available = Vec::new();
         loop {
@@ -268,9 +356,23 @@ mod platform {
                 .map_err(|err| format!("decoder output subtype query failed: {err}"))?;
             available.push(format!("{subtype:?}"));
             if subtype == MFVideoFormat_NV12 {
+                apply_color_metadata(&media_type, fallback_color);
                 unsafe { transform.SetOutputType(0, &media_type, 0) }
                     .map_err(|err| format!("SetOutputType advertised NV12 failed: {err}"))?;
-                return Ok(());
+                let current_type = unsafe { transform.GetOutputCurrentType(0) }
+                    .unwrap_or_else(|_| media_type.clone());
+                let metadata = read_color_metadata(&current_type);
+                let stride = metadata
+                    .default_stride
+                    .map(|value| value.unsigned_abs() as usize)
+                    .or_else(|| {
+                        unsafe { current_type.GetUINT32(&MF_MT_DEFAULT_STRIDE) }
+                            .ok()
+                            .map(|value| (value as i32).unsigned_abs() as usize)
+                    })
+                    .filter(|stride| *stride >= width as usize)
+                    .unwrap_or(width as usize);
+                return Ok(OutputTypeInfo { stride, metadata });
             }
             index += 1;
         }
@@ -328,6 +430,9 @@ mod platform {
         output_buffer_size: u32,
         width: u32,
         height: u32,
+        output_stride: usize,
+        output_color_metadata: MediaColorMetadata,
+        fallback_color: ColorSpec,
     ) -> Result<OutputResult, String> {
         let transform_provides_sample = output_info.dwFlags
             & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32
@@ -357,17 +462,14 @@ mod platform {
             Ok(()) => {
                 let sample = produced_sample
                     .ok_or_else(|| "decoder ProcessOutput returned no sample".to_string())?;
-                let bytes = read_sample_bytes(&sample)?;
-                let expected = nv12_size(width, height)?;
-                if bytes.len() < expected {
-                    return Err(format!(
-                        "decoder NV12 sample too small: expected {expected}, got {}",
-                        bytes.len()
-                    ));
-                }
-                Ok(OutputResult::Produced(DecodedFrame {
-                    nv12: bytes[..expected].to_vec(),
-                }))
+                Ok(OutputResult::Produced(read_nv12_sample(
+                    &sample,
+                    width,
+                    height,
+                    output_stride,
+                    output_color_metadata,
+                    fallback_color,
+                )?))
             }
             Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
                 Ok(OutputResult::NeedMoreInput)
@@ -405,6 +507,190 @@ mod platform {
         unsafe { buffer.Unlock() }
             .map_err(|err| format!("decoder output buffer Unlock failed: {err}"))?;
         Ok(bytes)
+    }
+
+    fn read_nv12_sample(
+        sample: &IMFSample,
+        width: u32,
+        height: u32,
+        configured_stride: usize,
+        color_metadata: MediaColorMetadata,
+        fallback_color: ColorSpec,
+    ) -> Result<DecodedFrame, String> {
+        let expected_tight_len = nv12_size(width, height)?;
+        if let Ok(buffer) = unsafe { sample.GetBufferByIndex(0) } {
+            if let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer2>() {
+                if let Some(frame) = try_read_2d_nv12(
+                    &buffer_2d,
+                    width,
+                    height,
+                    expected_tight_len,
+                    color_metadata,
+                    fallback_color,
+                )? {
+                    return Ok(frame);
+                }
+            }
+        }
+
+        let bytes = read_sample_bytes(sample)?;
+        let source_buffer_len = bytes.len();
+        let stride = resolve_contiguous_stride(
+            source_buffer_len,
+            width as usize,
+            height as usize,
+            configured_stride,
+        )?;
+        let allocated_height = resolve_allocated_height(source_buffer_len, stride, height as usize);
+        let uv_offset = stride
+            .checked_mul(allocated_height)
+            .ok_or_else(|| "NV12 UV offset overflow".to_string())?;
+        let layout_len = nv12_layout_len(uv_offset, stride, height as usize)?;
+        Ok(DecodedFrame {
+            nv12: bytes[..layout_len].to_vec(),
+            y_stride: stride,
+            uv_stride: stride,
+            uv_offset,
+            allocated_height,
+            source_buffer_len,
+            expected_tight_len,
+            used_2d_buffer: false,
+            color_spec: color_metadata.resolved_spec(fallback_color),
+            color_metadata,
+        })
+    }
+
+    fn try_read_2d_nv12(
+        buffer: &IMF2DBuffer2,
+        width: u32,
+        height: u32,
+        expected_tight_len: usize,
+        color_metadata: MediaColorMetadata,
+        fallback_color: ColorSpec,
+    ) -> Result<Option<DecodedFrame>, String> {
+        let mut scanline = ptr::null_mut();
+        let mut pitch = 0i32;
+        let mut buffer_start = ptr::null_mut();
+        let mut buffer_len = 0u32;
+        if unsafe {
+            buffer.Lock2DSize(
+                MF2DBuffer_LockFlags_Read,
+                &mut scanline,
+                &mut pitch,
+                &mut buffer_start,
+                &mut buffer_len,
+            )
+        }
+        .is_err()
+        {
+            return Ok(None);
+        }
+
+        let result = (|| {
+            if scanline.is_null()
+                || buffer_start.is_null()
+                || pitch <= 0
+                || (pitch as usize) < width as usize
+            {
+                return Ok(None);
+            }
+            let stride = pitch as usize;
+            let scanline_offset = unsafe { scanline.offset_from(buffer_start) };
+            if scanline_offset < 0 {
+                return Ok(None);
+            }
+            let available_len = (buffer_len as usize).saturating_sub(scanline_offset as usize);
+            let allocated_height = resolve_allocated_height(available_len, stride, height as usize);
+            let uv_offset = stride
+                .checked_mul(allocated_height)
+                .ok_or_else(|| "NV12 UV offset overflow".to_string())?;
+            let layout_len = nv12_layout_len(uv_offset, stride, height as usize)?;
+            if scanline_offset as usize + layout_len > buffer_len as usize {
+                return Ok(None);
+            }
+            let mut nv12 = vec![0u8; layout_len];
+            unsafe {
+                ptr::copy_nonoverlapping(scanline, nv12.as_mut_ptr(), layout_len);
+            }
+            Ok(Some(DecodedFrame {
+                nv12,
+                y_stride: stride,
+                uv_stride: stride,
+                uv_offset,
+                allocated_height,
+                source_buffer_len: buffer_len as usize,
+                expected_tight_len,
+                used_2d_buffer: true,
+                color_spec: color_metadata.resolved_spec(fallback_color),
+                color_metadata,
+            }))
+        })();
+        let unlock_result = unsafe { buffer.Unlock2D() };
+        result.and_then(|frame| {
+            unlock_result.map_err(|err| format!("decoder output Unlock2D failed: {err}"))?;
+            Ok(frame)
+        })
+    }
+
+    fn resolve_contiguous_stride(
+        buffer_len: usize,
+        width: usize,
+        height: usize,
+        configured_stride: usize,
+    ) -> Result<usize, String> {
+        let tight_uv_offset = width
+            .checked_mul(height)
+            .ok_or_else(|| "NV12 tight UV offset overflow".to_string())?;
+        let tight_len = nv12_layout_len(tight_uv_offset, width, height)?;
+        if buffer_len == tight_len {
+            return Ok(width);
+        }
+        if configured_stride >= width
+            && buffer_len
+                >= nv12_layout_len(
+                    configured_stride
+                        .checked_mul(height)
+                        .ok_or_else(|| "NV12 configured UV offset overflow".to_string())?,
+                    configured_stride,
+                    height,
+                )?
+        {
+            return Ok(configured_stride);
+        }
+        let denominator = height
+            .checked_mul(3)
+            .ok_or_else(|| "NV12 stride inference overflow".to_string())?;
+        let doubled = buffer_len
+            .checked_mul(2)
+            .ok_or_else(|| "NV12 buffer length overflow".to_string())?;
+        if denominator != 0 && doubled % denominator == 0 {
+            let inferred = doubled / denominator;
+            if inferred >= width {
+                return Ok(inferred);
+            }
+        }
+        Err(format!(
+            "cannot determine NV12 stride: width={width}, height={height}, buffer_len={buffer_len}, configured_stride={configured_stride}"
+        ))
+    }
+
+    fn resolve_allocated_height(buffer_len: usize, stride: usize, visible_height: usize) -> usize {
+        let denominator = stride.saturating_mul(3);
+        let doubled = buffer_len.saturating_mul(2);
+        if denominator != 0 && doubled % denominator == 0 {
+            let allocated = doubled / denominator;
+            if allocated >= visible_height && allocated % 2 == 0 {
+                return allocated;
+            }
+        }
+        visible_height
+    }
+
+    fn nv12_layout_len(uv_offset: usize, uv_stride: usize, height: usize) -> Result<usize, String> {
+        uv_stride
+            .checked_mul(height / 2)
+            .and_then(|uv| uv_offset.checked_add(uv))
+            .ok_or_else(|| "NV12 layout size overflow".to_string())
     }
 
     fn nv12_size(width: u32, height: u32) -> Result<usize, String> {

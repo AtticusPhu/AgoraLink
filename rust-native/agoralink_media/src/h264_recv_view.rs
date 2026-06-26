@@ -6,6 +6,8 @@ pub struct H264RecvViewConfig {
     pub max_inflight_frames: usize,
     pub max_decode_queue: usize,
     pub strict_decode_order: bool,
+    pub debug_dump_frames: Option<String>,
+    pub debug_dump_limit: usize,
     pub json_interval_ms: u64,
     pub title: String,
 }
@@ -16,6 +18,7 @@ mod platform {
     use std::io::{self, Write};
     use std::net::UdpSocket;
     use std::os::windows::io::AsRawSocket;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -29,11 +32,12 @@ mod platform {
     };
 
     use super::H264RecvViewConfig;
+    use crate::color_spec::{ColorSpec, MediaColorMetadata};
+    use crate::decoded_frame_renderer::OwnedBgraFrame;
     use crate::h264_annex_b::{dimensions_from_sps, VideoDimensions};
     use crate::h264_reassembly::{
         EncodedFrame, H264Reassembler, ReassemblyConfig, ReassemblyStats,
     };
-    use crate::nv12_to_bgra;
     use crate::win32_gdi_viewer::GdiViewerWindow;
     use crate::wmf_h264_decoder::{WmfH264Decoder, DECODER_NAME};
 
@@ -170,13 +174,52 @@ mod platform {
         decoder_errors: u64,
         decoder_resets: u64,
         render_queue_peak: usize,
+        render_frame_copies: u64,
+        render_buffer_reused: u64,
+        render_buffer_generation: u64,
+        nv12_y_stride: usize,
+        nv12_uv_stride: usize,
+        nv12_uv_offset: usize,
+        nv12_allocated_height: usize,
+        nv12_buffer_len: usize,
+        expected_tight_len: usize,
+        decoder_used_2d_buffer: bool,
+        color_spec: ColorSpec,
+        decoder_color_metadata: MediaColorMetadata,
         decode_ms_total: f64,
         render_ms_total: f64,
     }
 
     struct PendingRender {
         frame_id: u64,
-        nv12: Vec<u8>,
+        frame: OwnedBgraFrame,
+    }
+
+    struct DebugFrameDumper {
+        directory: Option<PathBuf>,
+        limit: usize,
+        dumped: usize,
+    }
+
+    impl DebugFrameDumper {
+        fn new(directory: Option<String>, limit: usize) -> Self {
+            Self {
+                directory: directory.map(PathBuf::from),
+                limit,
+                dumped: 0,
+            }
+        }
+
+        fn maybe_dump(&mut self, frame: &OwnedBgraFrame) -> Result<(), String> {
+            let Some(directory) = self.directory.as_deref() else {
+                return Ok(());
+            };
+            if self.dumped >= self.limit {
+                return Ok(());
+            }
+            self.dumped += 1;
+            frame.dump_raw(directory, self.dumped as u64)
+        }
     }
 
     struct DecodeState {
@@ -186,7 +229,7 @@ mod platform {
         input_index: u64,
         last_keyframe_id: Option<u64>,
         pending_render: Option<PendingRender>,
-        bgra: Vec<u8>,
+        next_render_generation: u64,
     }
 
     impl DecodeState {
@@ -198,7 +241,7 @@ mod platform {
                 input_index: 0,
                 last_keyframe_id: None,
                 pending_render: None,
-                bgra: Vec::new(),
+                next_render_generation: 0,
             }
         }
 
@@ -245,13 +288,15 @@ mod platform {
         )?;
 
         eprintln!(
-            "h264-recv-view bind={}:{} frame_timeout_ms={} max_inflight_frames={} max_decode_queue={} strict_decode_order={} udp_receive_buffer={} decoder=\"{}\" output=NV12 render=GDI title=\"{}\"",
+            "h264-recv-view bind={}:{} frame_timeout_ms={} max_inflight_frames={} max_decode_queue={} strict_decode_order={} debug_dump_frames={:?} debug_dump_limit={} udp_receive_buffer={} decoder=\"{}\" output=NV12 render=GDI title=\"{}\"",
             config.bind,
             config.port,
             config.frame_timeout_ms,
             config.max_inflight_frames,
             config.max_decode_queue,
             config.strict_decode_order,
+            config.debug_dump_frames,
+            config.debug_dump_limit,
             UDP_RECEIVE_BUFFER_BYTES,
             DECODER_NAME,
             config.title
@@ -264,6 +309,8 @@ mod platform {
         let mut previous_rendered = 0u64;
         let mut decode_state = DecodeState::new();
         let mut stats = ViewerStats::default();
+        let mut debug_dumper =
+            DebugFrameDumper::new(config.debug_dump_frames.clone(), config.debug_dump_limit);
         let mut closed_by_user = false;
 
         loop {
@@ -280,7 +327,12 @@ mod platform {
                 |mut queue| queue.items.drain(..).collect::<Vec<_>>(),
             );
             if items.is_empty() {
-                render_latest_decoded(&mut decode_state, &mut window, &mut stats);
+                render_latest_decoded(
+                    &mut decode_state,
+                    &mut window,
+                    &mut debug_dumper,
+                    &mut stats,
+                );
                 thread::sleep(Duration::from_millis(1));
             } else {
                 let mut remaining_frames = items
@@ -300,6 +352,7 @@ mod platform {
                                 !skip_stale_renders || remaining_frames == 0,
                                 &mut decode_state,
                                 &mut window,
+                                &mut debug_dumper,
                                 &mut stats,
                             );
                         }
@@ -344,7 +397,7 @@ mod platform {
             height: 0,
         });
         println!(
-            r#"{{"type":"H264_RECV_VIEW_DONE","mode":"h264_recv_view","strict_decode_order":{},"session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_decoded":{},"frames_rendered":{},"frames_render_skipped":{},"frames_decoded_not_rendered":{},"frames_incomplete_expired":{},"frames_predecode_dropped":{},"frames_queue_dropped":{},"frames_waiting_keyframe_dropped":{},"keyframe_recovery_count":{},"decoder_errors":{},"decoder_resets":{},"decode_queue_peak":{},"render_queue_peak":{},"last_keyframe_id":{},"waiting_keyframe":{},"decode_ms_avg":{:.3},"render_ms_avg":{:.3},"width":{},"height":{},"last_frame_id":{},"closed_by_user":{},"stopped_by_console":{},"duration_sec":{:.3}}}"#,
+            r#"{{"type":"H264_RECV_VIEW_DONE","mode":"h264_recv_view","strict_decode_order":{},"session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_decoded":{},"frames_rendered":{},"frames_render_skipped":{},"frames_decoded_not_rendered":{},"frames_incomplete_expired":{},"frames_predecode_dropped":{},"frames_queue_dropped":{},"frames_waiting_keyframe_dropped":{},"keyframe_recovery_count":{},"decoder_errors":{},"decoder_resets":{},"decode_queue_peak":{},"render_queue_peak":{},"render_frame_copies":{},"render_buffer_reused":{},"render_buffer_generation":{},"nv12_y_stride":{},"nv12_uv_stride":{},"nv12_uv_offset":{},"nv12_allocated_height":{},"nv12_buffer_len":{},"expected_tight_len":{},"decoder_used_2d_buffer":{},"last_keyframe_id":{},"waiting_keyframe":{},"decode_ms_avg":{:.3},"render_ms_avg":{:.3},"width":{},"height":{},"last_frame_id":{},"closed_by_user":{},"stopped_by_console":{},"duration_sec":{:.3},{},{}}}"#,
             config.strict_decode_order,
             optional_u64_json(snapshot.session_id),
             snapshot.reassembly.packets_received,
@@ -364,6 +417,16 @@ mod platform {
             stats.decoder_resets,
             snapshot.decode_queue_peak,
             stats.render_queue_peak,
+            stats.render_frame_copies,
+            stats.render_buffer_reused,
+            stats.render_buffer_generation,
+            stats.nv12_y_stride,
+            stats.nv12_uv_stride,
+            stats.nv12_uv_offset,
+            stats.nv12_allocated_height,
+            stats.nv12_buffer_len,
+            stats.expected_tight_len,
+            stats.decoder_used_2d_buffer,
             optional_u64_json(decode_state.last_keyframe_id.or(snapshot.last_keyframe_id)),
             decode_state.waiting_for_keyframe || snapshot.waiting_keyframe,
             average(stats.decode_ms_total, stats.frames_decoded),
@@ -373,7 +436,9 @@ mod platform {
             optional_u64_json(snapshot.reassembly.last_frame_id),
             closed_by_user,
             STOP_REQUESTED.load(Ordering::SeqCst),
-            started_at.elapsed().as_secs_f64()
+            started_at.elapsed().as_secs_f64(),
+            stats.color_spec.json_fragment(),
+            stats.decoder_color_metadata.json_fragment("decoder_output")
         );
         io::stdout().flush().ok();
         eprintln!(
@@ -534,6 +599,7 @@ mod platform {
         render_output: bool,
         decode_state: &mut DecodeState,
         window: &mut GdiViewerWindow,
+        debug_dumper: &mut DebugFrameDumper,
         stats: &mut ViewerStats,
     ) {
         if frame.is_keyframe() {
@@ -598,18 +664,45 @@ mod platform {
             stats.frames_decoded += decoded.len() as u64;
         }
 
+        let Some(dimensions) = decode_state.dimensions else {
+            return;
+        };
         for decoded_frame in decoded {
+            decode_state.next_render_generation += 1;
+            let owned_frame = match OwnedBgraFrame::from_decoded(
+                &decoded_frame,
+                dimensions.width,
+                dimensions.height,
+                decode_state.next_render_generation,
+            ) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    eprintln!("convert decoded frame {} failed: {err}", frame.frame_id);
+                    continue;
+                }
+            };
+            stats.render_frame_copies += 1;
+            stats.render_buffer_generation = owned_frame.generation;
+            stats.nv12_y_stride = owned_frame.nv12_y_stride;
+            stats.nv12_uv_stride = owned_frame.nv12_uv_stride;
+            stats.nv12_uv_offset = owned_frame.nv12_uv_offset;
+            stats.nv12_allocated_height = owned_frame.nv12_allocated_height;
+            stats.nv12_buffer_len = owned_frame.nv12_buffer_len;
+            stats.expected_tight_len = owned_frame.expected_tight_len;
+            stats.decoder_used_2d_buffer = owned_frame.decoder_used_2d_buffer;
+            stats.color_spec = owned_frame.color_spec;
+            stats.decoder_color_metadata = owned_frame.color_metadata;
             if decode_state.pending_render.is_some() {
                 stats.frames_decoded_not_rendered += 1;
                 stats.frames_render_skipped += 1;
             }
             decode_state.pending_render = Some(PendingRender {
                 frame_id: frame.frame_id,
-                nv12: decoded_frame.nv12,
+                frame: owned_frame,
             });
             stats.render_queue_peak = stats.render_queue_peak.max(1);
             if render_output {
-                render_latest_decoded(decode_state, window, stats);
+                render_latest_decoded(decode_state, window, debug_dumper, stats);
             }
         }
     }
@@ -617,22 +710,16 @@ mod platform {
     fn render_latest_decoded(
         decode_state: &mut DecodeState,
         window: &mut GdiViewerWindow,
+        debug_dumper: &mut DebugFrameDumper,
         stats: &mut ViewerStats,
     ) {
         let Some(pending) = decode_state.pending_render.take() else {
             return;
         };
-        let Some(dimensions) = decode_state.dimensions else {
-            return;
-        };
         let render_started = Instant::now();
-        if let Err(err) = nv12_to_bgra::convert(
-            &pending.nv12,
-            dimensions.width,
-            dimensions.height,
-            &mut decode_state.bgra,
-        )
-        .and_then(|_| window.render_bgra(&decode_state.bgra, dimensions.width, dimensions.height))
+        if let Err(err) = debug_dumper
+            .maybe_dump(&pending.frame)
+            .and_then(|_| pending.frame.render(window))
         {
             eprintln!("render frame {} failed: {err}", pending.frame_id);
             return;
@@ -660,7 +747,7 @@ mod platform {
             height: 0,
         });
         println!(
-            r#"{{"type":"H264_RECV_VIEW_STATS","mode":"h264_recv_view","strict_decode_order":{},"session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_decoded":{},"frames_rendered":{},"frames_render_skipped":{},"frames_decoded_not_rendered":{},"frames_incomplete_expired":{},"frames_predecode_dropped":{},"frames_queue_dropped":{},"frames_waiting_keyframe_dropped":{},"keyframe_recovery_count":{},"decoder_errors":{},"decoder_resets":{},"decode_queue":{},"decode_queue_peak":{},"render_queue_peak":{},"fps_decode":{:.2},"fps_render":{:.2},"mbps":{:.3},"last_frame_id":{},"last_keyframe_id":{},"waiting_keyframe":{},"inflight_frames":{},"completed_waiting":{},"decode_ms_avg":{:.3},"render_ms_avg":{:.3},"width":{},"height":{}}}"#,
+            r#"{{"type":"H264_RECV_VIEW_STATS","mode":"h264_recv_view","strict_decode_order":{},"session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_decoded":{},"frames_rendered":{},"frames_render_skipped":{},"frames_decoded_not_rendered":{},"frames_incomplete_expired":{},"frames_predecode_dropped":{},"frames_queue_dropped":{},"frames_waiting_keyframe_dropped":{},"keyframe_recovery_count":{},"decoder_errors":{},"decoder_resets":{},"decode_queue":{},"decode_queue_peak":{},"render_queue_peak":{},"render_frame_copies":{},"render_buffer_reused":{},"render_buffer_generation":{},"nv12_y_stride":{},"nv12_uv_stride":{},"nv12_uv_offset":{},"nv12_allocated_height":{},"nv12_buffer_len":{},"expected_tight_len":{},"decoder_used_2d_buffer":{},"fps_decode":{:.2},"fps_render":{:.2},"mbps":{:.3},"last_frame_id":{},"last_keyframe_id":{},"waiting_keyframe":{},"inflight_frames":{},"completed_waiting":{},"decode_ms_avg":{:.3},"render_ms_avg":{:.3},"width":{},"height":{},{},{}}}"#,
             strict_decode_order,
             optional_u64_json(snapshot.session_id),
             snapshot.reassembly.packets_received,
@@ -681,6 +768,16 @@ mod platform {
             snapshot.decode_queue,
             snapshot.decode_queue_peak,
             stats.render_queue_peak,
+            stats.render_frame_copies,
+            stats.render_buffer_reused,
+            stats.render_buffer_generation,
+            stats.nv12_y_stride,
+            stats.nv12_uv_stride,
+            stats.nv12_uv_offset,
+            stats.nv12_allocated_height,
+            stats.nv12_buffer_len,
+            stats.expected_tight_len,
+            stats.decoder_used_2d_buffer,
             stats.frames_decoded.saturating_sub(previous_decoded) as f64 / elapsed_sec,
             stats.frames_rendered.saturating_sub(previous_rendered) as f64 / elapsed_sec,
             snapshot
@@ -698,7 +795,9 @@ mod platform {
             average(stats.decode_ms_total, stats.frames_decoded),
             average(stats.render_ms_total, stats.frames_rendered),
             dimensions.width,
-            dimensions.height
+            dimensions.height,
+            stats.color_spec.json_fragment(),
+            stats.decoder_color_metadata.json_fragment("decoder_output")
         );
         io::stdout().flush().ok();
     }
@@ -726,6 +825,16 @@ mod platform {
         }
         if config.title.trim().is_empty() {
             return Err("title must not be empty".to_string());
+        }
+        if config
+            .debug_dump_frames
+            .as_deref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            return Err("debug-dump-frames must not be empty".to_string());
+        }
+        if config.debug_dump_limit == 0 {
+            return Err("debug-dump-limit must be greater than zero".to_string());
         }
         Ok(())
     }

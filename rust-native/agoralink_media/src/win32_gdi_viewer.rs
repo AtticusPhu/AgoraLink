@@ -92,13 +92,26 @@ mod platform {
             true
         }
 
-        pub fn render_bgra(&mut self, bgra: &[u8], width: u32, height: u32) -> Result<(), String> {
+        pub fn render_bgra_with_stride(
+            &mut self,
+            bgra: &[u8],
+            width: u32,
+            height: u32,
+            stride: usize,
+        ) -> Result<(), String> {
             if !self.pump_messages() {
                 return Err("viewer window was closed".to_string());
             }
-            let expected = (width as usize)
+            let expected_stride = (width as usize)
+                .checked_mul(4)
+                .ok_or_else(|| "BGRA stride overflow".to_string())?;
+            if stride != expected_stride {
+                return Err(format!(
+                    "GDI BGRA stride must be width * 4: width={width}, stride={stride}, expected={expected_stride}"
+                ));
+            }
+            let expected = stride
                 .checked_mul(height as usize)
-                .and_then(|pixels| pixels.checked_mul(4))
                 .ok_or_else(|| "BGRA frame size overflow".to_string())?;
             if bgra.len() < expected {
                 return Err(format!(

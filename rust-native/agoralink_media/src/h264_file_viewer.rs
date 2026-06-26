@@ -11,8 +11,9 @@ mod platform {
     use std::time::{Duration, Instant};
 
     use super::H264FileViewerConfig;
+    use crate::color_spec::{ColorSpec, MediaColorMetadata};
+    use crate::decoded_frame_renderer::OwnedBgraFrame;
     use crate::h264_annex_b::{dimensions_from_sps, split_access_units};
-    use crate::nv12_to_bgra;
     use crate::win32_gdi_viewer::GdiViewerWindow;
     use crate::wmf_h264_decoder::{DecodedFrame, WmfH264Decoder, DECODER_NAME};
 
@@ -51,8 +52,14 @@ mod platform {
         let mut previous_rendered = 0u64;
         let mut frames_decoded = 0u64;
         let mut frames_rendered = 0u64;
-        let mut bgra = Vec::new();
+        let mut render_generation = 0u64;
         let mut closed_by_user = false;
+        let mut last_color_spec = ColorSpec::default();
+        let mut last_color_metadata = MediaColorMetadata::default();
+        let mut last_y_stride = dimensions.width as usize;
+        let mut last_uv_stride = dimensions.width as usize;
+        let mut last_uv_offset = dimensions.width as usize * dimensions.height as usize;
+        let mut last_allocated_height = dimensions.height as usize;
 
         for (frame_index, access_unit) in access_units.iter().enumerate() {
             if !window.pump_messages() {
@@ -62,6 +69,15 @@ mod platform {
             let decoded = decoder.decode_access_unit(access_unit, frame_index as u64)?;
             frames_decoded += decoded.len() as u64;
             for frame in decoded {
+                update_layout_stats(
+                    &frame,
+                    &mut last_color_spec,
+                    &mut last_color_metadata,
+                    &mut last_y_stride,
+                    &mut last_uv_stride,
+                    &mut last_uv_offset,
+                    &mut last_allocated_height,
+                );
                 if !wait_until_frame(&mut window, next_frame_at) {
                     closed_by_user = true;
                     break;
@@ -71,7 +87,7 @@ mod platform {
                     &frame,
                     dimensions.width,
                     dimensions.height,
-                    &mut bgra,
+                    &mut render_generation,
                 )?;
                 frames_rendered += 1;
                 next_frame_at += frame_interval;
@@ -82,6 +98,12 @@ mod platform {
                     frames_rendered,
                     dimensions.width,
                     dimensions.height,
+                    last_color_spec,
+                    last_color_metadata,
+                    last_y_stride,
+                    last_uv_stride,
+                    last_uv_offset,
+                    last_allocated_height,
                 );
             }
             if closed_by_user {
@@ -93,6 +115,15 @@ mod platform {
             let drained = decoder.finish()?;
             frames_decoded += drained.len() as u64;
             for frame in drained {
+                update_layout_stats(
+                    &frame,
+                    &mut last_color_spec,
+                    &mut last_color_metadata,
+                    &mut last_y_stride,
+                    &mut last_uv_stride,
+                    &mut last_uv_offset,
+                    &mut last_allocated_height,
+                );
                 if !wait_until_frame(&mut window, next_frame_at) {
                     closed_by_user = true;
                     break;
@@ -102,7 +133,7 @@ mod platform {
                     &frame,
                     dimensions.width,
                     dimensions.height,
-                    &mut bgra,
+                    &mut render_generation,
                 )?;
                 frames_rendered += 1;
                 next_frame_at += frame_interval;
@@ -113,13 +144,19 @@ mod platform {
                     frames_rendered,
                     dimensions.width,
                     dimensions.height,
+                    last_color_spec,
+                    last_color_metadata,
+                    last_y_stride,
+                    last_uv_stride,
+                    last_uv_offset,
+                    last_allocated_height,
                 );
             }
         }
 
         let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
         println!(
-            r#"{{"type":"VIEWER_DONE","mode":"h264_file_viewer","decoder":"{}","render":"GDI","frames_decoded":{},"frames_rendered":{},"fps":{:.2},"width":{},"height":{},"closed_by_user":{},"input":"{}"}}"#,
+            r#"{{"type":"VIEWER_DONE","mode":"h264_file_viewer","decoder":"{}","render":"GDI","frames_decoded":{},"frames_rendered":{},"fps":{:.2},"width":{},"height":{},"closed_by_user":{},"input":"{}","nv12_y_stride":{},"nv12_uv_stride":{},"nv12_uv_offset":{},"nv12_allocated_height":{},{},{}}}"#,
             DECODER_NAME,
             frames_decoded,
             frames_rendered,
@@ -127,7 +164,13 @@ mod platform {
             dimensions.width,
             dimensions.height,
             closed_by_user,
-            json_escape(&config.input)
+            json_escape(&config.input),
+            last_y_stride,
+            last_uv_stride,
+            last_uv_offset,
+            last_allocated_height,
+            last_color_spec.json_fragment(),
+            last_color_metadata.json_fragment("decoder_output")
         );
         io::stdout().flush().ok();
         eprintln!(
@@ -146,10 +189,10 @@ mod platform {
         frame: &DecodedFrame,
         width: u32,
         height: u32,
-        bgra: &mut Vec<u8>,
+        generation: &mut u64,
     ) -> Result<(), String> {
-        nv12_to_bgra::convert(&frame.nv12, width, height, bgra)?;
-        window.render_bgra(bgra, width, height)
+        *generation += 1;
+        OwnedBgraFrame::from_decoded(frame, width, height, *generation)?.render(window)
     }
 
     fn wait_until_frame(window: &mut GdiViewerWindow, target: Instant) -> bool {
@@ -172,6 +215,12 @@ mod platform {
         frames_rendered: u64,
         width: u32,
         height: u32,
+        color_spec: ColorSpec,
+        color_metadata: MediaColorMetadata,
+        y_stride: usize,
+        uv_stride: usize,
+        uv_offset: usize,
+        allocated_height: usize,
     ) {
         let now = Instant::now();
         let elapsed = now.duration_since(*report_at);
@@ -180,16 +229,40 @@ mod platform {
         }
         let rendered_delta = frames_rendered.saturating_sub(*previous_rendered);
         println!(
-            r#"{{"type":"VIEWER_STATS","mode":"h264_file_viewer","frames_decoded":{},"frames_rendered":{},"fps":{:.2},"width":{},"height":{}}}"#,
+            r#"{{"type":"VIEWER_STATS","mode":"h264_file_viewer","frames_decoded":{},"frames_rendered":{},"fps":{:.2},"width":{},"height":{},"nv12_y_stride":{},"nv12_uv_stride":{},"nv12_uv_offset":{},"nv12_allocated_height":{},{},{}}}"#,
             frames_decoded,
             frames_rendered,
             rendered_delta as f64 / elapsed.as_secs_f64().max(0.001),
             width,
-            height
+            height,
+            y_stride,
+            uv_stride,
+            uv_offset,
+            allocated_height,
+            color_spec.json_fragment(),
+            color_metadata.json_fragment("decoder_output")
         );
         io::stdout().flush().ok();
         *previous_rendered = frames_rendered;
         *report_at = now;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_layout_stats(
+        frame: &DecodedFrame,
+        color_spec: &mut ColorSpec,
+        color_metadata: &mut MediaColorMetadata,
+        y_stride: &mut usize,
+        uv_stride: &mut usize,
+        uv_offset: &mut usize,
+        allocated_height: &mut usize,
+    ) {
+        *color_spec = frame.color_spec;
+        *color_metadata = frame.color_metadata;
+        *y_stride = frame.y_stride;
+        *uv_stride = frame.uv_stride;
+        *uv_offset = frame.uv_offset;
+        *allocated_height = frame.allocated_height;
     }
 
     fn json_escape(text: &str) -> String {

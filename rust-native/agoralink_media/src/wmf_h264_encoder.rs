@@ -8,21 +8,25 @@ mod platform {
     use std::ptr;
     use std::slice;
 
+    use crate::color_spec::{ColorMatrix, ColorSpec, MediaColorMetadata};
     use windows::core::{IUnknown, Result as WindowsResult, GUID};
     use windows::Win32::Media::MediaFoundation::{
         eAVEncH264VProfile_Main, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform,
         MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
-        MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFVideoFormat_H264,
-        MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL,
+        MFNominalRange_16_235, MFSampleExtension_CleanPoint, MFShutdown, MFStartup,
+        MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+        MFVideoPrimaries_BT709, MFVideoPrimaries_SMPTE170M, MFVideoTransFunc_709,
+        MFVideoTransferMatrix_BT601, MFVideoTransferMatrix_BT709, MFSTARTUP_FULL,
         MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
         MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
         MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
         MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_INFO,
         MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
-        MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE, MF_MT_FIXED_SIZE_SAMPLES,
-        MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-        MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SAMPLE_SIZE, MF_MT_SUBTYPE,
-        MF_VERSION,
+        MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
+        MF_MT_FIXED_SIZE_SAMPLES, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
+        MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SAMPLE_SIZE,
+        MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES,
+        MF_MT_YUV_MATRIX, MF_VERSION,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -100,11 +104,16 @@ mod platform {
         stats: EncoderStats,
         finished: bool,
         profile_main: bool,
+        #[allow(dead_code)]
+        color_spec: ColorSpec,
+        input_color_metadata: MediaColorMetadata,
+        output_color_metadata: MediaColorMetadata,
         _mf: MediaFoundationGuard,
         _com: ComGuard,
     }
 
     impl WmfH264Encoder {
+        #[allow(dead_code)]
         pub fn new(
             width: u32,
             height: u32,
@@ -112,18 +121,55 @@ mod platform {
             bitrate_mbps: f64,
             output_path: &str,
         ) -> Result<Self, String> {
-            let output = File::create(Path::new(output_path))
-                .map_err(|err| format!("create output failed: {err}"))?;
-            Self::new_internal(width, height, fps, bitrate_mbps, Some(output), false)
+            Self::new_with_color(
+                width,
+                height,
+                fps,
+                bitrate_mbps,
+                output_path,
+                ColorSpec::default(),
+            )
         }
 
+        pub fn new_with_color(
+            width: u32,
+            height: u32,
+            fps: u32,
+            bitrate_mbps: f64,
+            output_path: &str,
+            color_spec: ColorSpec,
+        ) -> Result<Self, String> {
+            let output = File::create(Path::new(output_path))
+                .map_err(|err| format!("create output failed: {err}"))?;
+            Self::new_internal(
+                width,
+                height,
+                fps,
+                bitrate_mbps,
+                Some(output),
+                false,
+                color_spec,
+            )
+        }
+
+        #[allow(dead_code)]
         pub fn new_stream(
             width: u32,
             height: u32,
             fps: u32,
             bitrate_mbps: f64,
         ) -> Result<Self, String> {
-            Self::new_internal(width, height, fps, bitrate_mbps, None, true)
+            Self::new_stream_with_color(width, height, fps, bitrate_mbps, ColorSpec::default())
+        }
+
+        pub fn new_stream_with_color(
+            width: u32,
+            height: u32,
+            fps: u32,
+            bitrate_mbps: f64,
+            color_spec: ColorSpec,
+        ) -> Result<Self, String> {
+            Self::new_internal(width, height, fps, bitrate_mbps, None, true, color_spec)
         }
 
         fn new_internal(
@@ -133,6 +179,7 @@ mod platform {
             bitrate_mbps: f64,
             output: Option<File>,
             collect_samples: bool,
+            color_spec: ColorSpec,
         ) -> Result<Self, String> {
             if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
                 return Err("encoder width and height must be non-zero even values".to_string());
@@ -148,6 +195,7 @@ mod platform {
 
             let output_type =
                 create_video_type(width, height, fps, MFVideoFormat_H264, bitrate_bps, None)?;
+            apply_color_metadata(&output_type, color_spec);
             let profile_attribute_set = unsafe {
                 output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)
             }
@@ -163,6 +211,7 @@ mod platform {
                         bitrate_bps,
                         None,
                     )?;
+                    apply_color_metadata(&fallback, color_spec);
                     unsafe { transform.SetOutputType(0, &fallback, 0) }.map_err(
                         |fallback_error| {
                             format!(
@@ -183,8 +232,22 @@ mod platform {
                 bitrate_bps,
                 Some(frame_size as u32),
             )?;
+            apply_color_metadata(&input_type, color_spec);
+            if let Err(err) =
+                unsafe { input_type.SetUINT32(&MF_MT_DEFAULT_STRIDE, width as i32 as u32) }
+            {
+                eprintln!("encoder media type could not set default stride: {err}");
+            }
             unsafe { transform.SetInputType(0, &input_type, 0) }
                 .map_err(|err| format!("SetInputType NV12 failed: {err}"))?;
+            let input_color_metadata = unsafe { transform.GetInputCurrentType(0) }
+                .ok()
+                .map(|media_type| read_color_metadata(&media_type))
+                .unwrap_or_default();
+            let output_color_metadata = unsafe { transform.GetOutputCurrentType(0) }
+                .ok()
+                .map(|media_type| read_color_metadata(&media_type))
+                .unwrap_or_default();
             let output_info = unsafe { transform.GetOutputStreamInfo(0) }
                 .map_err(|err| format!("GetOutputStreamInfo failed: {err}"))?;
             let output_buffer_size =
@@ -211,6 +274,9 @@ mod platform {
                 stats: EncoderStats::default(),
                 finished: false,
                 profile_main,
+                color_spec,
+                input_color_metadata,
+                output_color_metadata,
                 _mf: mf,
                 _com: com,
             })
@@ -305,6 +371,19 @@ mod platform {
         pub fn output_buffer_size(&self) -> u32 {
             self.output_buffer_size
         }
+
+        #[allow(dead_code)]
+        pub fn color_spec(&self) -> ColorSpec {
+            self.color_spec
+        }
+
+        pub fn input_color_metadata(&self) -> MediaColorMetadata {
+            self.input_color_metadata
+        }
+
+        pub fn output_color_metadata(&self) -> MediaColorMetadata {
+            self.output_color_metadata
+        }
     }
 
     impl Drop for WmfH264Encoder {
@@ -362,6 +441,47 @@ mod platform {
         })();
         configure_result.map_err(|err| format!("configure media type failed: {err}"))?;
         Ok(media_type)
+    }
+
+    fn apply_color_metadata(media_type: &IMFMediaType, color: ColorSpec) {
+        let primaries = match color.matrix {
+            ColorMatrix::Bt601 => MFVideoPrimaries_SMPTE170M.0 as u32,
+            ColorMatrix::Bt709 => MFVideoPrimaries_BT709.0 as u32,
+        };
+        let matrix = match color.matrix {
+            ColorMatrix::Bt601 => MFVideoTransferMatrix_BT601.0 as u32,
+            ColorMatrix::Bt709 => MFVideoTransferMatrix_BT709.0 as u32,
+        };
+        for (attribute, value, name) in [
+            (&MF_MT_VIDEO_PRIMARIES, primaries, "video primaries"),
+            (
+                &MF_MT_TRANSFER_FUNCTION,
+                MFVideoTransFunc_709.0 as u32,
+                "transfer function",
+            ),
+            (&MF_MT_YUV_MATRIX, matrix, "YUV matrix"),
+            (
+                &MF_MT_VIDEO_NOMINAL_RANGE,
+                MFNominalRange_16_235.0 as u32,
+                "nominal range",
+            ),
+        ] {
+            if let Err(err) = unsafe { media_type.SetUINT32(attribute, value) } {
+                eprintln!("encoder media type could not set {name}: {err}");
+            }
+        }
+    }
+
+    fn read_color_metadata(media_type: &IMFMediaType) -> MediaColorMetadata {
+        MediaColorMetadata {
+            primaries: unsafe { media_type.GetUINT32(&MF_MT_VIDEO_PRIMARIES) }.ok(),
+            transfer: unsafe { media_type.GetUINT32(&MF_MT_TRANSFER_FUNCTION) }.ok(),
+            matrix: unsafe { media_type.GetUINT32(&MF_MT_YUV_MATRIX) }.ok(),
+            nominal_range: unsafe { media_type.GetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE) }.ok(),
+            default_stride: unsafe { media_type.GetUINT32(&MF_MT_DEFAULT_STRIDE) }
+                .ok()
+                .map(|value| value as i32),
+        }
     }
 
     fn create_input_sample(

@@ -14,6 +14,7 @@ pub struct EncodeProbeConfig {
     pub bitrate_mbps: f64,
     pub output: String,
     pub encoder: EncoderChoice,
+    pub color_spec: crate::color_spec::ColorSpec,
 }
 
 #[cfg(windows)]
@@ -72,22 +73,27 @@ mod platform {
         }
         let _console_ctrl = ConsoleCtrlGuard::install()?;
         let frame_size = nv12_synthetic::buffer_size(config.width, config.height)?;
-        let mut encoder = WmfH264Encoder::new(
+        let mut encoder = WmfH264Encoder::new_with_color(
             config.width,
             config.height,
             config.fps,
             config.bitrate_mbps,
             &config.output,
+            config.color_spec,
         )?;
         eprintln!(
-            "encode-probe encoder=\"{}\" input=NV12 output=H264 size={}x{} fps={} bitrate_mbps={} output_buffer={} profile_main={}",
+            "encode-probe encoder=\"{}\" input=NV12 output=H264 size={}x{} fps={} bitrate_mbps={} color_matrix={} range={} output_buffer={} profile_main={} encoder_input_metadata={:?} encoder_output_metadata={:?}",
             ENCODER_NAME,
             config.width,
             config.height,
             config.fps,
             config.bitrate_mbps,
+            config.color_spec.yuv_matrix(),
+            config.color_spec.color_range(),
             encoder.output_buffer_size(),
-            encoder.profile_main()
+            encoder.profile_main(),
+            encoder.input_color_metadata(),
+            encoder.output_color_metadata()
         );
 
         let total_frames = u64::from(config.fps)
@@ -122,7 +128,7 @@ mod platform {
         let wall_time_sec = started_at.elapsed().as_secs_f64();
         let media_duration_sec = stats.frames_in as f64 / f64::from(config.fps);
         println!(
-            r#"{{"type":"ENCODE_DONE","encoder":"{}","frames_in":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"keyframes":{},"width":{},"height":{},"output":"{}"}}"#,
+            r#"{{"type":"ENCODE_DONE","encoder":"{}","frames_in":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"keyframes":{},"width":{},"height":{},"output":"{}",{},{},{}}}"#,
             ENCODER_NAME,
             stats.frames_in,
             stats.samples_out,
@@ -135,7 +141,14 @@ mod platform {
             keyframes_json(stats),
             config.width,
             config.height,
-            json_escape(&config.output)
+            json_escape(&config.output),
+            config.color_spec.json_fragment(),
+            encoder
+                .input_color_metadata()
+                .json_fragment("encoder_input"),
+            encoder
+                .output_color_metadata()
+                .json_fragment("encoder_output")
         );
         io::stdout().flush().ok();
         eprintln!(
@@ -186,7 +199,7 @@ mod platform {
             / media_elapsed_sec.max(0.001)
             / 1_000_000.0;
         println!(
-            r#"{{"type":"ENCODE_STATS","mode":"encode_probe","encoder":"{}","frames_in":{},"samples_out":{},"bytes_out":{},"mbps":{:.3},"fps":{},"processing_fps":{:.2},"keyframes":{},"width":{},"height":{}}}"#,
+            r#"{{"type":"ENCODE_STATS","mode":"encode_probe","encoder":"{}","frames_in":{},"samples_out":{},"bytes_out":{},"mbps":{:.3},"fps":{},"processing_fps":{:.2},"keyframes":{},"width":{},"height":{},{} }}"#,
             ENCODER_NAME,
             current.frames_in,
             current.samples_out,
@@ -196,7 +209,8 @@ mod platform {
             frame_delta as f64 / elapsed_sec,
             keyframes_json(current),
             config.width,
-            config.height
+            config.height,
+            config.color_spec.json_fragment()
         );
         io::stdout().flush().ok();
     }
