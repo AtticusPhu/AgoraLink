@@ -27,7 +27,27 @@ def screen_share_active_states() -> Set[str]:
     return set(ACTIVE_SCREEN_STATES)
 
 
-def screen_detail_text(profile: object = "", port: object = "") -> str:
+def screen_audio_text(audio: object = None, lang: object = "en") -> str:
+    if isinstance(audio, dict):
+        state = str(audio.get("state") or "").strip().lower()
+        enabled = bool(audio.get("enabled"))
+        mode = str(audio.get("mode") or "").strip().lower()
+    else:
+        text = str(audio or "").strip().lower()
+        state = text
+        enabled = text in ("system", "on", "enabled", "system_audio_on")
+        mode = "system" if enabled else ""
+    zh = _lang(lang) == "zh"
+    if state in ("fallback_video_only", "audio_failed_video_only", "unavailable"):
+        return "系统音频不可用，已继续视频投屏" if zh else "System audio unavailable · Video only"
+    if state in ("failed", "audio_failed"):
+        return "音频失败，已继续视频投屏" if zh else "Audio failed · Continued video only"
+    if enabled and mode == "system":
+        return "系统音频开启" if zh else "System audio on"
+    return "无音频" if zh else "Video only"
+
+
+def screen_detail_text(profile: object = "", port: object = "", audio: object = None, lang: object = "en") -> str:
     parts = []
     profile_text = str(profile or "").strip()
     port_text = "" if port in (None, "") else str(port)
@@ -35,6 +55,8 @@ def screen_detail_text(profile: object = "", port: object = "") -> str:
         parts.append(f"profile: {profile_text}")
     if port_text:
         parts.append(f"port: {port_text}")
+    if audio is not None:
+        parts.append(screen_audio_text(audio, lang))
     return "  ".join(parts)
 
 

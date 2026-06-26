@@ -83,6 +83,38 @@ def _validate_profiles(value: object, field: str) -> None:
         _require_text(item.get("id") or item.get("name"), f"{field}.id")
 
 
+def _audio_config(value: object) -> Dict[str, Any]:
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("audio must be an object")
+    enabled = bool(value.get("enabled"))
+    if not enabled:
+        return {"enabled": False, "mode": "none"}
+    mode = str(value.get("mode") or "system").strip().lower()
+    if mode != "system":
+        raise ValueError("audio.mode must be system")
+    codec = str(value.get("codec") or "aac").strip().lower()
+    if codec != "aac":
+        raise ValueError("audio.codec must be aac")
+    try:
+        sample_rate = int(value.get("sample_rate") or 48000)
+        channels = int(value.get("channels") or 2)
+        bitrate = int(value.get("bitrate") or 128000)
+    except Exception as exc:
+        raise ValueError("audio sample_rate/channels/bitrate must be integers") from exc
+    if sample_rate <= 0 or channels <= 0 or bitrate <= 0:
+        raise ValueError("audio sample_rate/channels/bitrate must be positive")
+    return {
+        "enabled": True,
+        "mode": "system",
+        "codec": "aac",
+        "sample_rate": sample_rate,
+        "channels": channels,
+        "bitrate": bitrate,
+    }
+
+
 def _base_message(
     message_type: str,
     session_id: object,
@@ -115,6 +147,7 @@ def make_offer(
     profile_dict: Mapping[str, Any],
     profiles: object = None,
     preferred_profile: object = None,
+    audio: object = None,
 ) -> Dict[str, object]:
     payload: Dict[str, Any] = {
         "host": _require_text(host, "host"),
@@ -122,6 +155,9 @@ def make_offer(
         "profile_name": _require_text(profile_name, "profile_name"),
         "profile": dict(profile_dict),
     }
+    audio_config = _audio_config(audio)
+    if audio_config:
+        payload["audio"] = audio_config
     advertised_profiles = _profiles_list(profiles)
     preferred = str(preferred_profile or "").strip()
     if advertised_profiles:
@@ -137,6 +173,8 @@ def make_offer(
     if advertised_profiles:
         message["profiles"] = advertised_profiles
         message["preferred_profile"] = payload["preferred_profile"]
+    if audio_config:
+        message["audio"] = audio_config
     return message
 
 
@@ -147,26 +185,33 @@ def make_accept(
     host: object,
     port: object,
     selected_profile: object,
+    audio: object = None,
 ) -> Dict[str, object]:
     screen_port = _require_port(port)
     selected_profile_id = profile_id_from_info(selected_profile, DEFAULT_SCREEN_PROFILE)
     selected_profile_info = dict(selected_profile) if isinstance(selected_profile, Mapping) else {"id": selected_profile_id, "name": selected_profile_id}
+    audio_config = _audio_config(audio)
+    payload: Dict[str, Any] = {
+        "host": _require_text(host, "host"),
+        "port": screen_port,
+        "screen_port": screen_port,
+        "selected_profile": selected_profile_id,
+        "selected_profile_info": selected_profile_info,
+    }
+    if audio_config:
+        payload["audio"] = audio_config
     message = _base_message(
         SCREEN_SHARE_ACCEPT,
         session_id,
         sender_peer_id,
         receiver_peer_id,
-        {
-            "host": _require_text(host, "host"),
-            "port": screen_port,
-            "screen_port": screen_port,
-            "selected_profile": selected_profile_id,
-            "selected_profile_info": selected_profile_info,
-        },
+        payload,
     )
     message["screen_port"] = screen_port
     message["selected_profile"] = selected_profile_id
     message["selected_profile_info"] = selected_profile_info
+    if audio_config:
+        message["audio"] = audio_config
     return message
 
 
@@ -254,6 +299,8 @@ def _validate_common_fields(message: Mapping[str, Any]) -> None:
         _require_text(message.get("selected_profile"), "selected_profile")
     if "selected_profile_info" in message and not isinstance(message.get("selected_profile_info"), Mapping):
         raise ValueError("selected_profile_info must be an object")
+    if "audio" in message:
+        _audio_config(message.get("audio"))
     if not isinstance(message.get("payload"), Mapping):
         raise ValueError("payload must be an object")
 
@@ -271,6 +318,8 @@ def _validate_payload(message: Mapping[str, Any]) -> None:
             _validate_profiles(payload.get("profiles"), "payload.profiles")
         if "preferred_profile" in payload:
             _require_text(payload.get("preferred_profile"), "payload.preferred_profile")
+        if "audio" in payload:
+            _audio_config(payload.get("audio"))
     elif message_type == SCREEN_SHARE_ACCEPT:
         _require_text(payload.get("host"), "payload.host")
         _require_port(payload.get("port"))
@@ -284,6 +333,8 @@ def _validate_payload(message: Mapping[str, Any]) -> None:
                 _require_text(selected, "payload.selected_profile")
         if "selected_profile_info" in payload and not isinstance(payload.get("selected_profile_info"), Mapping):
             raise ValueError("payload.selected_profile_info must be an object")
+        if "audio" in payload:
+            _audio_config(payload.get("audio"))
     elif message_type == SCREEN_SHARE_REJECT:
         if "reason" not in payload:
             raise ValueError("missing field: payload.reason")

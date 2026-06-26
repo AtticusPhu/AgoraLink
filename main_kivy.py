@@ -53,6 +53,7 @@ from file_transfer_presenter import (
 )
 from process_utils import popen_no_console, run_no_console
 from screen_share_presenter import (
+    screen_audio_text,
     screen_detail_text,
     screen_offer_title,
     screen_rejected_by_peer_text,
@@ -2126,6 +2127,7 @@ class RUDPTransferRoot(BoxLayout):
         self.chat_nickname = os.environ.get("USERNAME") or "AgoraLinkUser"
         self.gui_config = load_gui_config()
         self.auto_package_multi_selection = bool(self.gui_config.get("auto_package_multi_selection", True))
+        self.share_system_audio = bool(self.gui_config.get("screen_share_system_audio", False))
         self.current_chat_mode = "group"
         self.current_group_id = ""
         self.current_peer_id = ""
@@ -2156,6 +2158,7 @@ class RUDPTransferRoot(BoxLayout):
         self.screen_share_peer_label = ""
         self.screen_share_current_port: Optional[int] = None
         self.screen_share_selected_profile = ""
+        self.screen_share_current_audio: Dict[str, object] = {"enabled": False, "mode": "none"}
         self.current_screen_peer = ""
         self.current_screen_profile = ""
         self.current_screen_port: Optional[int] = None
@@ -4126,8 +4129,60 @@ class RUDPTransferRoot(BoxLayout):
         )
         self._add_runtime_chat_card(card, peer_id=peer_id or self.screen_share_peer_id or self.current_peer_id)
 
-    def _screen_detail_text(self, profile: object = "", port: object = "") -> str:
-        return screen_detail_text(profile, port)
+    def _screen_audio_enabled(self) -> bool:
+        return bool(getattr(self, "share_system_audio", False))
+
+    def _screen_audio_config(self, enabled: Optional[bool] = None) -> Dict[str, object]:
+        use_audio = self._screen_audio_enabled() if enabled is None else bool(enabled)
+        if not use_audio:
+            return {"enabled": False, "mode": "none"}
+        return {
+            "enabled": True,
+            "mode": "system",
+            "codec": "aac",
+            "sample_rate": 48000,
+            "channels": 2,
+            "bitrate": 128000,
+        }
+
+    def _screen_audio_from_control(self, control: Dict[str, object], payload: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+        payload = dict(payload or control.get("payload") or {})
+        value = payload.get("audio", control.get("audio"))
+        if isinstance(value, dict):
+            enabled = bool(value.get("enabled"))
+            if enabled:
+                return {
+                    "enabled": True,
+                    "mode": "system",
+                    "codec": "aac",
+                    "sample_rate": int(value.get("sample_rate") or 48000),
+                    "channels": int(value.get("channels") or 2),
+                    "bitrate": int(value.get("bitrate") or 128000),
+                }
+            return {"enabled": False, "mode": "none"}
+        return {"enabled": False, "mode": "none"}
+
+    def _screen_audio_from_runtime_state(self, state: Optional[Dict[str, object]], fallback: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+        data = dict(fallback or {"enabled": False, "mode": "none"})
+        try:
+            state_dict = dict(state or {})
+            runtime_audio = dict(state_dict.get("audio_config") or {})
+            if runtime_audio:
+                data.update(runtime_audio)
+            if "audio_enabled" in state_dict:
+                data["enabled"] = bool(state_dict.get("audio_enabled"))
+            audio_state = str(state_dict.get("audio_state") or "").strip()
+            if audio_state:
+                data["state"] = audio_state
+        except Exception:
+            pass
+        return data
+
+    def _screen_audio_text(self, audio: object = None) -> str:
+        return screen_audio_text(audio, self.lang)
+
+    def _screen_detail_text(self, profile: object = "", port: object = "", audio: object = None) -> str:
+        return screen_detail_text(profile, port, audio, lang=self.lang)
 
     def _screen_start_failed_text(self, reason: object) -> str:
         return screen_start_failed_text(reason, self.lang)
@@ -5313,6 +5368,13 @@ class RUDPTransferRoot(BoxLayout):
         package_checkbox = CheckBox(active=bool(getattr(self, "auto_package_multi_selection", True)), size_hint_x=None, width=dp(42))
         package_line.add_widget(package_checkbox)
         content.add_widget(package_line)
+        audio_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(8))
+        audio_label_text = "共享系统音频" if self.lang == "zh" else "Share system audio"
+        audio_line.add_widget(make_label(text=audio_label_text, size_hint_x=None, width=dp(220), color=THEME["muted_text"], halign="left", valign="middle"))
+        bind_label_wrap(audio_line.children[0])
+        audio_checkbox = CheckBox(active=bool(getattr(self, "share_system_audio", False)), size_hint_x=None, width=dp(42))
+        audio_line.add_widget(audio_checkbox)
+        content.add_widget(audio_line)
         note = make_label(
             text="诊断日志已移到“诊断”窗口。普通设置只保留日常选项。",
             size_hint_y=None,
@@ -5324,16 +5386,21 @@ class RUDPTransferRoot(BoxLayout):
         bind_label_wrap(note)
         content.add_widget(note)
         buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
-        popup = style_popup(Popup(title="设置", content=content, size_hint=(0.58, 0.36)))
+        popup = style_popup(Popup(title="设置", content=content, size_hint=(0.58, 0.42)))
         def _apply_theme(*_):
             self.theme_mode = theme_spinner.text
             self.apply_theme_mode(self.theme_mode)
+            old_audio = bool(getattr(self, "share_system_audio", False))
             self.auto_package_multi_selection = bool(package_checkbox.active)
+            self.share_system_audio = bool(audio_checkbox.active)
             try:
                 self.gui_config["auto_package_multi_selection"] = bool(self.auto_package_multi_selection)
+                self.gui_config["screen_share_system_audio"] = bool(self.share_system_audio)
                 save_gui_config(self.gui_config)
             except Exception:
                 pass
+            if old_audio != bool(self.share_system_audio) and self._screen_share_button_active():
+                self._set_screen_share_status("共享系统音频设置将在下次投屏生效" if self.lang == "zh" else "System audio setting applies to the next screen share")
         buttons.add_widget(make_button("primary", text="应用", on_release=_apply_theme))
         export_btn = make_button("secondary", text="导出诊断包")
         export_btn.bind(on_release=lambda *_: self.export_diagnostic_logs_async(log_box=self.sender_log_box, button=export_btn))
@@ -5590,6 +5657,7 @@ class RUDPTransferRoot(BoxLayout):
         peer_label: Optional[str] = None,
         profile: Optional[str] = None,
         port: Optional[int] = None,
+        audio: Optional[Dict[str, object]] = None,
     ) -> None:
         if peer_label is not None:
             self.screen_share_peer_label = str(peer_label or "").strip()
@@ -5600,11 +5668,14 @@ class RUDPTransferRoot(BoxLayout):
         if port is not None:
             self.screen_share_current_port = int(port)
             self.current_screen_port = int(port)
+        if audio is not None:
+            self.screen_share_current_audio = dict(audio or {"enabled": False, "mode": "none"})
 
     def _clear_current_screen_context(self) -> None:
         self.screen_share_peer_label = ""
         self.screen_share_current_port = None
         self.screen_share_selected_profile = ""
+        self.screen_share_current_audio = {"enabled": False, "mode": "none"}
         self.current_screen_peer = ""
         self.current_screen_profile = ""
         self.current_screen_port = None
@@ -5679,6 +5750,7 @@ class RUDPTransferRoot(BoxLayout):
             f"mode: {state.get('mode') or ''}    host: {state.get('host') or ''}\n"
             f"peer_label: {peer_label}\n"
             f"selected_profile: {selected_profile}    screen_port: {screen_port}\n"
+            f"audio: {state.get('audio_state') or 'video_only'}\n"
             f"ffmpeg_path: {deps.get('ffmpeg_path') or ''}\n"
             f"ffplay_path: {deps.get('ffplay_path') or ''}\n"
             f"last_error: {state.get('last_error') or ''}\n"
@@ -5971,15 +6043,17 @@ class RUDPTransferRoot(BoxLayout):
                 return
             selected_profile = self._screen_preferred_profile()
             peer_label = "Debug"
+            audio_config = self._screen_audio_config(False)
             state = self._screen_runtime().start_receiver(
                 port=screen_port,
                 profile=selected_profile,
                 peer_label=peer_label,
                 selected_profile=selected_profile,
                 screen_port=screen_port,
+                audio=audio_config,
             )
             if str(state.get("state") or "") == "receiving":
-                self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port)
+                self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port, audio=audio_config)
             else:
                 self._clear_current_screen_context()
             self._append_debug_line(f"screen receiver start requested port={screen_port} profile={selected_profile}", protocol=False)
@@ -6001,6 +6075,7 @@ class RUDPTransferRoot(BoxLayout):
                 return
             selected_profile = self._screen_preferred_profile()
             peer_label = host
+            audio_config = self._screen_audio_config()
             state = self._screen_runtime().start_sender(
                 host=host,
                 port=DEFAULT_SCREEN_PORT,
@@ -6008,9 +6083,19 @@ class RUDPTransferRoot(BoxLayout):
                 peer_label=peer_label,
                 selected_profile=selected_profile,
                 screen_port=DEFAULT_SCREEN_PORT,
+                system_audio=bool(audio_config.get("enabled")),
+                audio=audio_config,
             )
             if str(state.get("state") or "") == "sending":
-                self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=DEFAULT_SCREEN_PORT)
+                self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=DEFAULT_SCREEN_PORT, audio=self._screen_audio_from_runtime_state(state, audio_config))
+                self._schedule_screen_audio_fallback_ui_update(
+                    session_id=str(getattr(self, "screen_share_session_id", "") or "debug_screen"),
+                    peer_id=str(getattr(self, "current_peer_id", "") or ""),
+                    peer_label=peer_label,
+                    profile=selected_profile,
+                    port=DEFAULT_SCREEN_PORT,
+                    offered_audio=audio_config,
+                )
             self._append_debug_line(f"screen sender start requested host={host} port={DEFAULT_SCREEN_PORT} profile={selected_profile}", protocol=False)
         except Exception as exc:
             self._clear_current_screen_context()
@@ -6041,6 +6126,51 @@ class RUDPTransferRoot(BoxLayout):
                     pass
 
         self._stop_screen_runtime_nonblocking(status_label=status_label, on_done=_finish_stop)
+
+    def _schedule_screen_audio_fallback_ui_update(
+        self,
+        *,
+        session_id: str,
+        peer_id: str,
+        peer_label: str,
+        profile: str,
+        port: object,
+        offered_audio: Dict[str, object],
+    ) -> None:
+        if not bool((offered_audio or {}).get("enabled")):
+            return
+
+        def _check(_dt) -> None:
+            try:
+                state = dict(self._screen_runtime().get_state())
+                audio_state = str(state.get("audio_state") or "").strip()
+                if audio_state not in ("fallback_video_only", "audio_failed", "audio_failed_video_only"):
+                    return
+                audio_detail = self._screen_audio_from_runtime_state(state, offered_audio)
+                audio_text = self._screen_audio_text(audio_detail)
+                status_text = self._screen_share_status_text("sending", peer_label=peer_label, profile=profile, port=port)
+                if peer_id:
+                    self._add_screen_chat_card(
+                        CARD_SCREEN_STATE,
+                        session_id=session_id,
+                        peer_id=peer_id,
+                        title=self._screen_offer_title(),
+                        subtitle=peer_label,
+                        status=audio_text,
+                        detail=self._screen_detail_text(profile, port, audio_detail),
+                        profile=profile,
+                        port=port,
+                        actions=[{"label": "Stop", "action": "stop_screen", "style": "danger"}],
+                        direction="outgoing",
+                    )
+                self._set_current_screen_context(peer_label=peer_label, profile=profile, port=int(port), audio=audio_detail)
+                self._set_screen_share_status(f"{status_text} · {audio_text}")
+                self._append_debug_line(str(state.get("last_error") or audio_text), protocol=False)
+            except Exception as exc:
+                self._append_debug_line(f"screen audio fallback UI update failed: {exc}", protocol=False)
+
+        Clock.schedule_once(_check, 1.3)
+        Clock.schedule_once(_check, 2.8)
 
     def _screen_advertised_profiles(self, force: bool = False) -> List[Dict[str, object]]:
         now = time.time()
@@ -6352,6 +6482,7 @@ class RUDPTransferRoot(BoxLayout):
                 return
             preferred_profile = self._screen_preferred_profile()
             profile = self._screen_profile_dict(preferred_profile)
+            audio_config = self._screen_audio_config()
             peer_id = str(self.current_peer_id or "")
             peer_label = self._screen_peer_label(peer_id)
             self._append_debug_line(
@@ -6368,12 +6499,14 @@ class RUDPTransferRoot(BoxLayout):
                 profile,
                 profiles=profiles,
                 preferred_profile=preferred_profile,
+                audio=audio_config,
             )
             self.screen_share_session_id = session_id
             self.screen_share_peer_id = peer_id
             self._clear_current_screen_context()
             self.screen_share_peer_label = peer_label
             self.current_screen_peer = peer_label
+            self.screen_share_current_audio = dict(audio_config)
             if self._send_screen_control_to_peer(peer_id, offer):
                 status_text = self._screen_share_status_text("pending_offer", peer_label=peer_label)
                 self._set_screen_share_ui_state("pending_offer")
@@ -6385,7 +6518,7 @@ class RUDPTransferRoot(BoxLayout):
                     title=self._screen_offer_title(),
                     subtitle=peer_label,
                     status=status_text,
-                    detail=self._screen_detail_text(preferred_profile, DEFAULT_SCREEN_PORT),
+                    detail=self._screen_detail_text(preferred_profile, DEFAULT_SCREEN_PORT, audio_config),
                     profile=preferred_profile,
                     port=DEFAULT_SCREEN_PORT,
                     direction="outgoing",
@@ -6399,7 +6532,7 @@ class RUDPTransferRoot(BoxLayout):
                     title=self._screen_offer_title(),
                     subtitle=peer_label,
                     status=status_text,
-                    detail=self._screen_detail_text(preferred_profile, DEFAULT_SCREEN_PORT),
+                    detail=self._screen_detail_text(preferred_profile, DEFAULT_SCREEN_PORT, audio_config),
                     profile=preferred_profile,
                     port=DEFAULT_SCREEN_PORT,
                     direction="outgoing",
@@ -6421,6 +6554,7 @@ class RUDPTransferRoot(BoxLayout):
         peer_label = self._current_screen_peer_label() or self._screen_peer_label(peer_id)
         profile_name = self._current_screen_profile_name()
         port_text = self._current_screen_port_text()
+        audio_detail = dict(getattr(self, "screen_share_current_audio", {}) or {"enabled": False, "mode": "none"})
 
         def _finish_stop(state: Dict[str, object], error: str) -> None:
             stop_status_text = self._screen_stopped_text()
@@ -6443,7 +6577,7 @@ class RUDPTransferRoot(BoxLayout):
                     title=self._screen_offer_title(),
                     subtitle=peer_label,
                     status=stop_status_text,
-                    detail=self._screen_detail_text(profile_name, port_text),
+                    detail=self._screen_detail_text(profile_name, port_text, audio_detail),
                     profile=profile_name,
                     port=port_text,
                     direction="outgoing",
@@ -6486,6 +6620,7 @@ class RUDPTransferRoot(BoxLayout):
                 session_id = str(control.get("session_id") or "")
                 profile_name = profile_id_from_info(payload.get("preferred_profile") or payload.get("profile_name") or DEFAULT_SCREEN_PROFILE, DEFAULT_SCREEN_PROFILE)
                 offer_port = payload.get("port") or DEFAULT_SCREEN_PORT
+                audio_config = self._screen_audio_from_control(control, payload)
                 self.pending_screen_offers[session_id] = dict(control)
                 status_text = f"收到 {peer_label} 的投屏邀请" if self.lang == "zh" else f"Screen share invitation from {peer_label}"
                 self._add_screen_chat_card(
@@ -6495,7 +6630,7 @@ class RUDPTransferRoot(BoxLayout):
                     title=self._screen_offer_title(),
                     subtitle=peer_label,
                     status=status_text,
-                    detail=self._screen_detail_text(profile_name, offer_port),
+                    detail=self._screen_detail_text(profile_name, offer_port, audio_config),
                     profile=profile_name,
                     port=offer_port,
                     actions=[
@@ -6549,9 +6684,10 @@ class RUDPTransferRoot(BoxLayout):
         sender_host = str(payload.get("host") or "").strip()
         peer_label = self._screen_peer_label(sender, sender_host)
         profile_name = profile_id_from_info(payload.get("preferred_profile") or payload.get("profile_name") or DEFAULT_SCREEN_PROFILE, DEFAULT_SCREEN_PROFILE)
+        audio_config = self._screen_audio_from_control(control, payload)
         content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
         label = make_label(
-            text=f"收到投屏邀请\n来自: {peer_label}\n推荐 profile: {profile_name}",
+            text=f"收到投屏邀请\n来自: {peer_label}\n推荐 profile: {profile_name}\n{self._screen_audio_text(audio_config)}",
             halign="left",
             valign="top",
         )
@@ -6573,6 +6709,7 @@ class RUDPTransferRoot(BoxLayout):
         payload = dict(control.get("payload") or {})
         sender_host = str(payload.get("host") or "").strip()
         peer_label = self._screen_peer_label(sender, sender_host)
+        audio_config = self._screen_audio_from_control(control, payload)
         try:
             if session_id:
                 self.pending_screen_offers.pop(session_id, None)
@@ -6594,7 +6731,7 @@ class RUDPTransferRoot(BoxLayout):
                 title=self._screen_offer_title(),
                 subtitle=peer_label,
                 status=starting_text,
-                detail=self._screen_detail_text(self._preferred_screen_profile_from_offer(control, payload), payload.get("port") or DEFAULT_SCREEN_PORT),
+                detail=self._screen_detail_text(self._preferred_screen_profile_from_offer(control, payload), payload.get("port") or DEFAULT_SCREEN_PORT, audio_config),
             )
             offered_profiles = self._offered_screen_profiles(control, payload)
             if offered_profiles:
@@ -6650,6 +6787,7 @@ class RUDPTransferRoot(BoxLayout):
                 peer_label=peer_label,
                 selected_profile=selected_profile_name,
                 screen_port=screen_port,
+                audio=audio_config,
             )
             if str(state.get("state") or "") != "receiving":
                 reason = self._screen_runtime_error_detail(self._screen_runtime().get_state())
@@ -6664,7 +6802,7 @@ class RUDPTransferRoot(BoxLayout):
                     title=self._screen_offer_title(),
                     subtitle=peer_label,
                     status=failed_text,
-                    detail=self._screen_detail_text(selected_profile_name, screen_port),
+                    detail=self._screen_detail_text(selected_profile_name, screen_port, audio_config),
                     profile=selected_profile_name,
                     port=screen_port,
                 )
@@ -6677,10 +6815,11 @@ class RUDPTransferRoot(BoxLayout):
                 self._local_screen_host(),
                 screen_port,
                 selected_profile_info,
+                audio=audio_config,
             )
             self.screen_share_session_id = session_id
             self.screen_share_peer_id = sender
-            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile_name, port=screen_port)
+            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile_name, port=screen_port, audio=audio_config)
             self._set_screen_share_ui_state("receiving")
             status_text = self._screen_share_status_text("receiving", peer_label=peer_label, profile=selected_profile_name, port=screen_port)
             self._add_screen_chat_card(
@@ -6690,7 +6829,7 @@ class RUDPTransferRoot(BoxLayout):
                 title=self._screen_offer_title(),
                 subtitle=peer_label,
                 status=status_text,
-                detail=self._screen_detail_text(selected_profile_name, screen_port),
+                detail=self._screen_detail_text(selected_profile_name, screen_port, audio_config),
                 profile=selected_profile_name,
                 port=screen_port,
                 actions=[{"label": "Stop", "action": "stop_screen", "style": "danger"}],
@@ -6750,6 +6889,10 @@ class RUDPTransferRoot(BoxLayout):
     def _handle_screen_accept(self, control: Dict[str, object]) -> None:
         sender = str(control.get("sender_peer_id") or "")
         payload = dict(control.get("payload") or {})
+        audio_field_present = isinstance(payload.get("audio", control.get("audio")), dict)
+        audio_config = self._screen_audio_from_control(control, payload)
+        if not audio_field_present and not bool(audio_config.get("enabled")):
+            audio_config = dict(getattr(self, "screen_share_current_audio", {}) or self._screen_audio_config())
         try:
             host = str(payload.get("host") or "").strip()
             if not host or is_unspecified_ip(host):
@@ -6776,7 +6919,7 @@ class RUDPTransferRoot(BoxLayout):
             peer_label = self._screen_peer_label(sender, host)
             self.screen_share_session_id = str(control.get("session_id") or "")
             self.screen_share_peer_id = sender
-            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port)
+            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port, audio=audio_config)
             starting_text = self._screen_share_status_text("pending_accept", peer_label=peer_label, profile=selected_profile, port=screen_port)
             self._set_screen_share_status(starting_text)
             self._add_screen_chat_card(
@@ -6786,7 +6929,7 @@ class RUDPTransferRoot(BoxLayout):
                 title=self._screen_offer_title(),
                 subtitle=peer_label,
                 status=starting_text,
-                detail=self._screen_detail_text(selected_profile, screen_port),
+                detail=self._screen_detail_text(selected_profile, screen_port, audio_config),
                 profile=selected_profile,
                 port=screen_port,
             )
@@ -6797,6 +6940,8 @@ class RUDPTransferRoot(BoxLayout):
                 peer_label=peer_label,
                 selected_profile=selected_profile,
                 screen_port=screen_port,
+                system_audio=bool(audio_config.get("enabled")),
+                audio=audio_config,
             )
             if str(state.get("state") or "") != "sending":
                 reason = self._screen_runtime_error_detail(self._screen_runtime().get_state())
@@ -6813,12 +6958,13 @@ class RUDPTransferRoot(BoxLayout):
                     title=self._screen_offer_title(),
                     subtitle=peer_label,
                     status=failed_text,
-                    detail=self._screen_detail_text(selected_profile, screen_port),
+                    detail=self._screen_detail_text(selected_profile, screen_port, audio_config),
                     profile=selected_profile,
                     port=screen_port,
                 )
                 return
-            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port)
+            runtime_audio = self._screen_audio_from_runtime_state(state, audio_config)
+            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port, audio=runtime_audio)
             self._append_debug_line(f"sender actually used profile: {selected_profile}", protocol=False)
             self._set_screen_share_ui_state("sending")
             status_text = self._screen_share_status_text("sending", peer_label=peer_label, profile=selected_profile, port=screen_port)
@@ -6829,10 +6975,18 @@ class RUDPTransferRoot(BoxLayout):
                 title=self._screen_offer_title(),
                 subtitle=peer_label,
                 status=status_text,
-                detail=self._screen_detail_text(selected_profile, screen_port),
+                detail=self._screen_detail_text(selected_profile, screen_port, runtime_audio),
                 profile=selected_profile,
                 port=screen_port,
                 actions=[{"label": "Stop", "action": "stop_screen", "style": "danger"}],
+            )
+            self._schedule_screen_audio_fallback_ui_update(
+                session_id=str(control.get("session_id") or ""),
+                peer_id=sender,
+                peer_label=peer_label,
+                profile=selected_profile,
+                port=screen_port,
+                offered_audio=audio_config,
             )
             self._set_screen_share_status(status_text)
         except Exception as exc:
@@ -6855,6 +7009,7 @@ class RUDPTransferRoot(BoxLayout):
         peer_label = self._current_screen_peer_label() or self._screen_peer_label(sender)
         profile_name = self._current_screen_profile_name()
         port_text = self._current_screen_port_text()
+        audio_detail = dict(getattr(self, "screen_share_current_audio", {}) or {"enabled": False, "mode": "none"})
 
         def _finish_stop(_state: Dict[str, object], error: str) -> None:
             self.screen_share_session_id = ""
@@ -6867,7 +7022,7 @@ class RUDPTransferRoot(BoxLayout):
                 title=self._screen_offer_title(),
                 subtitle=peer_label,
                 status=stopped_text,
-                detail=self._screen_detail_text(profile_name, port_text),
+                detail=self._screen_detail_text(profile_name, port_text, audio_detail),
                 profile=profile_name,
                 port=port_text,
             )

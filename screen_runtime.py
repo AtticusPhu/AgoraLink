@@ -11,12 +11,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from app_paths import debug_log_dir
 from process_utils import popen_ffplay_windowed, popen_no_console, run_no_console
@@ -63,7 +64,15 @@ class ScreenRuntime:
         self.current_port: Optional[int] = None
         self.current_profile: Optional[str] = None
         self.current_peer_label: Optional[str] = None
+        self.current_audio_enabled = False
+        self.current_audio_mode = "none"
+        self.current_audio_state = "video_only"
+        self.current_audio_config: Dict[str, object] = {"enabled": False, "mode": "none"}
+        self.current_audio_error = ""
+        self.current_audio_input = ""
         self._process_log_path: Optional[Path] = None
+        self._wasapi_support_cache: Dict[str, bool] = {}
+        self._dshow_audio_devices_cache: Dict[str, List[Dict[str, str]]] = {}
 
     def start_receiver(
         self,
@@ -73,6 +82,7 @@ class ScreenRuntime:
         peer_label: Optional[str] = None,
         selected_profile: object = None,
         screen_port: Optional[int] = None,
+        audio: object = None,
     ) -> Dict[str, object]:
         if self._has_running_process():
             return self._already_running_result()
@@ -84,6 +94,7 @@ class ScreenRuntime:
             port = self._validate_port(port)
             profile_name = self._validate_profile(profile) if profile else ""
             peer_label_text = self._validate_peer_label(peer_label)
+            audio_config = self._normalize_audio_config(audio, enabled_default=False)
             self.last_command = []
             deps = self.check_dependencies()
             ffplay = str(deps.get("ffplay_path") or "")
@@ -103,6 +114,7 @@ class ScreenRuntime:
         self.current_port = port
         self.current_profile = profile_name or None
         self.current_peer_label = peer_label_text or None
+        self._set_audio_session(audio_config)
         self._schedule_startup_exit_check("ffplay", delay_sec=1.0)
         return self.get_state()
 
@@ -115,6 +127,8 @@ class ScreenRuntime:
         peer_label: Optional[str] = None,
         selected_profile: object = None,
         screen_port: Optional[int] = None,
+        system_audio: bool = False,
+        audio: object = None,
     ) -> Dict[str, object]:
         if self._has_running_process():
             return self._already_running_result()
@@ -127,25 +141,54 @@ class ScreenRuntime:
             port = self._validate_port(port)
             profile = self._validate_profile(profile)
             peer_label_text = self._validate_peer_label(peer_label) or host
+            audio_config = self._normalize_audio_config(audio, enabled_default=bool(system_audio))
             self.last_command = []
             deps = self.check_dependencies()
             ffmpeg = str(deps.get("ffmpeg_path") or "")
             if not ffmpeg:
                 return self._set_error(self._missing_tool_error(["ffmpeg"]))
-            cmd = self._build_sender_command(host=host, port=port, profile_name=profile, ffmpeg_path=ffmpeg)
+            audio_requested = bool(audio_config.get("enabled"))
+            if audio_requested:
+                audio_config = self._resolve_system_audio_config(ffmpeg, audio_config)
+            audio_enabled = bool(audio_config.get("enabled"))
+            audio_notice = "System audio unavailable, continued video-only." if audio_requested and not audio_enabled else ""
+            cmd = self._build_sender_command(
+                host=host,
+                port=port,
+                profile_name=profile,
+                ffmpeg_path=ffmpeg,
+                system_audio=audio_enabled,
+                audio=audio_config,
+            )
             self.last_command = list(cmd)
             self._process = self._start_process_no_console(cmd, "ffmpeg")
+            fallback_cmd = []
+            if audio_enabled:
+                fallback_cmd = self._build_sender_command(
+                    host=host,
+                    port=port,
+                    profile_name=profile,
+                    ffmpeg_path=ffmpeg,
+                    system_audio=False,
+                    audio={"enabled": False, "mode": "none"},
+                )
         except Exception as exc:
             return self._set_error(str(exc))
 
         self._state = STATE_SENDING
-        self.last_error = ""
+        self.last_error = audio_notice
         self.last_returncode = None
         self.current_mode = STATE_SENDING
         self.current_host = host
         self.current_port = port
         self.current_profile = profile
         self.current_peer_label = peer_label_text or None
+        self._set_audio_session(audio_config)
+        if audio_requested:
+            self._write_process_log_note(self._screen_audio_launch_note(audio_config))
+        if audio_enabled:
+            self._schedule_audio_fallback_check(self._process, fallback_cmd, delay_sec=1.0)
+            self._schedule_audio_fallback_check(self._process, fallback_cmd, delay_sec=2.5)
         return self.get_state()
 
     def stop(self) -> Dict[str, object]:
@@ -202,6 +245,16 @@ class ScreenRuntime:
             except Exception:
                 pass
 
+    def _write_process_log_note(self, text: str) -> None:
+        handle = self._process_log_file
+        if handle is None:
+            return
+        try:
+            handle.write(f"[AgoraLink] {str(text or '').strip()}\n")
+            handle.flush()
+        except Exception:
+            pass
+
     def _start_process_no_console(self, cmd: List[str], tool_name: str) -> subprocess.Popen[bytes]:
         self._close_process_log_file()
         log_file = self._open_process_log_file(tool_name)
@@ -234,6 +287,47 @@ class ScreenRuntime:
         timer = threading.Timer(max(0.0, float(delay_sec or 0.0)), lambda: self._handle_startup_exit_check(proc, tool_name))
         timer.daemon = True
         timer.start()
+
+    def _schedule_audio_fallback_check(self, proc: Optional[subprocess.Popen[bytes]], fallback_cmd: List[str], delay_sec: float = 1.0) -> None:
+        if proc is None or not fallback_cmd:
+            return
+        timer = threading.Timer(
+            max(0.0, float(delay_sec or 0.0)),
+            lambda: self._handle_audio_fallback_check(proc, list(fallback_cmd)),
+        )
+        timer.daemon = True
+        timer.start()
+
+    def _handle_audio_fallback_check(self, proc: subprocess.Popen[bytes], fallback_cmd: List[str]) -> None:
+        if proc is None or proc is not self._process:
+            return
+        returncode = proc.poll()
+        if returncode is None:
+            return
+        tail = self._read_process_log_tail("ffmpeg")
+        self.last_returncode = int(returncode)
+        self._process = None
+        self._close_process_log_file()
+        self.current_audio_enabled = False
+        self.current_audio_mode = "none"
+        self.current_audio_state = "fallback_video_only"
+        self.current_audio_config = {"enabled": False, "mode": "none", "state": "fallback_video_only"}
+        self.current_audio_error = f"system audio ffmpeg exited with code {returncode}"
+        self.current_audio_input = ""
+        message = "System audio unavailable, continued video-only."
+        if tail:
+            message = message + "\n" + tail
+        self.last_error = message
+        try:
+            self.last_command = list(fallback_cmd)
+            self._process = self._start_process_no_console(fallback_cmd, "ffmpeg")
+            self._state = STATE_SENDING
+            self._schedule_startup_exit_check("ffmpeg", delay_sec=1.0)
+        except Exception as exc:
+            self._state = STATE_ERROR
+            self.current_audio_state = "audio_failed"
+            self.current_audio_error = str(exc)
+            self.last_error = f"System audio failed and video-only retry failed: {exc}"
 
     def _handle_startup_exit_check(self, proc: subprocess.Popen[bytes], tool_name: str) -> None:
         if proc is None or proc is not self._process:
@@ -303,6 +397,12 @@ class ScreenRuntime:
             "port": self.current_port,
             "profile": self.current_profile,
             "peer_label": self.current_peer_label,
+            "audio_enabled": self.current_audio_enabled,
+            "audio_mode": self.current_audio_mode,
+            "audio_state": self.current_audio_state,
+            "audio_config": dict(self.current_audio_config),
+            "audio_error": self.current_audio_error,
+            "audio_input": self.current_audio_input,
             "pid": int(self._process.pid) if running and getattr(self._process, "pid", None) is not None else None,
             "returncode": self.last_returncode,
             "last_error": self.last_error,
@@ -326,6 +426,12 @@ class ScreenRuntime:
         self.current_port = None
         self.current_profile = None
         self.current_peer_label = None
+        self.current_audio_enabled = False
+        self.current_audio_mode = "none"
+        self.current_audio_state = "video_only"
+        self.current_audio_config = {"enabled": False, "mode": "none"}
+        self.current_audio_error = ""
+        self.current_audio_input = ""
 
     def check_dependencies(self) -> Dict[str, object]:
         ffmpeg = self._find_media_tool("ffmpeg")
@@ -374,12 +480,22 @@ class ScreenRuntime:
             f"udp://0.0.0.0:{int(port)}?fifo_size=1000000&overrun_nonfatal=1",
         ]
 
-    def _build_sender_command(self, *, host: str, port: int, profile_name: str, ffmpeg_path: Optional[str] = None) -> List[str]:
+    def _build_sender_command(
+        self,
+        *,
+        host: str,
+        port: int,
+        profile_name: str,
+        ffmpeg_path: Optional[str] = None,
+        system_audio: bool = False,
+        audio: object = None,
+    ) -> List[str]:
         ffmpeg = str(ffmpeg_path or self._find_media_tool("ffmpeg") or "")
         if not ffmpeg:
             raise FileNotFoundError(self._missing_tool_error(["ffmpeg"]))
         profile = self._profile_for_name(profile_name)
-        return [
+        audio_config = self._normalize_audio_config(audio, enabled_default=bool(system_audio))
+        cmd = [
             ffmpeg,
             "-hide_banner",
             "-fflags",
@@ -390,6 +506,43 @@ class ScreenRuntime:
             str(profile.fps),
             "-i",
             "desktop",
+        ]
+        if audio_config.get("enabled"):
+            audio_backend = str(audio_config.get("backend") or "wasapi").strip().lower()
+            if audio_backend == "dshow":
+                input_name = str(
+                    audio_config.get("input_name")
+                    or audio_config.get("alternative_name")
+                    or audio_config.get("device_name")
+                    or ""
+                ).strip()
+                if not input_name:
+                    raise ValueError("dshow system audio input is missing")
+                cmd.extend(
+                    [
+                        "-thread_queue_size",
+                        "512",
+                        "-f",
+                        "dshow",
+                        "-i",
+                        f"audio={input_name}",
+                    ]
+                )
+            else:
+                cmd.extend(
+                    [
+                        "-thread_queue_size",
+                        "512",
+                        "-f",
+                        "wasapi",
+                        "-loopback",
+                        "1",
+                        "-i",
+                        "default",
+                    ]
+                )
+        cmd.extend(
+            [
             "-vf",
             f"scale={profile.width}:{profile.height},format=nv12",
             "-c:v",
@@ -406,10 +559,231 @@ class ScreenRuntime:
             "0",
             "-fps_mode",
             "cfr",
+            ]
+        )
+        if audio_config.get("enabled"):
+            cmd.extend(
+                [
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:a",
+                    "aac",
+                    "-ar",
+                    str(int(audio_config.get("sample_rate") or 48000)),
+                    "-ac",
+                    str(int(audio_config.get("channels") or 2)),
+                    "-b:a",
+                    self._audio_bitrate_arg(audio_config.get("bitrate")),
+                ]
+            )
+        cmd.extend(
+            [
             "-f",
             "mpegts",
             f"udp://{host}:{int(port)}?pkt_size=1316",
-        ]
+            ]
+        )
+        return cmd
+
+    def _normalize_audio_config(self, audio: object = None, *, enabled_default: bool = False) -> Dict[str, object]:
+        if isinstance(audio, Mapping):
+            enabled = bool(audio.get("enabled", enabled_default))
+            mode = str(audio.get("mode") or ("system" if enabled else "none")).strip().lower()
+            sample_rate = audio.get("sample_rate", 48000)
+            channels = audio.get("channels", 2)
+            bitrate = audio.get("bitrate", 128000)
+        else:
+            enabled = bool(enabled_default)
+            mode = "system" if enabled else "none"
+            sample_rate = 48000
+            channels = 2
+            bitrate = 128000
+        if not enabled:
+            return {"enabled": False, "mode": "none"}
+        if mode != "system":
+            raise ValueError("only system audio is supported")
+        result: Dict[str, object] = {
+            "enabled": True,
+            "mode": "system",
+            "codec": "aac",
+            "sample_rate": max(8000, int(sample_rate or 48000)),
+            "channels": max(1, int(channels or 2)),
+            "bitrate": max(32000, int(bitrate or 128000)),
+        }
+        if isinstance(audio, Mapping):
+            for key in ("backend", "input_name", "device_name", "alternative_name", "state"):
+                value = str(audio.get(key) or "").strip()
+                if value:
+                    result[key] = value
+        return result
+
+    def _set_audio_session(self, audio_config: Mapping[str, Any]) -> None:
+        enabled = bool((audio_config or {}).get("enabled"))
+        self.current_audio_enabled = enabled
+        self.current_audio_mode = "system" if enabled else "none"
+        self.current_audio_state = str((audio_config or {}).get("state") or ("system_audio_on" if enabled else "video_only"))
+        self.current_audio_config = dict(audio_config or {"enabled": False, "mode": "none"})
+        self.current_audio_error = str((audio_config or {}).get("error") or "")
+        self.current_audio_input = str(
+            (audio_config or {}).get("input_name")
+            or (audio_config or {}).get("alternative_name")
+            or (audio_config or {}).get("device_name")
+            or ""
+        )
+
+    def _audio_bitrate_arg(self, bitrate: object) -> str:
+        try:
+            value = int(bitrate or 128000)
+        except Exception:
+            value = 128000
+        if value % 1000 == 0:
+            return f"{max(1, value // 1000)}k"
+        return str(max(1, value))
+
+    def _resolve_system_audio_config(self, ffmpeg_path: str, audio_config: Mapping[str, Any]) -> Dict[str, object]:
+        base = dict(audio_config or {})
+        if not bool(base.get("enabled")):
+            return {"enabled": False, "mode": "none"}
+        explicit_backend = str(base.get("backend") or "").strip().lower()
+        if explicit_backend:
+            return base
+        if os.name == "nt" and self._ffmpeg_supports_wasapi(ffmpeg_path):
+            base.update({"backend": "wasapi", "input_name": "default"})
+            return base
+        if os.name == "nt":
+            device = self._find_dshow_system_mix_device(ffmpeg_path)
+            if device:
+                input_name = str(device.get("alternative_name") or device.get("name") or "").strip()
+                base.update(
+                    {
+                        "backend": "dshow",
+                        "input_name": input_name,
+                        "device_name": str(device.get("name") or ""),
+                        "alternative_name": str(device.get("alternative_name") or ""),
+                    }
+                )
+                return base
+        return {
+            "enabled": False,
+            "mode": "none",
+            "state": "fallback_video_only",
+            "error": "system audio unavailable",
+        }
+
+    def _ffmpeg_supports_wasapi(self, ffmpeg_path: str) -> bool:
+        key = str(ffmpeg_path or "")
+        if key in self._wasapi_support_cache:
+            return bool(self._wasapi_support_cache[key])
+        output = self._run_ffmpeg_probe([key, "-hide_banner", "-devices"], timeout_sec=2.5)
+        supported = bool(re.search(r"(^|\s)wasapi(\s|$)", output, flags=re.IGNORECASE | re.MULTILINE))
+        self._wasapi_support_cache[key] = supported
+        return supported
+
+    def _find_dshow_system_mix_device(self, ffmpeg_path: str) -> Dict[str, str]:
+        devices = self._dshow_audio_devices(ffmpeg_path)
+        return self._select_dshow_system_mix_device(devices)
+
+    def _dshow_audio_devices(self, ffmpeg_path: str) -> List[Dict[str, str]]:
+        key = str(ffmpeg_path or "")
+        if key in self._dshow_audio_devices_cache:
+            return [dict(item) for item in self._dshow_audio_devices_cache[key]]
+        output = self._run_ffmpeg_probe(
+            [key, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+            timeout_sec=4.0,
+        )
+        devices = self._parse_dshow_audio_devices(output)
+        self._dshow_audio_devices_cache[key] = [dict(item) for item in devices]
+        return devices
+
+    def _run_ffmpeg_probe(self, args: List[str], timeout_sec: float = 3.0) -> str:
+        if not args or not str(args[0] or "").strip():
+            return ""
+        try:
+            result = run_no_console(
+                args,
+                cwd=str(self.script_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=max(1.0, float(timeout_sec or 3.0)),
+            )
+            return (str(result.stdout or "") + "\n" + str(result.stderr or "")).strip()
+        except Exception as exc:
+            return str(exc)
+
+    def _parse_dshow_audio_devices(self, text: str) -> List[Dict[str, str]]:
+        devices: List[Dict[str, str]] = []
+        in_audio_section = False
+        current: Optional[Dict[str, str]] = None
+        for raw_line in str(text or "").splitlines():
+            line = raw_line.strip()
+            lower = line.lower()
+            if "directshow audio devices" in lower:
+                in_audio_section = True
+                current = None
+                continue
+            if "directshow video devices" in lower:
+                in_audio_section = False
+                current = None
+                continue
+            alt_match = re.search(r'Alternative name\s+"([^"]+)"', line, flags=re.IGNORECASE)
+            if alt_match and current is not None:
+                current["alternative_name"] = alt_match.group(1).strip()
+                continue
+            if "alternative name" in lower:
+                continue
+            explicit_audio = "(audio)" in lower
+            if not in_audio_section and not explicit_audio:
+                continue
+            name_match = re.search(r'"([^"]+)"(?:\s+\(audio\))?\s*$', line)
+            if name_match:
+                current = {"name": name_match.group(1).strip(), "alternative_name": "", "raw": raw_line}
+                devices.append(current)
+        return devices
+
+    def _select_dshow_system_mix_device(self, devices: List[Dict[str, str]]) -> Dict[str, str]:
+        for item in devices or []:
+            name = str((item or {}).get("name") or "")
+            alternative = str((item or {}).get("alternative_name") or "")
+            haystack = f"{name}\n{alternative}"
+            if self._is_excluded_audio_capture_name(haystack):
+                continue
+            if self._is_system_mix_audio_name(haystack):
+                return dict(item)
+        return {}
+
+    def _is_system_mix_audio_name(self, text: str) -> bool:
+        lower = str(text or "").lower()
+        keywords = (
+            "stereo mix",
+            "立体声混音",
+            "立體聲混音",
+            "what u hear",
+            "wave out mix",
+            "wave mix",
+            "绔嬩綋澹版贩闊",
+        )
+        return any(keyword.lower() in lower for keyword in keywords)
+
+    def _is_excluded_audio_capture_name(self, text: str) -> bool:
+        lower = str(text or "").lower()
+        blocked = ("microphone", "麦克风", "麥克風", "麦克风阵列", "插孔麦克风")
+        if any(item.lower() in lower for item in blocked):
+            return True
+        return bool(re.search(r"(^|[\s(_-])mic($|[\s)_-])", lower))
+
+    def _screen_audio_launch_note(self, audio_config: Mapping[str, Any]) -> str:
+        if not bool((audio_config or {}).get("enabled")):
+            return "system audio unavailable; using video-only screen stream"
+        backend = str((audio_config or {}).get("backend") or "wasapi")
+        input_name = str((audio_config or {}).get("input_name") or "default")
+        if backend == "dshow":
+            return f'system audio input selected: -f dshow -i audio="{input_name}"'
+        return f"system audio input selected: -f wasapi -loopback 1 -i {input_name}"
 
     def _profile_for_name(self, profile_name: object) -> ScreenProfile:
         normalized = profile_id_from_info(profile_name)
@@ -691,6 +1065,38 @@ def _run_self_test() -> Dict[str, object]:
     fast_exit_state = fast_exit_runtime.get_state()
     missing_runtime = ScreenRuntime(popen_factory=fake_popen, taskkill_runner=fake_taskkill, tool_finder=lambda _name: "")
     missing_state = missing_runtime.start_sender("127.0.0.1")
+    sample_dshow = r'''
+[dshow @ 000001] DirectShow audio devices
+[dshow @ 000001]  "Microphone (Realtek(R) Audio)" (audio)
+[dshow @ 000001]     Alternative name "@device_cm_{MIC}\wave_{MIC}"
+[dshow @ 000001]  "绔嬩綋澹版贩闊?(Realtek(R) Audio)" (audio)
+[dshow @ 000001]     Alternative name "@device_cm_{33D9A762-90C8-11D0-BD43-00A0C911CE86}\wave_{9801B1F7-24E7-4D18-A739-D6DD3DB6444E}"
+'''
+    parsed_devices = runtime._parse_dshow_audio_devices(sample_dshow)
+    selected_mix = runtime._select_dshow_system_mix_device(parsed_devices)
+    expected_mix_alt = r"@device_cm_{33D9A762-90C8-11D0-BD43-00A0C911CE86}\wave_{9801B1F7-24E7-4D18-A739-D6DD3DB6444E}"
+    sample_dshow_inline = rf'''
+[in#0 @ 000001] "Integrated Webcam" (video)
+[in#0 @ 000001]   Alternative name "@device_pnp_\\?\usb#camera"
+[in#0 @ 000001] "插孔麦克风 (Realtek(R) Audio)" (audio)
+[in#0 @ 000001]   Alternative name "@device_cm_{{MIC}}\wave_{{MIC}}"
+[in#0 @ 000001] "立体声混音 (Realtek(R) Audio)" (audio)
+[in#0 @ 000001]   Alternative name "{expected_mix_alt}"
+'''
+    parsed_inline_devices = runtime._parse_dshow_audio_devices(sample_dshow_inline)
+    selected_inline_mix = runtime._select_dshow_system_mix_device(parsed_inline_devices)
+    dshow_cmd = runtime._build_sender_command(
+        host="127.0.0.1",
+        port=DEFAULT_SCREEN_PORT,
+        profile_name=DEFAULT_SCREEN_PROFILE,
+        ffmpeg_path=expected_ffmpeg,
+        audio={
+            "enabled": True,
+            "mode": "system",
+            "backend": "dshow",
+            "input_name": expected_mix_alt,
+        },
+    )
     checks = [
         initial_state["state"] == STATE_IDLE,
         receiver_state["state"] == STATE_RECEIVING,
@@ -728,6 +1134,14 @@ def _run_self_test() -> Dict[str, object]:
         fast_exit_state["command"][0] == expected_ffplay,
         missing_state["state"] == STATE_ERROR,
         "winget install --id Gyan.FFmpeg -e" in str(missing_state["last_error"]),
+        len(parsed_devices) == 2,
+        selected_mix.get("alternative_name") == expected_mix_alt,
+        len(parsed_inline_devices) == 2,
+        selected_inline_mix.get("alternative_name") == expected_mix_alt,
+        not runtime._is_system_mix_audio_name("Microphone (Realtek(R) Audio)"),
+        runtime._is_excluded_audio_capture_name("Mic Array"),
+        "-f" in dshow_cmd and "dshow" in dshow_cmd,
+        f"audio={expected_mix_alt}" in dshow_cmd,
     ]
     return {
         "ok": all(checks),
