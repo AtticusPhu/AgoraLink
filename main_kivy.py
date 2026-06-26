@@ -289,6 +289,8 @@ from file_transfer_common import (
 )
 from screen_control import (
     DEFAULT_SCREEN_PORT,
+    SCREEN_BACKEND_FFMPEG,
+    SCREEN_BACKEND_RUST,
     SCREEN_SHARE_ACCEPT,
     SCREEN_SHARE_OFFER,
     SCREEN_SHARE_REJECT,
@@ -347,6 +349,9 @@ except Exception:
 SCREEN_CONTROL_TEXT_PREFIX = "__AGORALINK_SCREEN_CONTROL__:"
 MAIN_UDP_PORT = 9999
 SCREEN_PORT_CANDIDATES = tuple(range(DEFAULT_SCREEN_PORT, DEFAULT_SCREEN_PORT + 6))
+RUST_SCREEN_PORT_CANDIDATES = tuple(range(55000, 56000))
+SCREEN_BACKEND_VALUES = (SCREEN_BACKEND_FFMPEG, SCREEN_BACKEND_RUST)
+RUST_SCREEN_PORTS_BUSY_MESSAGE = "Rust native screen ports 55000-55999 are unavailable."
 MAIN_UDP_PORT_BUSY_MESSAGE = "UDP 9999 已被占用，请关闭旧的 AgoraLink 或修改配置后重启。"
 SCREEN_PORTS_BUSY_MESSAGE = "投屏端口 50020-50025 均被占用，无法启动接收端。"
 
@@ -2128,6 +2133,7 @@ class RUDPTransferRoot(BoxLayout):
         self.gui_config = load_gui_config()
         self.auto_package_multi_selection = bool(self.gui_config.get("auto_package_multi_selection", True))
         self.share_system_audio = bool(self.gui_config.get("screen_share_system_audio", False))
+        self.screen_backend = self._normalize_screen_backend(self.gui_config.get("screen_backend", SCREEN_BACKEND_FFMPEG))
         self.current_chat_mode = "group"
         self.current_group_id = ""
         self.current_peer_id = ""
@@ -2159,6 +2165,7 @@ class RUDPTransferRoot(BoxLayout):
         self.screen_share_current_port: Optional[int] = None
         self.screen_share_selected_profile = ""
         self.screen_share_current_audio: Dict[str, object] = {"enabled": False, "mode": "none"}
+        self.screen_share_current_backend = str(self.screen_backend or SCREEN_BACKEND_FFMPEG)
         self.current_screen_peer = ""
         self.current_screen_profile = ""
         self.current_screen_port: Optional[int] = None
@@ -4132,6 +4139,36 @@ class RUDPTransferRoot(BoxLayout):
     def _screen_audio_enabled(self) -> bool:
         return bool(getattr(self, "share_system_audio", False))
 
+    def _normalize_screen_backend(self, backend: object) -> str:
+        value = str(backend or SCREEN_BACKEND_FFMPEG).strip().lower()
+        if value not in SCREEN_BACKEND_VALUES:
+            return SCREEN_BACKEND_FFMPEG
+        return value
+
+    def _screen_backend(self) -> str:
+        value = self._normalize_screen_backend(getattr(self, "screen_backend", SCREEN_BACKEND_FFMPEG))
+        self.screen_backend = value
+        return value
+
+    def _screen_backend_label(self, backend: object = None) -> str:
+        value = self._normalize_screen_backend(self._screen_backend() if backend is None else backend)
+        return "Rust Native" if value == SCREEN_BACKEND_RUST else "FFmpeg"
+
+    def _screen_backend_from_control(self, control: Dict[str, object], payload: Optional[Dict[str, object]] = None, default: object = SCREEN_BACKEND_FFMPEG) -> str:
+        payload = dict(payload or control.get("payload") or {})
+        return self._normalize_screen_backend(payload.get("backend") or control.get("backend") or default)
+
+    def _screen_audio_for_backend(self, backend: object, audio: Dict[str, object]) -> Dict[str, object]:
+        backend_name = self._normalize_screen_backend(backend)
+        if backend_name == SCREEN_BACKEND_RUST and bool((audio or {}).get("enabled")):
+            return {
+                "enabled": False,
+                "mode": "none",
+                "state": "video_only",
+                "error": "Rust native backend currently supports video only",
+            }
+        return dict(audio or {"enabled": False, "mode": "none"})
+
     def _screen_audio_config(self, enabled: Optional[bool] = None) -> Dict[str, object]:
         use_audio = self._screen_audio_enabled() if enabled is None else bool(enabled)
         if not use_audio:
@@ -5375,6 +5412,14 @@ class RUDPTransferRoot(BoxLayout):
         audio_checkbox = CheckBox(active=bool(getattr(self, "share_system_audio", False)), size_hint_x=None, width=dp(42))
         audio_line.add_widget(audio_checkbox)
         content.add_widget(audio_line)
+        backend_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(8))
+        backend_line.add_widget(make_label(text="Screen backend", size_hint_x=None, width=dp(220), color=THEME["muted_text"], halign="left", valign="middle"))
+        bind_label_wrap(backend_line.children[0])
+        backend_spinner = style_spinner(
+            Spinner(text=self._screen_backend(), values=list(SCREEN_BACKEND_VALUES), font_name=UI_FONT)
+        )
+        backend_line.add_widget(backend_spinner)
+        content.add_widget(backend_line)
         note = make_label(
             text="诊断日志已移到“诊断”窗口。普通设置只保留日常选项。",
             size_hint_y=None,
@@ -5391,16 +5436,21 @@ class RUDPTransferRoot(BoxLayout):
             self.theme_mode = theme_spinner.text
             self.apply_theme_mode(self.theme_mode)
             old_audio = bool(getattr(self, "share_system_audio", False))
+            old_backend = self._screen_backend()
             self.auto_package_multi_selection = bool(package_checkbox.active)
             self.share_system_audio = bool(audio_checkbox.active)
+            self.screen_backend = self._normalize_screen_backend(backend_spinner.text)
             try:
                 self.gui_config["auto_package_multi_selection"] = bool(self.auto_package_multi_selection)
                 self.gui_config["screen_share_system_audio"] = bool(self.share_system_audio)
+                self.gui_config["screen_backend"] = str(self.screen_backend)
                 save_gui_config(self.gui_config)
             except Exception:
                 pass
             if old_audio != bool(self.share_system_audio) and self._screen_share_button_active():
                 self._set_screen_share_status("共享系统音频设置将在下次投屏生效" if self.lang == "zh" else "System audio setting applies to the next screen share")
+            if old_backend != self.screen_backend and self._screen_share_button_active():
+                self._set_screen_share_status("Screen backend setting applies to the next screen share")
         buttons.add_widget(make_button("primary", text="应用", on_release=_apply_theme))
         export_btn = make_button("secondary", text="导出诊断包")
         export_btn.bind(on_release=lambda *_: self.export_diagnostic_logs_async(log_box=self.sender_log_box, button=export_btn))
@@ -5617,8 +5667,22 @@ class RUDPTransferRoot(BoxLayout):
         threading.Thread(target=_run_stop, daemon=True).start()
         return True
 
-    def _choose_screen_receive_port(self) -> Optional[int]:
-        return find_available_udp_port(SCREEN_PORT_CANDIDATES)
+    def _choose_screen_receive_port(self, backend: object = None) -> Optional[int]:
+        backend_name = self._normalize_screen_backend(self._screen_backend() if backend is None else backend)
+        if backend_name != SCREEN_BACKEND_RUST:
+            return find_available_udp_port(SCREEN_PORT_CANDIDATES)
+        for port in RUST_SCREEN_PORT_CANDIDATES:
+            status = udp_port_status(port)
+            if status.get("available"):
+                return int(port)
+            error_text = str(status.get("error") or "")
+            if "10013" in error_text or "access permissions" in error_text.lower():
+                self._append_debug_line("Port denied by Windows policy; trying another high port", protocol=False)
+        return None
+
+    def _screen_receive_ports_busy_message(self, backend: object = None) -> str:
+        backend_name = self._normalize_screen_backend(self._screen_backend() if backend is None else backend)
+        return RUST_SCREEN_PORTS_BUSY_MESSAGE if backend_name == SCREEN_BACKEND_RUST else SCREEN_PORTS_BUSY_MESSAGE
 
     def _screen_peer_label(self, peer_id: str = "", fallback_host: str = "") -> str:
         pid = str(peer_id or "").strip()
@@ -5658,6 +5722,7 @@ class RUDPTransferRoot(BoxLayout):
         profile: Optional[str] = None,
         port: Optional[int] = None,
         audio: Optional[Dict[str, object]] = None,
+        backend: Optional[str] = None,
     ) -> None:
         if peer_label is not None:
             self.screen_share_peer_label = str(peer_label or "").strip()
@@ -5670,12 +5735,15 @@ class RUDPTransferRoot(BoxLayout):
             self.current_screen_port = int(port)
         if audio is not None:
             self.screen_share_current_audio = dict(audio or {"enabled": False, "mode": "none"})
+        if backend is not None:
+            self.screen_share_current_backend = self._normalize_screen_backend(backend)
 
     def _clear_current_screen_context(self) -> None:
         self.screen_share_peer_label = ""
         self.screen_share_current_port = None
         self.screen_share_selected_profile = ""
         self.screen_share_current_audio = {"enabled": False, "mode": "none"}
+        self.screen_share_current_backend = self._screen_backend()
         self.current_screen_peer = ""
         self.current_screen_profile = ""
         self.current_screen_port = None
@@ -5717,17 +5785,24 @@ class RUDPTransferRoot(BoxLayout):
                 main_status = "本机 AgoraLink 接收端正在使用"
             else:
                 main_status = "已被占用，请关闭旧的 AgoraLink 或修改配置后重启"
-            screen_statuses = udp_ports_status(SCREEN_PORT_CANDIDATES)
+            backend = self._screen_backend()
+            screen_port_candidates = RUST_SCREEN_PORT_CANDIDATES if backend == SCREEN_BACKEND_RUST else SCREEN_PORT_CANDIDATES
+            screen_port_range = "55000-55999" if backend == SCREEN_BACKEND_RUST else "50020-50025"
+            screen_statuses = udp_ports_status(screen_port_candidates)
             occupied = [str(item.get("port")) for item in screen_statuses if not item.get("available")]
             occupied_text = ", ".join(occupied) if occupied else "无"
             current_port = self._current_screen_port_text(state) or "无"
             selected_profile = self._current_screen_profile_name(state) or "无"
             current_encoder = self._current_screen_encoder(selected_profile)
-            profile_ids = [str(item.get("id") or item.get("name") or "") for item in self._screen_advertised_profiles()]
+            if backend == SCREEN_BACKEND_RUST:
+                profile_ids = [DEFAULT_SCREEN_PROFILE]
+            else:
+                profile_ids = [str(item.get("id") or item.get("name") or "") for item in self._screen_advertised_profiles()]
             profiles_text = ", ".join([item for item in profile_ids if item]) or "无"
             return (
                 f"UDP 9999: {main_status}\n"
-                f"UDP 50020-50025 被占用: {occupied_text}\n"
+                f"screen backend: {self._screen_backend_label(backend)}\n"
+                f"UDP {screen_port_range} occupied: {occupied_text}\n"
                 f"本机可发送 profiles: {profiles_text}\n"
                 f"当前 selected_profile: {selected_profile}\n"
                 f"当前 encoder: {current_encoder or '无'}\n"
@@ -5745,14 +5820,19 @@ class RUDPTransferRoot(BoxLayout):
         peer_label = self._current_screen_peer_label(state)
         selected_profile = self._current_screen_profile_name(state) or str(state.get("profile") or "")
         screen_port = self._current_screen_port_text(state)
+        backend = str(state.get("backend") or self._screen_backend())
+        native_stats = dict(state.get("native_stats") or {})
         return (
             f"screen_state: {state.get('state') or ''}    running: {bool(state.get('running'))}\n"
+            f"backend: {self._screen_backend_label(backend)}\n"
             f"mode: {state.get('mode') or ''}    host: {state.get('host') or ''}\n"
             f"peer_label: {peer_label}\n"
             f"selected_profile: {selected_profile}    screen_port: {screen_port}\n"
             f"audio: {state.get('audio_state') or 'video_only'}\n"
             f"ffmpeg_path: {deps.get('ffmpeg_path') or ''}\n"
             f"ffplay_path: {deps.get('ffplay_path') or ''}\n"
+            f"rust_native_path: {deps.get('rust_native_path') or deps.get('native_media_path') or ''}\n"
+            f"native_stats: fps={native_stats.get('fps') or native_stats.get('fps_render') or ''} mbps={native_stats.get('mbps') or ''} frames_sent={native_stats.get('frames_sent') or ''} frames_rendered={native_stats.get('frames_rendered') or ''} packets_lost={native_stats.get('packets_lost_estimate') or ''} decoder_errors={native_stats.get('decoder_errors') or ''}\n"
             f"last_error: {state.get('last_error') or ''}\n"
             f"{self._format_udp_port_diagnostics(state)}"
         )
@@ -5868,12 +5948,15 @@ class RUDPTransferRoot(BoxLayout):
         except Exception as exc:
             main_port = {"available": False, "occupied": False, "error": str(exc), "port": MAIN_UDP_PORT}
         try:
-            screen_ports = udp_ports_status(SCREEN_PORT_CANDIDATES)
+            backend = self._screen_backend()
+            ports = RUST_SCREEN_PORT_CANDIDATES if backend == SCREEN_BACKEND_RUST else SCREEN_PORT_CANDIDATES
+            screen_ports = udp_ports_status(ports)
         except Exception:
             screen_ports = []
         return {
             "runtime_state": runtime_state,
             "dependencies": deps,
+            "screen_backend": self._screen_backend(),
             "receiver_running": receiver_running,
             "main_port": main_port,
             "screen_ports": screen_ports,
@@ -5893,19 +5976,26 @@ class RUDPTransferRoot(BoxLayout):
 
     def _diagnostic_screen_ports_summary(self, snapshot: Dict[str, object]) -> Tuple[str, str, str]:
         statuses = list(snapshot.get("screen_ports") or [])
+        backend = self._normalize_screen_backend(snapshot.get("screen_backend") or self._screen_backend())
+        port_range = "55000-55999" if backend == SCREEN_BACKEND_RUST else "50020-50025"
         if not statuses:
-            return "需检查", "投屏端口 50020-50025 状态暂不可用。", "warning"
+            return "需检查", f"投屏端口 {port_range} 状态暂不可用。", "warning"
         occupied = [str(item.get("port")) for item in statuses if not item.get("available")]
         available = [str(item.get("port")) for item in statuses if item.get("available")]
         current = self._current_screen_port_text(dict(snapshot.get("runtime_state") or {})) or "无"
         if len(available) == 0:
-            return "异常", "投屏端口 50020-50025 均被占用，无法启动接收端。", "danger"
+            return "异常", f"投屏端口 {port_range} 均被占用，无法启动接收端。", "danger"
         if occupied:
             return "可用", f"可用：{', '.join(available)}；占用：{', '.join(occupied)}；当前：{current}", "warning"
-        return "正常", f"50020-50025 均可用；当前投屏端口：{current}", "neutral"
+        return "正常", f"{port_range} 均可用；当前投屏端口：{current}", "neutral"
 
     def _diagnostic_dependencies_summary(self, snapshot: Dict[str, object]) -> Tuple[str, str, str]:
         deps = dict(snapshot.get("dependencies") or {})
+        backend = self._normalize_screen_backend(snapshot.get("screen_backend") or self._screen_backend())
+        if backend == SCREEN_BACKEND_RUST:
+            if bool(deps.get("rust_native_ok") or deps.get("native_media_ok")):
+                return "正常", "Rust native media executable found.", "neutral"
+            return "异常", "Rust native media executable not found", "danger"
         ffmpeg_ok = bool(deps.get("ffmpeg_ok"))
         ffplay_ok = bool(deps.get("ffplay_ok"))
         if ffmpeg_ok and ffplay_ok:
@@ -6032,14 +6122,16 @@ class RUDPTransferRoot(BoxLayout):
 
     def _screen_debug_start_receiver(self, status_label: Label) -> None:
         try:
-            screen_port = self._choose_screen_receive_port()
+            backend = self._screen_backend()
+            screen_port = self._choose_screen_receive_port(backend)
             if screen_port is None:
                 self._clear_current_screen_context()
+                busy_message = self._screen_receive_ports_busy_message(backend)
                 try:
-                    self._screen_runtime().last_error = SCREEN_PORTS_BUSY_MESSAGE
+                    self._screen_runtime().last_error = busy_message
                 except Exception:
                     pass
-                status_label.text = SCREEN_PORTS_BUSY_MESSAGE + "\n" + self._format_udp_port_diagnostics()
+                status_label.text = busy_message + "\n" + self._format_udp_port_diagnostics()
                 return
             selected_profile = self._screen_preferred_profile()
             peer_label = "Debug"
@@ -6051,12 +6143,13 @@ class RUDPTransferRoot(BoxLayout):
                 selected_profile=selected_profile,
                 screen_port=screen_port,
                 audio=audio_config,
+                backend=backend,
             )
             if str(state.get("state") or "") == "receiving":
-                self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port, audio=audio_config)
+                self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port, audio=audio_config, backend=backend)
             else:
                 self._clear_current_screen_context()
-            self._append_debug_line(f"screen receiver start requested port={screen_port} profile={selected_profile}", protocol=False)
+            self._append_debug_line(f"screen receiver start requested backend={backend} port={screen_port} profile={selected_profile}", protocol=False)
         except Exception as exc:
             self._clear_current_screen_context()
             try:
@@ -6073,30 +6166,33 @@ class RUDPTransferRoot(BoxLayout):
             if not host:
                 status_label.text = "screen sender start failed: target IP is required"
                 return
+            backend = self._screen_backend()
             selected_profile = self._screen_preferred_profile()
             peer_label = host
-            audio_config = self._screen_audio_config()
+            audio_config = self._screen_audio_for_backend(backend, self._screen_audio_config())
+            debug_port = int(getattr(self, "screen_share_current_port", None) or (RUST_SCREEN_PORT_CANDIDATES[0] if backend == SCREEN_BACKEND_RUST else DEFAULT_SCREEN_PORT))
             state = self._screen_runtime().start_sender(
                 host=host,
-                port=DEFAULT_SCREEN_PORT,
+                port=debug_port,
                 profile=selected_profile,
                 peer_label=peer_label,
                 selected_profile=selected_profile,
-                screen_port=DEFAULT_SCREEN_PORT,
+                screen_port=debug_port,
                 system_audio=bool(audio_config.get("enabled")),
                 audio=audio_config,
+                backend=backend,
             )
             if str(state.get("state") or "") == "sending":
-                self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=DEFAULT_SCREEN_PORT, audio=self._screen_audio_from_runtime_state(state, audio_config))
+                self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=debug_port, audio=self._screen_audio_from_runtime_state(state, audio_config), backend=backend)
                 self._schedule_screen_audio_fallback_ui_update(
                     session_id=str(getattr(self, "screen_share_session_id", "") or "debug_screen"),
                     peer_id=str(getattr(self, "current_peer_id", "") or ""),
                     peer_label=peer_label,
                     profile=selected_profile,
-                    port=DEFAULT_SCREEN_PORT,
+                    port=debug_port,
                     offered_audio=audio_config,
                 )
-            self._append_debug_line(f"screen sender start requested host={host} port={DEFAULT_SCREEN_PORT} profile={selected_profile}", protocol=False)
+            self._append_debug_line(f"screen sender start requested backend={backend} host={host} port={debug_port} profile={selected_profile}", protocol=False)
         except Exception as exc:
             self._clear_current_screen_context()
             try:
@@ -6461,7 +6557,15 @@ class RUDPTransferRoot(BoxLayout):
             return
         try:
             session_id = "screen_" + secrets.token_hex(12)
-            profiles = self._screen_advertised_profiles(force=True)
+            backend = self._screen_backend()
+            if backend == SCREEN_BACKEND_RUST:
+                preferred_profile = DEFAULT_SCREEN_PROFILE
+                profile = self._screen_profile_dict(preferred_profile)
+                profiles = [dict(profile)]
+            else:
+                profiles = self._screen_advertised_profiles(force=True)
+                preferred_profile = self._screen_preferred_profile()
+                profile = self._screen_profile_dict(preferred_profile)
             if not profiles:
                 reason = "没有可用的本机投屏档位"
                 status_text = self._screen_start_failed_text(reason)
@@ -6480,9 +6584,9 @@ class RUDPTransferRoot(BoxLayout):
                     )
                 self._set_screen_share_ui_state("idle")
                 return
-            preferred_profile = self._screen_preferred_profile()
-            profile = self._screen_profile_dict(preferred_profile)
-            audio_config = self._screen_audio_config()
+            audio_config = self._screen_audio_for_backend(backend, self._screen_audio_config())
+            if backend == SCREEN_BACKEND_RUST and bool(self._screen_audio_config().get("enabled")):
+                self._set_screen_share_status("Rust native backend currently supports video only")
             peer_id = str(self.current_peer_id or "")
             peer_label = self._screen_peer_label(peer_id)
             self._append_debug_line(
@@ -6500,6 +6604,7 @@ class RUDPTransferRoot(BoxLayout):
                 profiles=profiles,
                 preferred_profile=preferred_profile,
                 audio=audio_config,
+                backend=backend,
             )
             self.screen_share_session_id = session_id
             self.screen_share_peer_id = peer_id
@@ -6507,6 +6612,7 @@ class RUDPTransferRoot(BoxLayout):
             self.screen_share_peer_label = peer_label
             self.current_screen_peer = peer_label
             self.screen_share_current_audio = dict(audio_config)
+            self.screen_share_current_backend = backend
             if self._send_screen_control_to_peer(peer_id, offer):
                 status_text = self._screen_share_status_text("pending_offer", peer_label=peer_label)
                 self._set_screen_share_ui_state("pending_offer")
@@ -6621,6 +6727,7 @@ class RUDPTransferRoot(BoxLayout):
                 profile_name = profile_id_from_info(payload.get("preferred_profile") or payload.get("profile_name") or DEFAULT_SCREEN_PROFILE, DEFAULT_SCREEN_PROFILE)
                 offer_port = payload.get("port") or DEFAULT_SCREEN_PORT
                 audio_config = self._screen_audio_from_control(control, payload)
+                backend = self._screen_backend_from_control(control, payload, SCREEN_BACKEND_FFMPEG)
                 self.pending_screen_offers[session_id] = dict(control)
                 status_text = f"收到 {peer_label} 的投屏邀请" if self.lang == "zh" else f"Screen share invitation from {peer_label}"
                 self._add_screen_chat_card(
@@ -6630,7 +6737,7 @@ class RUDPTransferRoot(BoxLayout):
                     title=self._screen_offer_title(),
                     subtitle=peer_label,
                     status=status_text,
-                    detail=self._screen_detail_text(profile_name, offer_port, audio_config),
+                    detail=self._screen_detail_text(profile_name, offer_port, audio_config) + f"  backend: {self._screen_backend_label(backend)}",
                     profile=profile_name,
                     port=offer_port,
                     actions=[
@@ -6709,7 +6816,8 @@ class RUDPTransferRoot(BoxLayout):
         payload = dict(control.get("payload") or {})
         sender_host = str(payload.get("host") or "").strip()
         peer_label = self._screen_peer_label(sender, sender_host)
-        audio_config = self._screen_audio_from_control(control, payload)
+        backend = self._screen_backend_from_control(control, payload, SCREEN_BACKEND_FFMPEG)
+        audio_config = self._screen_audio_for_backend(backend, self._screen_audio_from_control(control, payload))
         try:
             if session_id:
                 self.pending_screen_offers.pop(session_id, None)
@@ -6731,10 +6839,12 @@ class RUDPTransferRoot(BoxLayout):
                 title=self._screen_offer_title(),
                 subtitle=peer_label,
                 status=starting_text,
-                detail=self._screen_detail_text(self._preferred_screen_profile_from_offer(control, payload), payload.get("port") or DEFAULT_SCREEN_PORT, audio_config),
+                detail=self._screen_detail_text(self._preferred_screen_profile_from_offer(control, payload), payload.get("port") or DEFAULT_SCREEN_PORT, audio_config) + f"  backend: {self._screen_backend_label(backend)}",
             )
             offered_profiles = self._offered_screen_profiles(control, payload)
-            if offered_profiles:
+            if backend == SCREEN_BACKEND_RUST:
+                selected_profile_info = self._legacy_screen_profile_from_offer(payload)
+            elif offered_profiles:
                 local_profiles = self._screen_advertised_profiles(force=True)
                 user_preferred = str((self.gui_config or {}).get("screen_preferred_profile") or "").strip()
                 preferred = user_preferred or self._preferred_screen_profile_from_offer(control, payload)
@@ -6763,10 +6873,11 @@ class RUDPTransferRoot(BoxLayout):
                 selected_profile_info = self._legacy_screen_profile_from_offer(payload)
             selected_profile_name = profile_id_from_info(selected_profile_info, DEFAULT_SCREEN_PROFILE)
             self._append_debug_line(f"ACCEPT selected profile: {selected_profile_name}", protocol=False)
-            screen_port = self._choose_screen_receive_port()
+            screen_port = self._choose_screen_receive_port(backend)
             if screen_port is None:
                 self._clear_current_screen_context()
-                failed_text = self._screen_start_failed_text(SCREEN_PORTS_BUSY_MESSAGE)
+                busy_message = self._screen_receive_ports_busy_message(backend)
+                failed_text = self._screen_start_failed_text(busy_message)
                 self._set_screen_share_status(failed_text)
                 self._set_screen_share_ui_state("idle")
                 self._add_screen_chat_card(
@@ -6776,10 +6887,10 @@ class RUDPTransferRoot(BoxLayout):
                     title=self._screen_offer_title(),
                     subtitle=peer_label,
                     status=failed_text,
-                    detail=SCREEN_PORTS_BUSY_MESSAGE,
+                    detail=busy_message,
                     profile=selected_profile_name,
                 )
-                self._reject_screen_offer(control, SCREEN_PORTS_BUSY_MESSAGE, update_status=False)
+                self._reject_screen_offer(control, busy_message, update_status=False)
                 return
             state = self._screen_runtime().start_receiver(
                 port=screen_port,
@@ -6788,6 +6899,7 @@ class RUDPTransferRoot(BoxLayout):
                 selected_profile=selected_profile_name,
                 screen_port=screen_port,
                 audio=audio_config,
+                backend=backend,
             )
             if str(state.get("state") or "") != "receiving":
                 reason = self._screen_runtime_error_detail(self._screen_runtime().get_state())
@@ -6816,10 +6928,11 @@ class RUDPTransferRoot(BoxLayout):
                 screen_port,
                 selected_profile_info,
                 audio=audio_config,
+                backend=backend,
             )
             self.screen_share_session_id = session_id
             self.screen_share_peer_id = sender
-            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile_name, port=screen_port, audio=audio_config)
+            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile_name, port=screen_port, audio=audio_config, backend=backend)
             self._set_screen_share_ui_state("receiving")
             status_text = self._screen_share_status_text("receiving", peer_label=peer_label, profile=selected_profile_name, port=screen_port)
             self._add_screen_chat_card(
@@ -6893,6 +7006,8 @@ class RUDPTransferRoot(BoxLayout):
         audio_config = self._screen_audio_from_control(control, payload)
         if not audio_field_present and not bool(audio_config.get("enabled")):
             audio_config = dict(getattr(self, "screen_share_current_audio", {}) or self._screen_audio_config())
+        backend = self._screen_backend_from_control(control, payload, getattr(self, "screen_share_current_backend", SCREEN_BACKEND_FFMPEG))
+        audio_config = self._screen_audio_for_backend(backend, audio_config)
         try:
             host = str(payload.get("host") or "").strip()
             if not host or is_unspecified_ip(host):
@@ -6919,7 +7034,7 @@ class RUDPTransferRoot(BoxLayout):
             peer_label = self._screen_peer_label(sender, host)
             self.screen_share_session_id = str(control.get("session_id") or "")
             self.screen_share_peer_id = sender
-            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port, audio=audio_config)
+            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port, audio=audio_config, backend=backend)
             starting_text = self._screen_share_status_text("pending_accept", peer_label=peer_label, profile=selected_profile, port=screen_port)
             self._set_screen_share_status(starting_text)
             self._add_screen_chat_card(
@@ -6929,7 +7044,7 @@ class RUDPTransferRoot(BoxLayout):
                 title=self._screen_offer_title(),
                 subtitle=peer_label,
                 status=starting_text,
-                detail=self._screen_detail_text(selected_profile, screen_port, audio_config),
+                detail=self._screen_detail_text(selected_profile, screen_port, audio_config) + f"  backend: {self._screen_backend_label(backend)}",
                 profile=selected_profile,
                 port=screen_port,
             )
@@ -6942,6 +7057,7 @@ class RUDPTransferRoot(BoxLayout):
                 screen_port=screen_port,
                 system_audio=bool(audio_config.get("enabled")),
                 audio=audio_config,
+                backend=backend,
             )
             if str(state.get("state") or "") != "sending":
                 reason = self._screen_runtime_error_detail(self._screen_runtime().get_state())
@@ -6964,8 +7080,8 @@ class RUDPTransferRoot(BoxLayout):
                 )
                 return
             runtime_audio = self._screen_audio_from_runtime_state(state, audio_config)
-            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port, audio=runtime_audio)
-            self._append_debug_line(f"sender actually used profile: {selected_profile}", protocol=False)
+            self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port, audio=runtime_audio, backend=backend)
+            self._append_debug_line(f"sender actually used backend/profile: {backend}/{selected_profile}", protocol=False)
             self._set_screen_share_ui_state("sending")
             status_text = self._screen_share_status_text("sending", peer_label=peer_label, profile=selected_profile, port=screen_port)
             self._add_screen_chat_card(
@@ -7071,11 +7187,12 @@ class RUDPTransferRoot(BoxLayout):
         def _populate_summary() -> None:
             summary_grid.clear_widgets()
             snapshot = self._diagnostic_snapshot()
+            screen_port_title = "投屏端口 55000-55999" if self._screen_backend() == SCREEN_BACKEND_RUST else "投屏端口 50020-50025"
             cards = [
                 ("接收端状态",) + self._diagnostic_receiver_summary(snapshot),
                 ("UDP 9999 状态",) + self._diagnostic_udp_9999_summary(snapshot),
-                ("投屏端口 50020-50025",) + self._diagnostic_screen_ports_summary(snapshot),
-                ("FFmpeg / ffplay",) + self._diagnostic_dependencies_summary(snapshot),
+                (screen_port_title,) + self._diagnostic_screen_ports_summary(snapshot),
+                ("Screen backend dependencies",) + self._diagnostic_dependencies_summary(snapshot),
                 ("screen runtime",) + self._diagnostic_runtime_summary(snapshot),
             ]
             recent_errors = str(snapshot.get("recent_errors") or "").strip()

@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, TextIO
 
 from app_paths import debug_log_dir
 from process_utils import popen_ffplay_windowed, popen_no_console, run_no_console
@@ -32,11 +32,16 @@ STATE_STOPPING = "stopping"
 STATE_ERROR = "error"
 
 DEFAULT_SCREEN_PROFILE = "720p30_h264_qsv"
+SCREEN_BACKEND_FFMPEG = "ffmpeg"
+SCREEN_BACKEND_RUST = "rust"
+SCREEN_BACKENDS = {SCREEN_BACKEND_FFMPEG, SCREEN_BACKEND_RUST}
 FFMPEG_INSTALL_HINT = "winget install --id Gyan.FFmpeg -e"
 FFMPEG_MISSING_MESSAGE = (
     "找不到 ffmpeg/ffplay。请安装 FFmpeg 或使用内置 tools/ffmpeg/bin。\n"
     f"安装命令：{FFMPEG_INSTALL_HINT}"
 )
+RUST_NATIVE_MISSING_MESSAGE = "Rust native media executable not found"
+RUST_NATIVE_VIDEO_ONLY_MESSAGE = "Rust native backend currently supports video only"
 
 class ScreenRuntime:
     def __init__(
@@ -59,6 +64,7 @@ class ScreenRuntime:
         self.last_error = ""
         self.last_returncode: Optional[int] = None
         self.last_command: List[str] = []
+        self.current_backend = SCREEN_BACKEND_FFMPEG
         self.current_mode: Optional[str] = None
         self.current_host: Optional[str] = None
         self.current_port: Optional[int] = None
@@ -70,6 +76,8 @@ class ScreenRuntime:
         self.current_audio_config: Dict[str, object] = {"enabled": False, "mode": "none"}
         self.current_audio_error = ""
         self.current_audio_input = ""
+        self.native_stats: Dict[str, object] = {}
+        self.native_last_event: Dict[str, object] = {}
         self._process_log_path: Optional[Path] = None
         self._wasapi_support_cache: Dict[str, bool] = {}
         self._dshow_audio_devices_cache: Dict[str, List[Dict[str, str]]] = {}
@@ -83,10 +91,13 @@ class ScreenRuntime:
         selected_profile: object = None,
         screen_port: Optional[int] = None,
         audio: object = None,
+        backend: object = SCREEN_BACKEND_FFMPEG,
     ) -> Dict[str, object]:
         if self._has_running_process():
             return self._already_running_result()
         try:
+            backend_name = self._normalize_backend(backend)
+            self.current_backend = backend_name
             if screen_port is not None:
                 port = int(screen_port)
             if selected_profile:
@@ -96,26 +107,37 @@ class ScreenRuntime:
             peer_label_text = self._validate_peer_label(peer_label)
             audio_config = self._normalize_audio_config(audio, enabled_default=False)
             self.last_command = []
-            deps = self.check_dependencies()
-            ffplay = str(deps.get("ffplay_path") or "")
-            if not ffplay:
-                return self._set_error(self._missing_tool_error(["ffplay"]))
-            cmd = self._build_receiver_command(port, ffplay_path=ffplay, peer_label=peer_label_text)
-            self.last_command = list(cmd)
-            self._process = self._start_process_no_console(cmd, "ffplay")
+            self.native_stats = {}
+            self.native_last_event = {}
+            if backend_name == SCREEN_BACKEND_RUST:
+                native_exe = self._find_native_media_exe()
+                if not native_exe:
+                    return self._set_error(RUST_NATIVE_MISSING_MESSAGE)
+                cmd = self._build_native_receiver_command(port, native_exe=native_exe)
+                self.last_command = list(cmd)
+                self._process = self._start_native_process(cmd, "agoralink_media")
+            else:
+                deps = self.check_dependencies()
+                ffplay = str(deps.get("ffplay_path") or "")
+                if not ffplay:
+                    return self._set_error(self._missing_tool_error(["ffplay"]))
+                cmd = self._build_receiver_command(port, ffplay_path=ffplay, peer_label=peer_label_text)
+                self.last_command = list(cmd)
+                self._process = self._start_process_no_console(cmd, "ffplay")
         except Exception as exc:
             return self._set_error(str(exc))
 
         self._state = STATE_RECEIVING
         self.last_error = ""
         self.last_returncode = None
+        self.current_backend = backend_name
         self.current_mode = STATE_RECEIVING
         self.current_host = None
         self.current_port = port
         self.current_profile = profile_name or None
         self.current_peer_label = peer_label_text or None
         self._set_audio_session(audio_config)
-        self._schedule_startup_exit_check("ffplay", delay_sec=1.0)
+        self._schedule_startup_exit_check("agoralink_media" if backend_name == SCREEN_BACKEND_RUST else "ffplay", delay_sec=1.0)
         return self.get_state()
 
     def start_sender(
@@ -129,10 +151,13 @@ class ScreenRuntime:
         screen_port: Optional[int] = None,
         system_audio: bool = False,
         audio: object = None,
+        backend: object = SCREEN_BACKEND_FFMPEG,
     ) -> Dict[str, object]:
         if self._has_running_process():
             return self._already_running_result()
         try:
+            backend_name = self._normalize_backend(backend)
+            self.current_backend = backend_name
             if screen_port is not None:
                 port = int(screen_port)
             if selected_profile:
@@ -143,50 +168,71 @@ class ScreenRuntime:
             peer_label_text = self._validate_peer_label(peer_label) or host
             audio_config = self._normalize_audio_config(audio, enabled_default=bool(system_audio))
             self.last_command = []
-            deps = self.check_dependencies()
-            ffmpeg = str(deps.get("ffmpeg_path") or "")
-            if not ffmpeg:
-                return self._set_error(self._missing_tool_error(["ffmpeg"]))
+            self.native_stats = {}
+            self.native_last_event = {}
             audio_requested = bool(audio_config.get("enabled"))
-            if audio_requested:
-                audio_config = self._resolve_system_audio_config(ffmpeg, audio_config)
-            audio_enabled = bool(audio_config.get("enabled"))
-            audio_notice = "System audio unavailable, continued video-only." if audio_requested and not audio_enabled else ""
-            cmd = self._build_sender_command(
-                host=host,
-                port=port,
-                profile_name=profile,
-                ffmpeg_path=ffmpeg,
-                system_audio=audio_enabled,
-                audio=audio_config,
-            )
-            self.last_command = list(cmd)
-            self._process = self._start_process_no_console(cmd, "ffmpeg")
             fallback_cmd = []
-            if audio_enabled:
-                fallback_cmd = self._build_sender_command(
+            audio_enabled = False
+            audio_notice = ""
+            if backend_name == SCREEN_BACKEND_RUST:
+                native_exe = self._find_native_media_exe()
+                if not native_exe:
+                    return self._set_error(RUST_NATIVE_MISSING_MESSAGE)
+                if audio_requested:
+                    audio_notice = RUST_NATIVE_VIDEO_ONLY_MESSAGE
+                    audio_config = {
+                        "enabled": False,
+                        "mode": "none",
+                        "state": "video_only",
+                        "error": RUST_NATIVE_VIDEO_ONLY_MESSAGE,
+                    }
+                cmd = self._build_native_sender_command(host=host, port=port, native_exe=native_exe)
+                self.last_command = list(cmd)
+                self._process = self._start_native_process(cmd, "agoralink_media")
+            else:
+                deps = self.check_dependencies()
+                ffmpeg = str(deps.get("ffmpeg_path") or "")
+                if not ffmpeg:
+                    return self._set_error(self._missing_tool_error(["ffmpeg"]))
+                if audio_requested:
+                    audio_config = self._resolve_system_audio_config(ffmpeg, audio_config)
+                audio_enabled = bool(audio_config.get("enabled"))
+                audio_notice = "System audio unavailable, continued video-only." if audio_requested and not audio_enabled else ""
+                cmd = self._build_sender_command(
                     host=host,
                     port=port,
                     profile_name=profile,
                     ffmpeg_path=ffmpeg,
-                    system_audio=False,
-                    audio={"enabled": False, "mode": "none"},
+                    system_audio=audio_enabled,
+                    audio=audio_config,
                 )
+                self.last_command = list(cmd)
+                self._process = self._start_process_no_console(cmd, "ffmpeg")
+                if audio_enabled:
+                    fallback_cmd = self._build_sender_command(
+                        host=host,
+                        port=port,
+                        profile_name=profile,
+                        ffmpeg_path=ffmpeg,
+                        system_audio=False,
+                        audio={"enabled": False, "mode": "none"},
+                    )
         except Exception as exc:
             return self._set_error(str(exc))
 
         self._state = STATE_SENDING
         self.last_error = audio_notice
         self.last_returncode = None
+        self.current_backend = backend_name
         self.current_mode = STATE_SENDING
         self.current_host = host
         self.current_port = port
         self.current_profile = profile
         self.current_peer_label = peer_label_text or None
         self._set_audio_session(audio_config)
-        if audio_requested:
+        if backend_name == SCREEN_BACKEND_FFMPEG and audio_requested:
             self._write_process_log_note(self._screen_audio_launch_note(audio_config))
-        if audio_enabled:
+        if backend_name == SCREEN_BACKEND_FFMPEG and audio_enabled:
             self._schedule_audio_fallback_check(self._process, fallback_cmd, delay_sec=1.0)
             self._schedule_audio_fallback_check(self._process, fallback_cmd, delay_sec=2.5)
         return self.get_state()
@@ -279,6 +325,95 @@ class ScreenRuntime:
             raise
         self._process_log_file = log_file
         return proc
+
+    def _start_native_process(self, cmd: List[str], tool_name: str) -> subprocess.Popen[str]:
+        self._close_process_log_file()
+        log_file = self._open_process_log_file(tool_name)
+        try:
+            proc = self._popen_factory(
+                cmd,
+                cwd=str(self.script_dir),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                shell=False,
+            )
+        except Exception:
+            if log_file is not None:
+                try:
+                    log_file.close()
+                except Exception:
+                    pass
+            raise
+        self._process_log_file = log_file
+        self._start_native_output_threads(proc, log_file)
+        return proc
+
+    def _start_native_output_threads(self, proc: subprocess.Popen[str], log_file: Optional[TextIO]) -> None:
+        stdout = getattr(proc, "stdout", None)
+        stderr = getattr(proc, "stderr", None)
+        if stdout is not None:
+            thread = threading.Thread(target=self._read_native_stdout, args=(proc, stdout), daemon=True)
+            thread.start()
+        if stderr is not None:
+            thread = threading.Thread(target=self._read_native_stderr, args=(stderr, log_file), daemon=True)
+            thread.start()
+
+    def _read_native_stdout(self, proc: subprocess.Popen[str], stream: TextIO) -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                text = str(line or "").strip()
+                if not text:
+                    continue
+                try:
+                    event = json.loads(text)
+                except Exception:
+                    self._write_process_log_note(f"native stdout non-json: {text}")
+                    continue
+                if isinstance(event, Mapping):
+                    self._handle_native_event(dict(event), proc)
+        except Exception as exc:
+            self._write_process_log_note(f"native stdout reader failed: {exc}")
+
+    def _read_native_stderr(self, stream: TextIO, log_file: Optional[TextIO]) -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                text = str(line or "")
+                if not text:
+                    continue
+                if log_file is not None:
+                    try:
+                        log_file.write(text)
+                        if not text.endswith("\n"):
+                            log_file.write("\n")
+                        log_file.flush()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            self._write_process_log_note(f"native stderr reader failed: {exc}")
+
+    def _handle_native_event(self, event: Dict[str, object], proc: Optional[subprocess.Popen[str]] = None) -> None:
+        event_type = str(event.get("type") or "").strip()
+        self.native_last_event = dict(event)
+        if event_type == "NATIVE_SCREEN_STATS":
+            self.native_stats = dict(event)
+            return
+        if event_type == "NATIVE_SCREEN_STARTED":
+            if not self.last_error:
+                self.last_error = ""
+            return
+        if event_type == "NATIVE_SCREEN_STOPPED":
+            self.native_stats = dict(event)
+            if proc is None or proc is self._process:
+                self.last_error = ""
+            return
+        if event_type == "NATIVE_SCREEN_ERROR":
+            message = str(event.get("error") or event.get("message") or "native screen error").strip()
+            self.last_error = message or "native screen error"
+            self._state = STATE_ERROR
 
     def _schedule_startup_exit_check(self, tool_name: str, delay_sec: float = 1.0) -> None:
         proc = self._process
@@ -392,6 +527,7 @@ class ScreenRuntime:
             "ok": bool(running or actual_state == STATE_IDLE) if ok is None else bool(ok),
             "state": actual_state,
             "running": running,
+            "backend": self.current_backend,
             "mode": self.current_mode,
             "host": self.current_host,
             "port": self.current_port,
@@ -407,6 +543,8 @@ class ScreenRuntime:
             "returncode": self.last_returncode,
             "last_error": self.last_error,
             "command": list(self.last_command),
+            "native_stats": dict(self.native_stats),
+            "native_last_event": dict(self.native_last_event),
         }
 
     def _set_error(self, message: str) -> Dict[str, object]:
@@ -436,8 +574,10 @@ class ScreenRuntime:
     def check_dependencies(self) -> Dict[str, object]:
         ffmpeg = self._find_media_tool("ffmpeg")
         ffplay = self._find_media_tool("ffplay")
+        native = self._find_native_media_exe()
         ffmpeg_ok = bool(ffmpeg)
         ffplay_ok = bool(ffplay)
+        native_ok = bool(native)
         missing = []
         if not ffmpeg_ok:
             missing.append("ffmpeg")
@@ -447,9 +587,14 @@ class ScreenRuntime:
             "ok": bool(ffmpeg_ok and ffplay_ok),
             "ffmpeg_ok": ffmpeg_ok,
             "ffplay_ok": ffplay_ok,
+            "rust_native_ok": native_ok,
+            "native_media_ok": native_ok,
             "ffmpeg_path": str(ffmpeg or ""),
             "ffplay_path": str(ffplay or ""),
+            "rust_native_path": str(native or ""),
+            "native_media_path": str(native or ""),
             "error": "" if not missing else self._missing_tool_error(missing),
+            "rust_error": "" if native_ok else RUST_NATIVE_MISSING_MESSAGE,
             "install_hint": FFMPEG_INSTALL_HINT,
         }
 
@@ -458,6 +603,42 @@ class ScreenRuntime:
         if names:
             return f"{FFMPEG_MISSING_MESSAGE}\n缺少：{names}"
         return FFMPEG_MISSING_MESSAGE
+
+    def _build_native_receiver_command(self, port: int, native_exe: Optional[str] = None) -> List[str]:
+        exe = str(native_exe or self._find_native_media_exe() or "")
+        if not exe:
+            raise FileNotFoundError(RUST_NATIVE_MISSING_MESSAGE)
+        return [
+            exe,
+            "screen-recv",
+            "--bind",
+            "0.0.0.0",
+            "--port",
+            str(int(port)),
+            "--title",
+            "AgoraLink Native Viewer",
+        ]
+
+    def _build_native_sender_command(self, *, host: str, port: int, native_exe: Optional[str] = None) -> List[str]:
+        exe = str(native_exe or self._find_native_media_exe() or "")
+        if not exe:
+            raise FileNotFoundError(RUST_NATIVE_MISSING_MESSAGE)
+        return [
+            exe,
+            "screen-send",
+            "--host",
+            str(host),
+            "--port",
+            str(int(port)),
+            "--width",
+            "1280",
+            "--height",
+            "720",
+            "--fps",
+            "30",
+            "--bitrate-mbps",
+            "4",
+        ]
 
     def _build_receiver_command(self, port: int, ffplay_path: Optional[str] = None, peer_label: str = "") -> List[str]:
         ffplay = str(ffplay_path or self._find_media_tool("ffplay") or "")
@@ -834,6 +1015,34 @@ class ScreenRuntime:
                 return found
         return ""
 
+    def _find_native_media_exe(self) -> str:
+        if self._tool_finder is not None:
+            found = str(self._tool_finder("agoralink_media") or self._tool_finder("agoralink_media.exe") or "")
+            if found:
+                return found
+        exe_names = self._tool_executable_names("agoralink_media")
+        for base in self._native_media_dirs():
+            found = self._find_tool_in_dir(base, exe_names)
+            if found:
+                return found
+        for exe in exe_names:
+            found = shutil.which(exe)
+            if found:
+                return str(Path(found).resolve())
+        return ""
+
+    def _native_media_dirs(self) -> List[Path]:
+        dirs: List[Path] = []
+        exe_dir = Path(sys.executable).resolve().parent
+        dirs.append(exe_dir / "_internal" / "tools" / "agoralink_media")
+        meipass = str(getattr(sys, "_MEIPASS", "") or "").strip()
+        if meipass:
+            dirs.append(Path(meipass) / "tools" / "agoralink_media")
+        dirs.append(exe_dir / "tools" / "agoralink_media")
+        dirs.append(self.script_dir / "tools" / "agoralink_media")
+        dirs.append(self.script_dir / "rust-native" / "agoralink_media" / "target" / "release")
+        return dirs
+
     @staticmethod
     def _tool_executable_names(name: str) -> List[str]:
         base = str(name or "").strip()
@@ -903,6 +1112,15 @@ class ScreenRuntime:
         except Exception:
             pass
         return ""
+
+    @staticmethod
+    def _normalize_backend(backend: object) -> str:
+        value = str(backend or SCREEN_BACKEND_FFMPEG).strip().lower()
+        if not value:
+            return SCREEN_BACKEND_FFMPEG
+        if value not in SCREEN_BACKENDS:
+            raise ValueError("screen backend must be ffmpeg or rust")
+        return value
 
     def _stop_windows_process_tree(self, proc: subprocess.Popen[bytes]) -> None:
         pid = getattr(proc, "pid", None)

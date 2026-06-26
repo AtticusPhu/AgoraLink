@@ -23,6 +23,9 @@ SCREEN_SHARE_STATE = "SCREEN_SHARE_STATE"
 
 SCREEN_CONTROL_VERSION = 1
 DEFAULT_SCREEN_PORT = 50020
+SCREEN_BACKEND_FFMPEG = "ffmpeg"
+SCREEN_BACKEND_RUST = "rust"
+SCREEN_BACKENDS = frozenset({SCREEN_BACKEND_FFMPEG, SCREEN_BACKEND_RUST})
 
 SCREEN_CONTROL_TYPES = frozenset(
     {
@@ -115,6 +118,15 @@ def _audio_config(value: object) -> Dict[str, Any]:
     }
 
 
+def _backend_config(value: object) -> str:
+    if value in (None, ""):
+        return ""
+    backend = str(value or "").strip().lower()
+    if backend not in SCREEN_BACKENDS:
+        raise ValueError("backend must be ffmpeg or rust")
+    return backend
+
+
 def _base_message(
     message_type: str,
     session_id: object,
@@ -148,6 +160,7 @@ def make_offer(
     profiles: object = None,
     preferred_profile: object = None,
     audio: object = None,
+    backend: object = None,
 ) -> Dict[str, object]:
     payload: Dict[str, Any] = {
         "host": _require_text(host, "host"),
@@ -158,6 +171,9 @@ def make_offer(
     audio_config = _audio_config(audio)
     if audio_config:
         payload["audio"] = audio_config
+    backend_value = _backend_config(backend)
+    if backend_value:
+        payload["backend"] = backend_value
     advertised_profiles = _profiles_list(profiles)
     preferred = str(preferred_profile or "").strip()
     if advertised_profiles:
@@ -175,6 +191,8 @@ def make_offer(
         message["preferred_profile"] = payload["preferred_profile"]
     if audio_config:
         message["audio"] = audio_config
+    if backend_value:
+        message["backend"] = backend_value
     return message
 
 
@@ -186,11 +204,13 @@ def make_accept(
     port: object,
     selected_profile: object,
     audio: object = None,
+    backend: object = None,
 ) -> Dict[str, object]:
     screen_port = _require_port(port)
     selected_profile_id = profile_id_from_info(selected_profile, DEFAULT_SCREEN_PROFILE)
     selected_profile_info = dict(selected_profile) if isinstance(selected_profile, Mapping) else {"id": selected_profile_id, "name": selected_profile_id}
     audio_config = _audio_config(audio)
+    backend_value = _backend_config(backend)
     payload: Dict[str, Any] = {
         "host": _require_text(host, "host"),
         "port": screen_port,
@@ -200,6 +220,8 @@ def make_accept(
     }
     if audio_config:
         payload["audio"] = audio_config
+    if backend_value:
+        payload["backend"] = backend_value
     message = _base_message(
         SCREEN_SHARE_ACCEPT,
         session_id,
@@ -212,6 +234,8 @@ def make_accept(
     message["selected_profile_info"] = selected_profile_info
     if audio_config:
         message["audio"] = audio_config
+    if backend_value:
+        message["backend"] = backend_value
     return message
 
 
@@ -301,6 +325,8 @@ def _validate_common_fields(message: Mapping[str, Any]) -> None:
         raise ValueError("selected_profile_info must be an object")
     if "audio" in message:
         _audio_config(message.get("audio"))
+    if "backend" in message:
+        _backend_config(message.get("backend"))
     if not isinstance(message.get("payload"), Mapping):
         raise ValueError("payload must be an object")
 
@@ -320,6 +346,8 @@ def _validate_payload(message: Mapping[str, Any]) -> None:
             _require_text(payload.get("preferred_profile"), "payload.preferred_profile")
         if "audio" in payload:
             _audio_config(payload.get("audio"))
+        if "backend" in payload:
+            _backend_config(payload.get("backend"))
     elif message_type == SCREEN_SHARE_ACCEPT:
         _require_text(payload.get("host"), "payload.host")
         _require_port(payload.get("port"))
@@ -335,6 +363,8 @@ def _validate_payload(message: Mapping[str, Any]) -> None:
             raise ValueError("payload.selected_profile_info must be an object")
         if "audio" in payload:
             _audio_config(payload.get("audio"))
+        if "backend" in payload:
+            _backend_config(payload.get("backend"))
     elif message_type == SCREEN_SHARE_REJECT:
         if "reason" not in payload:
             raise ValueError("missing field: payload.reason")
@@ -371,6 +401,8 @@ __all__ = [
     "SCREEN_SHARE_STATE",
     "SCREEN_CONTROL_VERSION",
     "DEFAULT_SCREEN_PORT",
+    "SCREEN_BACKEND_FFMPEG",
+    "SCREEN_BACKEND_RUST",
     "make_offer",
     "make_accept",
     "make_reject",
