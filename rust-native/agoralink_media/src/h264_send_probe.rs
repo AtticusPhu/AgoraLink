@@ -9,6 +9,7 @@ pub struct H264SendConfig {
     pub out_height: u32,
     pub color_spec: crate::color_spec::ColorSpec,
     pub mode: H264SendMode,
+    pub verbose: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -330,17 +331,19 @@ mod platform {
     pub fn run(config: H264SendConfig) -> Result<(), String> {
         validate_config(&config)?;
         let mut observer = UdpObserver::new(&config)?;
-        eprintln!(
-            "h264-send-probe target={} duration_sec={} target_fps={} bitrate_mbps={} output={}x{} color_matrix={} range={} packet_payload_max=1200",
-            observer.target,
-            optional_duration_text(config.duration_sec),
-            config.target_fps,
-            config.bitrate_mbps,
-            config.out_width,
-            config.out_height,
-            config.color_spec.yuv_matrix(),
-            config.color_spec.color_range()
-        );
+        if config.verbose {
+            eprintln!(
+                "h264-send-probe target={} duration_sec={} target_fps={} bitrate_mbps={} output={}x{} color_matrix={} range={} packet_payload_max=1200",
+                observer.target,
+                optional_duration_text(config.duration_sec),
+                config.target_fps,
+                config.bitrate_mbps,
+                config.out_width,
+                config.out_height,
+                config.color_spec.yuv_matrix(),
+                config.color_spec.color_range()
+            );
+        }
         let pipeline_config = capture_encode_probe::CaptureEncodeConfig {
             duration_sec: config.duration_sec,
             target_fps: config.target_fps,
@@ -349,6 +352,7 @@ mod platform {
             out_height: config.out_height,
             output: String::new(),
             color_spec: config.color_spec,
+            verbose: config.verbose,
         };
         let done = capture_encode_probe::run_with_observer(&pipeline_config, &mut observer)?;
         observer.print_done(done);

@@ -7,6 +7,7 @@ pub struct CaptureEncodeConfig {
     pub out_height: u32,
     pub output: String,
     pub color_spec: crate::color_spec::ColorSpec,
+    pub verbose: bool,
 }
 
 #[cfg(windows)]
@@ -238,14 +239,16 @@ mod platform {
                 .json_fragment("encoder_output")
         );
         io::stdout().flush().ok();
-        eprintln!(
-            "capture-encode-probe stopped reason={}",
-            if done.stopped_by_console {
-                "console-control"
-            } else {
-                "duration-complete"
-            }
-        );
+        if config.verbose {
+            eprintln!(
+                "capture-encode-probe stopped reason={}",
+                if done.stopped_by_console {
+                    "console-control"
+                } else {
+                    "duration-complete"
+                }
+            );
+        }
         Ok(())
     }
 
@@ -276,25 +279,27 @@ mod platform {
         let mut last_version = 0u64;
         let mut have_nv12 = false;
 
-        eprintln!(
-            "capture-encode target=primary-monitor source={}x{} output={}x{} input={} encode=NV12 encoder=\"{}\" target_fps={} bitrate_mbps={} color_matrix={} range={} d3d_driver={} output_buffer={} profile_main={} encoder_input_metadata={:?} encoder_output_metadata={:?} duration_sec={}",
-            capture_info.width,
-            capture_info.height,
-            config.out_width,
-            config.out_height,
-            PIXEL_FORMAT_NAME,
-            ENCODER_NAME,
-            config.target_fps,
-            config.bitrate_mbps,
-            config.color_spec.yuv_matrix(),
-            config.color_spec.color_range(),
-            capture_info.driver_name,
-            encoder.output_buffer_size(),
-            encoder.profile_main(),
-            encoder.input_color_metadata(),
-            encoder.output_color_metadata(),
-            optional_duration_text(config.duration_sec)
-        );
+        if config.verbose {
+            eprintln!(
+                "capture-encode target=primary-monitor source={}x{} output={}x{} input={} encode=NV12 encoder=\"{}\" target_fps={} bitrate_mbps={} color_matrix={} range={} d3d_driver={} output_buffer={} profile_main={} encoder_input_metadata={:?} encoder_output_metadata={:?} duration_sec={}",
+                capture_info.width,
+                capture_info.height,
+                config.out_width,
+                config.out_height,
+                PIXEL_FORMAT_NAME,
+                ENCODER_NAME,
+                config.target_fps,
+                config.bitrate_mbps,
+                config.color_spec.yuv_matrix(),
+                config.color_spec.color_range(),
+                capture_info.driver_name,
+                encoder.output_buffer_size(),
+                encoder.profile_main(),
+                encoder.input_color_metadata(),
+                encoder.output_color_metadata(),
+                optional_duration_text(config.duration_sec)
+            );
+        }
         observer.on_started(&CapturePipelineStarted {
             target_fps: config.target_fps,
             bitrate_mbps: config.bitrate_mbps,

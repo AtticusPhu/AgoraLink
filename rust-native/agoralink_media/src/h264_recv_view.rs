@@ -12,6 +12,7 @@ pub struct H264RecvViewConfig {
     pub json_interval_ms: u64,
     pub title: String,
     pub mode: H264RecvViewMode,
+    pub verbose: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -293,23 +294,26 @@ mod platform {
             config.frame_timeout_ms,
             config.max_inflight_frames,
             config.max_decode_queue,
+            config.verbose,
         )?;
 
-        eprintln!(
-            "h264-recv-view bind={}:{} frame_timeout_ms={} max_inflight_frames={} max_decode_queue={} strict_decode_order={} debug_dump_frames={:?} debug_dump_limit={} udp_receive_buffer={} decoder=\"{}\" output=NV12 render=GDI title=\"{}\" duration_sec={}",
-            config.bind,
-            config.port,
-            config.frame_timeout_ms,
-            config.max_inflight_frames,
-            config.max_decode_queue,
-            config.strict_decode_order,
-            config.debug_dump_frames,
-            config.debug_dump_limit,
-            UDP_RECEIVE_BUFFER_BYTES,
-            DECODER_NAME,
-            config.title,
-            optional_duration_text(config.duration_sec)
-        );
+        if config.verbose {
+            eprintln!(
+                "h264-recv-view bind={}:{} frame_timeout_ms={} max_inflight_frames={} max_decode_queue={} strict_decode_order={} debug_dump_frames={:?} debug_dump_limit={} udp_receive_buffer={} decoder=\"{}\" output=NV12 render=GDI title=\"{}\" duration_sec={}",
+                config.bind,
+                config.port,
+                config.frame_timeout_ms,
+                config.max_inflight_frames,
+                config.max_decode_queue,
+                config.strict_decode_order,
+                config.debug_dump_frames,
+                config.debug_dump_limit,
+                UDP_RECEIVE_BUFFER_BYTES,
+                DECODER_NAME,
+                config.title,
+                optional_duration_text(config.duration_sec)
+            );
+        }
         print_started(&config);
 
         let started_at = Instant::now();
@@ -422,10 +426,12 @@ mod platform {
             started_at.elapsed().as_secs_f64(),
         );
         io::stdout().flush().ok();
-        eprintln!(
-            "h264-recv-view stopped reason={}",
-            human_stop_reason(closed_by_user, network_error.is_some(), config.duration_sec)
-        );
+        if config.verbose {
+            eprintln!(
+                "h264-recv-view stopped reason={}",
+                human_stop_reason(closed_by_user, network_error.is_some(), config.duration_sec)
+            );
+        }
         if let Some(error) = network_error {
             Err(error)
         } else {
@@ -441,6 +447,7 @@ mod platform {
         frame_timeout_ms: u64,
         max_inflight_frames: usize,
         max_decode_queue: usize,
+        verbose: bool,
     ) -> Result<thread::JoinHandle<()>, String> {
         thread::Builder::new()
             .name("agoralink-h264-recv".to_string())
@@ -453,6 +460,7 @@ mod platform {
                     frame_timeout_ms,
                     max_inflight_frames,
                     max_decode_queue,
+                    verbose,
                 ) {
                     if let Ok(mut shared) = state.lock() {
                         shared.error = Some(err);
@@ -471,6 +479,7 @@ mod platform {
         frame_timeout_ms: u64,
         max_inflight_frames: usize,
         max_decode_queue: usize,
+        verbose: bool,
     ) -> Result<(), String> {
         let mut reassembler = H264Reassembler::new(ReassemblyConfig {
             frame_timeout: Duration::from_millis(frame_timeout_ms),
@@ -494,7 +503,11 @@ mod platform {
                                 }
                                 enqueue_network_frames(frames, queue, max_decode_queue)?;
                             }
-                            Err(err) => eprintln!("discarding invalid AGM1 packet: {err}"),
+                            Err(err) => {
+                                if verbose {
+                                    eprintln!("discarding invalid AGM1 packet: {err}");
+                                }
+                            }
                         }
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,

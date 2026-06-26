@@ -629,6 +629,7 @@ fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
             out_height,
             output,
             color_spec,
+            verbose: true,
         },
     ))
 }
@@ -697,6 +698,7 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
         out_height,
         color_spec,
         mode: h264_send_probe::H264SendMode::Probe,
+        verbose: true,
     }))
 }
 
@@ -931,6 +933,7 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
         json_interval_ms,
         title,
         mode: h264_recv_view::H264RecvViewMode::Probe,
+        verbose: true,
     }))
 }
 
@@ -943,6 +946,7 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
     let mut out_width = 1280u32;
     let mut out_height = 720u32;
     let mut color_spec = color_spec::ColorSpec::default();
+    let mut verbose = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -991,6 +995,9 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
                 i += 1;
                 parse_screen_payload_size(required_value(args, i, "--payload-size")?)?;
             }
+            "--verbose" => {
+                verbose = true;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unknown screen-send argument: {other}")),
         }
@@ -1007,6 +1014,7 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
         out_height,
         color_spec,
         mode: h264_send_probe::H264SendMode::Screen,
+        verbose,
     }))
 }
 
@@ -1022,6 +1030,7 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
     let mut debug_dump_limit = 10usize;
     let mut json_interval_ms = 1000u64;
     let mut title = "AgoraLink Native Viewer".to_string();
+    let mut verbose = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -1104,6 +1113,9 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
                     return Err("title must not be empty".to_string());
                 }
             }
+            "--verbose" => {
+                verbose = true;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unknown screen-recv argument: {other}")),
         }
@@ -1123,6 +1135,7 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
         json_interval_ms,
         title,
         mode: h264_recv_view::H264RecvViewMode::Screen,
+        verbose,
     }))
 }
 
@@ -1273,8 +1286,8 @@ Usage:\n\
   agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels> [--color-matrix bt601|bt709]\n\
   agoralink_media h264-recv-dump --bind <ip> --port <port> --output <path> [--idle-timeout-sec <seconds>]\n\
   agoralink_media h264-recv-view --bind <ip> --port <port> [--frame-timeout-ms <ms>] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--debug-dump-frames <dir>] [--debug-dump-limit <n>] [--json-interval-ms <ms>] [--title <text>]\n\
-  agoralink_media screen-send --host <ip> --port <port> [--width <pixels>] [--height <pixels>] [--fps <fps>] [--bitrate-mbps <mbps>] [--duration-sec <seconds>] [--color-matrix bt601|bt709] [--payload-size 1200]\n\
-  agoralink_media screen-recv --bind <ip> --port <port> [--duration-sec <seconds>] [--frame-timeout-ms <ms>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--json-interval-ms <ms>] [--title <text>]\n\
+  agoralink_media screen-send --host <ip> --port <port> [--width <pixels>] [--height <pixels>] [--fps <fps>] [--bitrate-mbps <mbps>] [--duration-sec <seconds>] [--color-matrix bt601|bt709] [--payload-size 1200] [--verbose]\n\
+  agoralink_media screen-recv --bind <ip> --port <port> [--duration-sec <seconds>] [--frame-timeout-ms <ms>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--json-interval-ms <ms>] [--title <text>] [--verbose]\n\
   agoralink_media h264-file-viewer --input <path>\n\n\
   agoralink_media color-test-pattern --output <path> --width <pixels> --height <pixels> --duration-sec <seconds> [--fps <fps>] [--bitrate-mbps <mbps>] [--color-matrix bt601|bt709]\n\n\
 Defaults:\n\
@@ -1286,8 +1299,8 @@ Defaults:\n\
   h264-send-probe: --host 127.0.0.1 --port 50130 --duration-sec 10 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --color-matrix bt709\n\
   h264-recv-dump: --bind 0.0.0.0 --port 50130 --output received_capture.h264 --idle-timeout-sec 3\n\
   h264-recv-view: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --debug-dump-limit 10 --json-interval-ms 1000 --title \"AgoraLink Native Viewer\"\n\
-  screen-send: --host required --port required --width 1280 --height 720 --fps 30 --bitrate-mbps 4 --color-matrix bt709 --payload-size 1200 --duration-sec unlimited\n\
-  screen-recv: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --json-interval-ms 1000 --title \"AgoraLink Native Viewer\" --duration-sec unlimited\n\
+  screen-send: --host required --port required --width 1280 --height 720 --fps 30 --bitrate-mbps 4 --color-matrix bt709 --payload-size 1200 --duration-sec unlimited --verbose off\n\
+  screen-recv: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --json-interval-ms 1000 --title \"AgoraLink Native Viewer\" --duration-sec unlimited --verbose off\n\
   h264-file-viewer: --input received_capture_lan.h264\n\
   color-test-pattern: --output color_test_1080p.h264 --width 1920 --height 1080 --fps 30 --duration-sec 3 --bitrate-mbps 8 --color-matrix bt709"
     );
