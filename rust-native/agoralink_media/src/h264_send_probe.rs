@@ -93,13 +93,14 @@ mod platform {
                 return;
             }
             println!(
-                r#"{{"type":"NATIVE_SCREEN_STARTED","role":"sender","mode":"screen-send","host":"{}","port":{},"width":{},"height":{},"fps":{},"bitrate_mbps":{:.3},{},{},{},{}}}"#,
+                r#"{{"type":"NATIVE_SCREEN_STARTED","role":"sender","mode":"screen-send","host":"{}","port":{},"width":{},"height":{},"fps":{},"bitrate_mbps":{:.3},{},{},{},{},{}}}"#,
                 json_escape(&self.host),
                 self.port,
                 started.width,
                 started.height,
                 started.target_fps,
                 started.bitrate_mbps,
+                started.conversion_selection.json_fragment(),
                 started.encoder_selection.json_fragment(),
                 started.color_spec.json_fragment(),
                 started
@@ -364,6 +365,7 @@ mod platform {
             output: String::new(),
             color_spec: config.color_spec,
             encoder: config.encoder,
+            convert_backend: capture_encode_probe::ConvertBackend::Cpu,
             verbose: config.verbose,
         };
         let done = capture_encode_probe::run_with_observer(&pipeline_config, &mut observer)?;

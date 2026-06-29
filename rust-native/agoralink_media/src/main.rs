@@ -13,6 +13,8 @@ mod color_spec;
 mod color_test_pattern;
 mod decoded_frame_renderer;
 mod encode_probe;
+mod gpu_convert_probe;
+mod gpu_nv12_capture;
 mod h264_annex_b;
 mod h264_file_viewer;
 mod h264_reassembly;
@@ -145,6 +147,7 @@ enum Command {
         target_fps: u32,
     },
     WmfProbe,
+    GpuConvertProbe(gpu_convert_probe::GpuConvertProbeConfig),
     EncodeProbe(encode_probe::EncodeProbeConfig),
     CaptureEncodeProbe(capture_encode_probe::CaptureEncodeConfig),
     H264SendProbe(h264_send_probe::H264SendConfig),
@@ -305,6 +308,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        Ok(Command::GpuConvertProbe(config)) => {
+            if let Err(err) = gpu_convert_probe::run(config) {
+                eprintln!("gpu-convert-probe error: {err}");
+                process::exit(1);
+            }
+        }
         Ok(Command::EncodeProbe(config)) => {
             if let Err(err) = encode_probe::run(config) {
                 eprintln!("encode-probe error: {err}");
@@ -397,6 +406,7 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
                 Err("wmf-probe does not accept extra arguments".to_string())
             }
         }
+        "gpu-convert-probe" => parse_gpu_convert_probe_args(&args[1..]),
         "encode-probe" => parse_encode_probe_args(&args[1..]),
         "capture-encode-probe" => parse_capture_encode_probe_args(&args[1..]),
         "h264-send-probe" => parse_h264_send_probe_args(&args[1..]),
@@ -500,6 +510,79 @@ fn parse_capture_probe_args(args: &[String]) -> Result<Command, String> {
     })
 }
 
+fn parse_gpu_convert_probe_args(args: &[String]) -> Result<Command, String> {
+    let mut duration_sec = 5u64;
+    let mut target_fps = 30u32;
+    let mut out_width = 1280u32;
+    let mut out_height = 720u32;
+    let mut color_spec = color_spec::ColorSpec::default();
+    let mut debug_dump_nv12 = None;
+    let mut debug_dump_bgra = None;
+    let mut debug_dump_limit = 3usize;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--duration-sec" => {
+                i += 1;
+                duration_sec = parse_duration_sec(required_value(args, i, "--duration-sec")?)?;
+            }
+            "--target-fps" => {
+                i += 1;
+                target_fps = parse_fps(required_value(args, i, "--target-fps")?)?;
+            }
+            "--out-width" => {
+                i += 1;
+                out_width = parse_dimension(required_value(args, i, "--out-width")?, "out-width")?;
+            }
+            "--out-height" => {
+                i += 1;
+                out_height =
+                    parse_dimension(required_value(args, i, "--out-height")?, "out-height")?;
+            }
+            "--color-matrix" => {
+                i += 1;
+                color_spec = color_spec::ColorSpec::with_matrix(color_spec::ColorMatrix::parse(
+                    required_value(args, i, "--color-matrix")?,
+                )?);
+            }
+            "--debug-dump-nv12" => {
+                i += 1;
+                debug_dump_nv12 = Some(required_value(args, i, "--debug-dump-nv12")?.to_string());
+            }
+            "--debug-dump-bgra" => {
+                i += 1;
+                debug_dump_bgra = Some(required_value(args, i, "--debug-dump-bgra")?.to_string());
+            }
+            "--debug-dump-limit" => {
+                i += 1;
+                debug_dump_limit = parse_count(
+                    required_value(args, i, "--debug-dump-limit")?,
+                    "debug-dump-limit",
+                    1,
+                    100,
+                )?;
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown gpu-convert-probe argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::GpuConvertProbe(
+        gpu_convert_probe::GpuConvertProbeConfig {
+            duration_sec,
+            target_fps,
+            out_width,
+            out_height,
+            color_spec,
+            debug_dump_nv12,
+            debug_dump_bgra,
+            debug_dump_limit,
+        },
+    ))
+}
+
 fn parse_encode_probe_args(args: &[String]) -> Result<Command, String> {
     let mut width = 1280u32;
     let mut height = 720u32;
@@ -577,6 +660,7 @@ fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
     let mut output = "capture_720p30.h264".to_string();
     let mut color_spec = color_spec::ColorSpec::default();
     let mut encoder = wmf_h264_encoder::EncoderChoice::Auto;
+    let mut convert_backend = capture_encode_probe::ConvertBackend::Auto;
     let mut i = 0;
 
     while i < args.len() {
@@ -613,6 +697,11 @@ fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
                 i += 1;
                 encoder = parse_encoder_choice(required_value(args, i, "--encoder")?)?;
             }
+            "--convert-backend" => {
+                i += 1;
+                convert_backend =
+                    parse_convert_backend(required_value(args, i, "--convert-backend")?)?;
+            }
             "--color-matrix" => {
                 i += 1;
                 color_spec = color_spec::ColorSpec::with_matrix(color_spec::ColorMatrix::parse(
@@ -635,6 +724,7 @@ fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
             output,
             color_spec,
             encoder,
+            convert_backend,
             verbose: true,
         },
     ))
@@ -1282,6 +1372,15 @@ fn parse_encoder_choice(text: &str) -> Result<wmf_h264_encoder::EncoderChoice, S
     }
 }
 
+fn parse_convert_backend(text: &str) -> Result<capture_encode_probe::ConvertBackend, String> {
+    match text {
+        "auto" => Ok(capture_encode_probe::ConvertBackend::Auto),
+        "cpu" => Ok(capture_encode_probe::ConvertBackend::Cpu),
+        "d3d11" => Ok(capture_encode_probe::ConvertBackend::D3d11),
+        _ => Err("convert-backend must be auto, cpu, or d3d11".to_string()),
+    }
+}
+
 fn print_native_screen_error(role: &str, mode: &str, error: &str) {
     println!(
         r#"{{"type":"NATIVE_SCREEN_ERROR","role":"{}","mode":"{}","error":"{}"}}"#,
@@ -1301,8 +1400,9 @@ Usage:\n\
   agoralink_media receiver --bind <ip> --port <port>\n\
   agoralink_media capture-probe --duration-sec <seconds> --target-fps <fps>\n\
   agoralink_media wmf-probe\n\
+  agoralink_media gpu-convert-probe --duration-sec <seconds> --target-fps <fps> --out-width <pixels> --out-height <pixels> [--debug-dump-nv12 <dir>] [--debug-dump-bgra <dir>] [--debug-dump-limit <n>]\n\
   agoralink_media encode-probe --width <pixels> --height <pixels> --fps <fps> --duration-sec <seconds> --bitrate-mbps <mbps> --output <path> [--encoder auto|hardware|software|microsoft|intel-qsv] [--color-matrix bt601|bt709]\n\
-  agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels> --output <path> [--encoder auto|hardware|software|microsoft|intel-qsv] [--color-matrix bt601|bt709]\n\
+  agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels> --output <path> [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--color-matrix bt601|bt709]\n\
   agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels> [--encoder auto|hardware|software|microsoft|intel-qsv] [--color-matrix bt601|bt709]\n\
   agoralink_media h264-recv-dump --bind <ip> --port <port> --output <path> [--idle-timeout-sec <seconds>]\n\
   agoralink_media h264-recv-view --bind <ip> --port <port> [--frame-timeout-ms <ms>] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--debug-dump-frames <dir>] [--debug-dump-limit <n>] [--json-interval-ms <ms>] [--title <text>]\n\
@@ -1314,8 +1414,9 @@ Defaults:\n\
   sender: --host 127.0.0.1 --port 50120 --fps 30 --bitrate-mbps 4\n\
   receiver: --bind 0.0.0.0 --port 50120\n\
   capture-probe: --duration-sec 10 --target-fps 30\n\
+  gpu-convert-probe: --duration-sec 5 --target-fps 30 --out-width 1280 --out-height 720 --color-matrix bt709 --debug-dump-limit 3\n\
   encode-probe: --width 1280 --height 720 --fps 30 --duration-sec 5 --bitrate-mbps 4 --output synthetic_720p30.h264 --encoder auto --color-matrix bt709\n\
-  capture-encode-probe: --duration-sec 5 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --output capture_720p30.h264 --encoder auto --color-matrix bt709\n\
+  capture-encode-probe: --duration-sec 5 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --output capture_720p30.h264 --encoder auto --convert-backend auto --color-matrix bt709\n\
   h264-send-probe: --host 127.0.0.1 --port 50130 --duration-sec 10 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --encoder auto --color-matrix bt709\n\
   h264-recv-dump: --bind 0.0.0.0 --port 50130 --output received_capture.h264 --idle-timeout-sec 3\n\
   h264-recv-view: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --debug-dump-limit 10 --json-interval-ms 1000 --title \"AgoraLink Native Viewer\"\n\

@@ -1,3 +1,20 @@
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConvertBackend {
+    Auto,
+    Cpu,
+    D3d11,
+}
+
+impl ConvertBackend {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::D3d11 => "d3d11",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CaptureEncodeConfig {
     pub duration_sec: Option<u64>,
@@ -8,6 +25,7 @@ pub struct CaptureEncodeConfig {
     pub output: String,
     pub color_spec: crate::color_spec::ColorSpec,
     pub encoder: crate::wmf_h264_encoder::EncoderChoice,
+    pub convert_backend: ConvertBackend,
     pub verbose: bool,
 }
 
@@ -24,14 +42,72 @@ mod platform {
         SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
     };
 
-    use super::CaptureEncodeConfig;
+    use super::{CaptureEncodeConfig, ConvertBackend};
     use crate::bgra_to_nv12;
     use crate::color_spec::{ColorSpec, MediaColorMetadata};
+    use crate::gpu_nv12_capture::{GpuCaptureStats, GpuNv12Capture};
     use crate::wgc_latest_capture::{LatestCapture, LatestCaptureStats};
     use crate::wmf_h264_encoder::{EncodedSample, EncoderSelection, EncoderStats, WmfH264Encoder};
 
     const PIXEL_FORMAT_NAME: &str = "B8G8R8A8";
     static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    #[derive(Clone, Debug)]
+    pub struct ConversionSelection {
+        pub requested: ConvertBackend,
+        pub selected: ConvertBackend,
+        pub fallback_reason: Option<String>,
+    }
+
+    impl ConversionSelection {
+        pub fn fallback(&self) -> bool {
+            self.requested == ConvertBackend::Auto && self.selected != ConvertBackend::D3d11
+        }
+
+        pub fn selected_name(&self) -> &'static str {
+            match self.selected {
+                ConvertBackend::D3d11 => "d3d11-video-processor",
+                ConvertBackend::Cpu | ConvertBackend::Auto => "cpu",
+            }
+        }
+
+        pub fn json_fragment(&self) -> String {
+            format!(
+                r#""convert_backend_requested":"{}","convert_backend_selected":"{}","convert_fallback":{},"convert_fallback_reason":{}"#,
+                self.requested.name(),
+                self.selected_name(),
+                self.fallback(),
+                optional_json_string(self.fallback_reason.as_deref()),
+            )
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct CaptureStats {
+        raw_frames: u64,
+        latest_updates: u64,
+        callback_skipped: u64,
+        dropped: u64,
+        copy_ms_total: f64,
+        gpu_convert_ms_total: f64,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct CaptureInfo {
+        width: u32,
+        height: u32,
+        driver_name: &'static str,
+    }
+
+    enum CaptureSource {
+        Cpu(LatestCapture),
+        Gpu(GpuNv12Capture),
+    }
+
+    struct CaptureRuntime {
+        source: CaptureSource,
+        selection: ConversionSelection,
+    }
 
     #[derive(Clone, Debug)]
     pub struct CapturePipelineStats {
@@ -56,7 +132,10 @@ mod platform {
         pub height: u32,
         pub copy_ms_avg: f64,
         pub convert_ms_avg: f64,
+        pub gpu_convert_ms_avg: f64,
+        pub cpu_convert_ms_avg: f64,
         pub encode_ms_avg: f64,
+        pub conversion_selection: ConversionSelection,
         pub color_spec: ColorSpec,
         pub encoder_selection: EncoderSelection,
         pub encoder_input_color_metadata: MediaColorMetadata,
@@ -70,6 +149,7 @@ mod platform {
         pub width: u32,
         pub height: u32,
         pub color_spec: ColorSpec,
+        pub conversion_selection: ConversionSelection,
         pub encoder_selection: EncoderSelection,
         pub encoder_input_color_metadata: MediaColorMetadata,
         pub encoder_output_color_metadata: MediaColorMetadata,
@@ -96,9 +176,12 @@ mod platform {
         pub height: u32,
         pub copy_ms_avg: f64,
         pub convert_ms_avg: f64,
+        pub gpu_convert_ms_avg: f64,
+        pub cpu_convert_ms_avg: f64,
         pub encode_ms_avg: f64,
         pub stopped_by_console: bool,
         pub color_spec: ColorSpec,
+        pub conversion_selection: ConversionSelection,
         pub encoder_selection: EncoderSelection,
         pub encoder_input_color_metadata: MediaColorMetadata,
         pub encoder_output_color_metadata: MediaColorMetadata,
@@ -120,8 +203,173 @@ mod platform {
         no_new_frame_reused: u64,
         frames_encoded: u64,
         encode_lag_skips: u64,
-        convert_ms_total: f64,
+        cpu_convert_ms_total: f64,
         encode_ms_total: f64,
+    }
+
+    impl CaptureRuntime {
+        fn start(config: &CaptureEncodeConfig) -> Result<Self, String> {
+            match config.convert_backend {
+                ConvertBackend::Cpu => Ok(Self {
+                    source: CaptureSource::Cpu(LatestCapture::start()?),
+                    selection: ConversionSelection {
+                        requested: ConvertBackend::Cpu,
+                        selected: ConvertBackend::Cpu,
+                        fallback_reason: None,
+                    },
+                }),
+                ConvertBackend::D3d11 => Ok(Self {
+                    source: CaptureSource::Gpu(GpuNv12Capture::start(
+                        config.out_width,
+                        config.out_height,
+                        config.target_fps,
+                        config.color_spec,
+                    )?),
+                    selection: ConversionSelection {
+                        requested: ConvertBackend::D3d11,
+                        selected: ConvertBackend::D3d11,
+                        fallback_reason: None,
+                    },
+                }),
+                ConvertBackend::Auto => match GpuNv12Capture::start(
+                    config.out_width,
+                    config.out_height,
+                    config.target_fps,
+                    config.color_spec,
+                ) {
+                    Ok(capture) => Ok(Self {
+                        source: CaptureSource::Gpu(capture),
+                        selection: ConversionSelection {
+                            requested: ConvertBackend::Auto,
+                            selected: ConvertBackend::D3d11,
+                            fallback_reason: None,
+                        },
+                    }),
+                    Err(gpu_error) => Ok(Self {
+                        source: CaptureSource::Cpu(LatestCapture::start()?),
+                        selection: ConversionSelection {
+                            requested: ConvertBackend::Auto,
+                            selected: ConvertBackend::Cpu,
+                            fallback_reason: Some(gpu_error),
+                        },
+                    }),
+                },
+            }
+        }
+
+        fn info(&self) -> CaptureInfo {
+            match &self.source {
+                CaptureSource::Cpu(capture) => {
+                    let info = capture.info();
+                    CaptureInfo {
+                        width: info.width,
+                        height: info.height,
+                        driver_name: info.driver_name,
+                    }
+                }
+                CaptureSource::Gpu(capture) => {
+                    let info = capture.info();
+                    CaptureInfo {
+                        width: info.source_width,
+                        height: info.source_height,
+                        driver_name: info.driver_name,
+                    }
+                }
+            }
+        }
+
+        fn error(&self) -> Option<String> {
+            match &self.source {
+                CaptureSource::Cpu(capture) => capture.error(),
+                CaptureSource::Gpu(capture) => capture.error(),
+            }
+        }
+
+        fn update_nv12(
+            &self,
+            config: &CaptureEncodeConfig,
+            nv12: &mut Vec<u8>,
+            last_version: &mut u64,
+            counters: &mut PipelineCounters,
+        ) -> Result<bool, String> {
+            match &self.source {
+                CaptureSource::Cpu(capture) => {
+                    let Some(frame) = capture.latest() else {
+                        return Ok(false);
+                    };
+                    if frame.version == *last_version {
+                        return Ok(false);
+                    }
+                    let convert_started = Instant::now();
+                    bgra_to_nv12::convert_scaled_with_spec(
+                        &frame.bgra,
+                        frame.row_pitch,
+                        frame.width,
+                        frame.height,
+                        config.out_width,
+                        config.out_height,
+                        nv12,
+                        config.color_spec,
+                    )?;
+                    counters.cpu_convert_ms_total +=
+                        convert_started.elapsed().as_secs_f64() * 1000.0;
+                    *last_version = frame.version;
+                    Ok(true)
+                }
+                CaptureSource::Gpu(capture) => {
+                    let Some(frame) = capture.latest() else {
+                        return Ok(false);
+                    };
+                    if frame.version == *last_version {
+                        return Ok(false);
+                    }
+                    if frame.nv12.len() != nv12.len() {
+                        return Err(format!(
+                            "GPU NV12 length mismatch: expected {}, got {}",
+                            nv12.len(),
+                            frame.nv12.len()
+                        ));
+                    }
+                    nv12.copy_from_slice(&frame.nv12);
+                    *last_version = frame.version;
+                    Ok(true)
+                }
+            }
+        }
+
+        fn stats(&self) -> CaptureStats {
+            match &self.source {
+                CaptureSource::Cpu(capture) => {
+                    let stats: LatestCaptureStats = capture.stats();
+                    CaptureStats {
+                        raw_frames: stats.raw_frames,
+                        latest_updates: stats.latest_updates,
+                        callback_skipped: stats.callback_skipped,
+                        dropped: stats.dropped,
+                        copy_ms_total: stats.copy_ms_total,
+                        gpu_convert_ms_total: 0.0,
+                    }
+                }
+                CaptureSource::Gpu(capture) => {
+                    let stats: GpuCaptureStats = capture.stats();
+                    CaptureStats {
+                        raw_frames: stats.raw_frames,
+                        latest_updates: stats.latest_updates,
+                        callback_skipped: stats.callback_skipped + stats.pacing_skipped,
+                        dropped: stats.dropped,
+                        copy_ms_total: stats.copy_ms_total,
+                        gpu_convert_ms_total: stats.gpu_convert_ms_total,
+                    }
+                }
+            }
+        }
+
+        fn stop(self) -> Result<(), String> {
+            match self.source {
+                CaptureSource::Cpu(capture) => capture.stop(),
+                CaptureSource::Gpu(capture) => capture.stop(),
+            }
+        }
     }
 
     struct FileProbeObserver {
@@ -137,7 +385,7 @@ mod platform {
 
         fn on_stats(&mut self, stats: &CapturePipelineStats) -> Result<(), String> {
             println!(
-                r#"{{"type":"CAPTURE_ENCODE_STATS","mode":"capture_encode_probe","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"mbps":{:.3},"target_bitrate_mbps":{:.3},"width":{},"height":{},"format_in":"{}","format_encode":"NV12","copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},{},{},{},{}}}"#,
+                r#"{{"type":"CAPTURE_ENCODE_STATS","mode":"capture_encode_probe","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"mbps":{:.3},"target_bitrate_mbps":{:.3},"width":{},"height":{},"format_in":"{}","format_encode":"NV12","copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"gpu_convert_ms_avg":{:.3},"cpu_convert_ms_avg":{:.3},"encode_ms_avg":{:.3},{},{},{},{},{}}}"#,
                 stats.capture_raw_frames,
                 stats.capture_latest_updates,
                 stats.capture_callback_skipped,
@@ -160,7 +408,10 @@ mod platform {
                 PIXEL_FORMAT_NAME,
                 stats.copy_ms_avg,
                 stats.convert_ms_avg,
+                stats.gpu_convert_ms_avg,
+                stats.cpu_convert_ms_avg,
                 stats.encode_ms_avg,
+                stats.conversion_selection.json_fragment(),
                 stats.encoder_selection.json_fragment(),
                 stats.color_spec.json_fragment(),
                 stats
@@ -215,7 +466,7 @@ mod platform {
             .flush()
             .map_err(|err| format!("flush output failed: {err}"))?;
         println!(
-            r#"{{"type":"CAPTURE_ENCODE_DONE","encoder":"{}","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"target_bitrate_mbps":{:.3},"keyframes":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"output":"{}",{},{},{},{}}}"#,
+            r#"{{"type":"CAPTURE_ENCODE_DONE","encoder":"{}","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"target_bitrate_mbps":{:.3},"keyframes":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"gpu_convert_ms_avg":{:.3},"cpu_convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"output":"{}",{},{},{},{},{}}}"#,
             json_escape(&done.encoder_selection.selected_name),
             done.capture_raw_frames,
             done.capture_latest_updates,
@@ -239,8 +490,11 @@ mod platform {
             done.height,
             done.copy_ms_avg,
             done.convert_ms_avg,
+            done.gpu_convert_ms_avg,
+            done.cpu_convert_ms_avg,
             done.encode_ms_avg,
             json_escape(&config.output),
+            done.conversion_selection.json_fragment(),
             done.encoder_selection.json_fragment(),
             done.color_spec.json_fragment(),
             done.encoder_input_color_metadata
@@ -268,7 +522,7 @@ mod platform {
     ) -> Result<CapturePipelineDone, String> {
         validate_stream_config(config)?;
         let _console_ctrl = ConsoleCtrlGuard::install()?;
-        let capture = LatestCapture::start()?;
+        let capture = CaptureRuntime::start(config)?;
         let capture_info = capture.info();
         let mut encoder = WmfH264Encoder::new_stream_with_color_and_choice(
             config.out_width,
@@ -283,7 +537,7 @@ mod platform {
         let started_at = Instant::now();
         let mut next_tick = started_at;
         let mut report_at = started_at;
-        let mut previous_capture = LatestCaptureStats::default();
+        let mut previous_capture = CaptureStats::default();
         let mut previous_pipeline = PipelineCounters::default();
         let mut previous_encoder = EncoderStats::default();
         let mut counters = PipelineCounters::default();
@@ -292,12 +546,13 @@ mod platform {
 
         if config.verbose {
             eprintln!(
-                "capture-encode target=primary-monitor source={}x{} output={}x{} input={} encode=NV12 encoder=\"{}\" requested={} target_fps={} bitrate_mbps={} color_matrix={} range={} d3d_driver={} output_buffer={} profile_main={} encoder_input_metadata={:?} encoder_output_metadata={:?} duration_sec={}",
+                "capture-encode target=primary-monitor source={}x{} output={}x{} input={} encode=NV12 convert_backend={} encoder=\"{}\" requested={} target_fps={} bitrate_mbps={} color_matrix={} range={} d3d_driver={} output_buffer={} profile_main={} encoder_input_metadata={:?} encoder_output_metadata={:?} duration_sec={}",
                 capture_info.width,
                 capture_info.height,
                 config.out_width,
                 config.out_height,
                 PIXEL_FORMAT_NAME,
+                capture.selection.selected_name(),
                 encoder.encoder_selection().selected_name,
                 config.encoder.name(),
                 config.target_fps,
@@ -318,6 +573,7 @@ mod platform {
             width: config.out_width,
             height: config.out_height,
             color_spec: config.color_spec,
+            conversion_selection: capture.selection.clone(),
             encoder_selection: encoder.encoder_selection().clone(),
             encoder_input_color_metadata: encoder.input_color_metadata(),
             encoder_output_color_metadata: encoder.output_color_metadata(),
@@ -331,25 +587,10 @@ mod platform {
                 return Err(error);
             }
             counters.encode_ticks += 1;
-            if let Some(frame) = capture.latest() {
-                if frame.version != last_version {
-                    let convert_started = Instant::now();
-                    bgra_to_nv12::convert_scaled_with_spec(
-                        &frame.bgra,
-                        frame.row_pitch,
-                        frame.width,
-                        frame.height,
-                        config.out_width,
-                        config.out_height,
-                        &mut nv12,
-                        config.color_spec,
-                    )?;
-                    counters.convert_ms_total += convert_started.elapsed().as_secs_f64() * 1000.0;
-                    last_version = frame.version;
-                    have_nv12 = true;
-                } else if have_nv12 {
-                    counters.no_new_frame_reused += 1;
-                }
+            if capture.update_nv12(config, &mut nv12, &mut last_version, &mut counters)? {
+                have_nv12 = true;
+            } else if have_nv12 {
+                counters.no_new_frame_reused += 1;
             }
             if have_nv12 {
                 let encode_started = Instant::now();
@@ -384,6 +625,7 @@ mod platform {
                     encoder.input_color_metadata(),
                     encoder.output_color_metadata(),
                     encoder.encoder_selection().clone(),
+                    capture.selection.clone(),
                     after_work.duration_since(report_at),
                 );
                 observer.on_stats(&stats)?;
@@ -395,6 +637,7 @@ mod platform {
         }
 
         let capture_stats = capture.stats();
+        let conversion_selection = capture.selection.clone();
         capture.stop()?;
         let encoder_stats = encoder.finish()?;
         emit_encoded_samples(&mut encoder, observer)?;
@@ -421,10 +664,23 @@ mod platform {
             width: config.out_width,
             height: config.out_height,
             copy_ms_avg: average_ms(capture_stats.copy_ms_total, capture_stats.latest_updates),
-            convert_ms_avg: average_ms(counters.convert_ms_total, counters.frames_encoded),
+            convert_ms_avg: if conversion_selection.selected == ConvertBackend::D3d11 {
+                average_ms(
+                    capture_stats.gpu_convert_ms_total,
+                    capture_stats.latest_updates,
+                )
+            } else {
+                average_ms(counters.cpu_convert_ms_total, counters.frames_encoded)
+            },
+            gpu_convert_ms_avg: average_ms(
+                capture_stats.gpu_convert_ms_total,
+                capture_stats.latest_updates,
+            ),
+            cpu_convert_ms_avg: average_ms(counters.cpu_convert_ms_total, counters.frames_encoded),
             encode_ms_avg: average_ms(counters.encode_ms_total, counters.frames_encoded),
             stopped_by_console: STOP_REQUESTED.load(Ordering::SeqCst),
             color_spec: config.color_spec,
+            conversion_selection,
             encoder_selection: encoder.encoder_selection().clone(),
             encoder_input_color_metadata: encoder.input_color_metadata(),
             encoder_output_color_metadata: encoder.output_color_metadata(),
@@ -434,8 +690,8 @@ mod platform {
     #[allow(clippy::too_many_arguments)]
     fn make_stats(
         config: &CaptureEncodeConfig,
-        capture: LatestCaptureStats,
-        previous_capture: LatestCaptureStats,
+        capture: CaptureStats,
+        previous_capture: CaptureStats,
         pipeline: PipelineCounters,
         previous_pipeline: PipelineCounters,
         encoder: EncoderStats,
@@ -443,6 +699,7 @@ mod platform {
         encoder_input_color_metadata: MediaColorMetadata,
         encoder_output_color_metadata: MediaColorMetadata,
         encoder_selection: EncoderSelection,
+        conversion_selection: ConversionSelection,
         elapsed: Duration,
     ) -> CapturePipelineStats {
         let elapsed_sec = elapsed.as_secs_f64().max(0.001);
@@ -476,8 +733,15 @@ mod platform {
             width: config.out_width,
             height: config.out_height,
             copy_ms_avg: average_ms(capture.copy_ms_total, capture.latest_updates),
-            convert_ms_avg: average_ms(pipeline.convert_ms_total, pipeline.frames_encoded),
+            convert_ms_avg: if conversion_selection.selected == ConvertBackend::D3d11 {
+                average_ms(capture.gpu_convert_ms_total, capture.latest_updates)
+            } else {
+                average_ms(pipeline.cpu_convert_ms_total, pipeline.frames_encoded)
+            },
+            gpu_convert_ms_avg: average_ms(capture.gpu_convert_ms_total, capture.latest_updates),
+            cpu_convert_ms_avg: average_ms(pipeline.cpu_convert_ms_total, pipeline.frames_encoded),
             encode_ms_avg: average_ms(pipeline.encode_ms_total, pipeline.frames_encoded),
+            conversion_selection,
             color_spec: config.color_spec,
             encoder_selection,
             encoder_input_color_metadata,
@@ -566,6 +830,13 @@ mod platform {
             .replace('"', "\\\"")
             .replace('\r', "\\r")
             .replace('\n', "\\n")
+    }
+
+    fn optional_json_string(value: Option<&str>) -> String {
+        value.map_or_else(
+            || "null".to_string(),
+            |value| format!(r#""{}""#, json_escape(value)),
+        )
     }
 }
 
