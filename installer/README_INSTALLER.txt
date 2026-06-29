@@ -17,12 +17,13 @@ AgoraLink does not silently change Windows Firewall rules during installation.
 On first run, allow Windows Firewall access for private networks.
 If manual firewall setup is needed, run allow_firewall_udp_9999_admin.bat as Administrator.
 
-Bundled FFmpeg:
+Bundled media tools:
 The packaged app expects FFmpeg under:
 _internal\tools\ffmpeg\bin
+The packaged app expects Rust native media under:
+_internal\tools\agoralink_media\agoralink_media.exe
 
 Uninstall behavior:
 The uninstaller removes the installed program files and shortcuts.
 It does not delete local user data by default:
 %LOCALAPPDATA%\AgoraLink
-

@@ -33,6 +33,9 @@ rust-native/**/target/
 tools/ffmpeg/bin/*.exe
 tools/ffmpeg/bin/*.dll
 
+# Bundled local Rust native media binary for packaging only
+tools/agoralink_media/*.exe
+
 # Rust native media probe outputs
 rust-native/agoralink_media/*.h264
 rust-native/agoralink_media/*.wav

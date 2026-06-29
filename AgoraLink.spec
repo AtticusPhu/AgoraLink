@@ -89,6 +89,10 @@ ffmpeg_dir = project_dir / 'tools' / 'ffmpeg'
 if ffmpeg_dir.exists():
     datas.append((str(ffmpeg_dir), 'tools/ffmpeg'))
 
+rust_media_exe = project_dir / 'rust-native' / 'agoralink_media' / 'target' / 'release' / 'agoralink_media.exe'
+if rust_media_exe.exists():
+    datas.append((str(rust_media_exe), 'tools/agoralink_media'))
+
 for src, dest in [
     (project_dir / 'assets' / 'app.png', 'assets'),
     (project_dir / 'assets' / 'app.ico', 'assets'),

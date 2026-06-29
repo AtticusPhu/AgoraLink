@@ -16,6 +16,10 @@ $NsisScript = Join-Path $InstallerDir "AgoraLink.nsi"
 $DistDir = Join-Path $RepoRoot "dist"
 $DistAppDir = Join-Path $DistDir "AgoraLink"
 $AppExe = Join-Path $DistAppDir "AgoraLink.exe"
+$RustMediaCrateDir = Join-Path $RepoRoot "rust-native\agoralink_media"
+$RustMediaExe = Join-Path $RustMediaCrateDir "target\release\agoralink_media.exe"
+$DistRustMediaExe = Join-Path $DistAppDir "_internal\tools\agoralink_media\agoralink_media.exe"
+$DistFfmpegExe = Join-Path $DistAppDir "_internal\tools\ffmpeg\bin\ffmpeg.exe"
 $InstallerExe = Join-Path $DistDir "AgoraLink_Setup_v$Version.exe"
 $PortableZip = Join-Path $DistDir "AgoraLink_portable_v$Version.zip"
 
@@ -87,6 +91,37 @@ function Resolve-MakeNsis {
     throw "makensis.exe not found. Install NSIS or set MAKENSIS to makensis.exe."
 }
 
+function Resolve-Cargo {
+    $command = Get-Command "cargo.exe" -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
+    }
+    $command = Get-Command "cargo" -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
+    }
+    throw "cargo not found. Install Rust stable toolchain before packaging Rust native media."
+}
+
+function Invoke-RustMediaBuild {
+    Assert-Directory $RustMediaCrateDir
+    Assert-File (Join-Path $RustMediaCrateDir "Cargo.toml")
+
+    $cargo = Resolve-Cargo
+    Push-Location $RustMediaCrateDir
+    try {
+        Invoke-Checked `
+            -FilePath $cargo `
+            -Arguments @("build", "--release", "--locked", "--offline") `
+            -Step "Rust native media release build"
+    }
+    finally {
+        Pop-Location
+    }
+
+    Assert-File $RustMediaExe
+}
+
 function Invoke-PyCompile {
     $pyFiles = Get-ChildItem -LiteralPath $RepoRoot -Filter "*.py" -File |
         Sort-Object FullName
@@ -121,6 +156,7 @@ try {
     Assert-File (Join-Path $RepoRoot "main_kivy.py")
 
     Invoke-PyCompile
+    Invoke-RustMediaBuild
 
     Invoke-Checked `
         -FilePath $Python `
@@ -128,6 +164,8 @@ try {
         -Step "PyInstaller"
 
     Assert-File $AppExe
+    Assert-File $DistRustMediaExe
+    Assert-File $DistFfmpegExe
 
     $makensisExe = Resolve-MakeNsis -Requested $MakeNsis
     Push-Location $InstallerDir
@@ -147,6 +185,8 @@ try {
     }
     Compress-Archive -Path (Join-Path $DistAppDir "*") -DestinationPath $PortableZip -CompressionLevel Optimal
     Assert-File $PortableZip
+    Assert-File $DistRustMediaExe
+    Assert-File $DistFfmpegExe
 
     Write-Host "==> SHA256"
     foreach ($artifact in @($InstallerExe, $PortableZip)) {
