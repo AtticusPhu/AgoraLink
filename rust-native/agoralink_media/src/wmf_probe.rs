@@ -145,12 +145,22 @@ mod platform {
         Ok((
             clsid,
             format!(
-                r#"{{"type":"WMF_ENCODER","codec":"h264","name":"{}","clsid":"{}","hardware":{},"async":{},"is_hardware_or_async_hint":{},"input_formats":{},"output_formats":{}}}"#,
+                r#"{{"type":"WMF_ENCODER","codec":"h264","name":"{}","clsid":"{}","hardware":{},"async":{},"is_hardware_or_async_hint":{},"hardware_url":{},"hardware_vendor":{},"input_formats":{},"output_formats":{}}}"#,
                 json_escape(&name),
                 guid_string(&clsid),
                 hardware,
                 async_mft,
                 hardware || async_mft,
+                optional_json_string(if hardware_url.is_empty() {
+                    None
+                } else {
+                    Some(&hardware_url)
+                }),
+                optional_json_string(if hardware_vendor.is_empty() {
+                    None
+                } else {
+                    Some(&hardware_vendor)
+                }),
                 json_string_array(&registered.input_formats),
                 json_string_array(&registered.output_formats)
             ),
@@ -272,6 +282,13 @@ mod platform {
             .map(|value| format!(r#""{}""#, json_escape(value)))
             .collect();
         format!("[{}]", items.join(","))
+    }
+
+    fn optional_json_string(value: Option<&str>) -> String {
+        value.map_or_else(
+            || "null".to_string(),
+            |value| format!(r#""{}""#, json_escape(value)),
+        )
     }
 
     fn json_escape(text: &str) -> String {

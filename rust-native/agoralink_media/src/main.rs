@@ -507,7 +507,7 @@ fn parse_encode_probe_args(args: &[String]) -> Result<Command, String> {
     let mut duration_sec = 5u64;
     let mut bitrate_mbps = 4.0f64;
     let mut output = "synthetic_720p30.h264".to_string();
-    let mut encoder = encode_probe::EncoderChoice::Auto;
+    let mut encoder = wmf_h264_encoder::EncoderChoice::Auto;
     let mut color_spec = color_spec::ColorSpec::default();
     let mut i = 0;
 
@@ -576,6 +576,7 @@ fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
     let mut out_height = 720u32;
     let mut output = "capture_720p30.h264".to_string();
     let mut color_spec = color_spec::ColorSpec::default();
+    let mut encoder = wmf_h264_encoder::EncoderChoice::Auto;
     let mut i = 0;
 
     while i < args.len() {
@@ -608,6 +609,10 @@ fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
                     return Err("output path must not be empty".to_string());
                 }
             }
+            "--encoder" => {
+                i += 1;
+                encoder = parse_encoder_choice(required_value(args, i, "--encoder")?)?;
+            }
             "--color-matrix" => {
                 i += 1;
                 color_spec = color_spec::ColorSpec::with_matrix(color_spec::ColorMatrix::parse(
@@ -629,6 +634,7 @@ fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
             out_height,
             output,
             color_spec,
+            encoder,
             verbose: true,
         },
     ))
@@ -643,6 +649,7 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
     let mut out_width = 1280u32;
     let mut out_height = 720u32;
     let mut color_spec = color_spec::ColorSpec::default();
+    let mut encoder = wmf_h264_encoder::EncoderChoice::Auto;
     let mut i = 0;
 
     while i < args.len() {
@@ -682,6 +689,10 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
                     required_value(args, i, "--color-matrix")?,
                 )?);
             }
+            "--encoder" => {
+                i += 1;
+                encoder = parse_encoder_choice(required_value(args, i, "--encoder")?)?;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unknown h264-send-probe argument: {other}")),
         }
@@ -697,6 +708,7 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
         out_width,
         out_height,
         color_spec,
+        encoder,
         mode: h264_send_probe::H264SendMode::Probe,
         verbose: true,
     }))
@@ -946,6 +958,7 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
     let mut out_width = 1280u32;
     let mut out_height = 720u32;
     let mut color_spec = color_spec::ColorSpec::default();
+    let mut encoder = wmf_h264_encoder::EncoderChoice::Auto;
     let mut verbose = false;
     let mut i = 0;
 
@@ -991,6 +1004,10 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
                     required_value(args, i, "--color-matrix")?,
                 )?);
             }
+            "--encoder" => {
+                i += 1;
+                encoder = parse_encoder_choice(required_value(args, i, "--encoder")?)?;
+            }
             "--payload-size" => {
                 i += 1;
                 parse_screen_payload_size(required_value(args, i, "--payload-size")?)?;
@@ -1013,6 +1030,7 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
         out_width,
         out_height,
         color_spec,
+        encoder,
         mode: h264_send_probe::H264SendMode::Screen,
         verbose,
     }))
@@ -1253,12 +1271,14 @@ fn parse_screen_payload_size(text: &str) -> Result<usize, String> {
     }
 }
 
-fn parse_encoder_choice(text: &str) -> Result<encode_probe::EncoderChoice, String> {
+fn parse_encoder_choice(text: &str) -> Result<wmf_h264_encoder::EncoderChoice, String> {
     match text {
-        "auto" => Ok(encode_probe::EncoderChoice::Auto),
-        "software" => Ok(encode_probe::EncoderChoice::Software),
-        "hardware" => Ok(encode_probe::EncoderChoice::Hardware),
-        _ => Err("encoder must be auto, software, or hardware".to_string()),
+        "auto" => Ok(wmf_h264_encoder::EncoderChoice::Auto),
+        "software" => Ok(wmf_h264_encoder::EncoderChoice::Software),
+        "microsoft" => Ok(wmf_h264_encoder::EncoderChoice::Microsoft),
+        "hardware" => Ok(wmf_h264_encoder::EncoderChoice::Hardware),
+        "intel-qsv" => Ok(wmf_h264_encoder::EncoderChoice::IntelQsv),
+        _ => Err("encoder must be auto, hardware, software, microsoft, or intel-qsv".to_string()),
     }
 }
 
@@ -1281,12 +1301,12 @@ Usage:\n\
   agoralink_media receiver --bind <ip> --port <port>\n\
   agoralink_media capture-probe --duration-sec <seconds> --target-fps <fps>\n\
   agoralink_media wmf-probe\n\
-  agoralink_media encode-probe --width <pixels> --height <pixels> --fps <fps> --duration-sec <seconds> --bitrate-mbps <mbps> --output <path> [--encoder auto|software|hardware] [--color-matrix bt601|bt709]\n\
-  agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels> --output <path> [--color-matrix bt601|bt709]\n\
-  agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels> [--color-matrix bt601|bt709]\n\
+  agoralink_media encode-probe --width <pixels> --height <pixels> --fps <fps> --duration-sec <seconds> --bitrate-mbps <mbps> --output <path> [--encoder auto|hardware|software|microsoft|intel-qsv] [--color-matrix bt601|bt709]\n\
+  agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels> --output <path> [--encoder auto|hardware|software|microsoft|intel-qsv] [--color-matrix bt601|bt709]\n\
+  agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels> [--encoder auto|hardware|software|microsoft|intel-qsv] [--color-matrix bt601|bt709]\n\
   agoralink_media h264-recv-dump --bind <ip> --port <port> --output <path> [--idle-timeout-sec <seconds>]\n\
   agoralink_media h264-recv-view --bind <ip> --port <port> [--frame-timeout-ms <ms>] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--debug-dump-frames <dir>] [--debug-dump-limit <n>] [--json-interval-ms <ms>] [--title <text>]\n\
-  agoralink_media screen-send --host <ip> --port <port> [--width <pixels>] [--height <pixels>] [--fps <fps>] [--bitrate-mbps <mbps>] [--duration-sec <seconds>] [--color-matrix bt601|bt709] [--payload-size 1200] [--verbose]\n\
+  agoralink_media screen-send --host <ip> --port <port> [--width <pixels>] [--height <pixels>] [--fps <fps>] [--bitrate-mbps <mbps>] [--duration-sec <seconds>] [--encoder auto|hardware|software|microsoft|intel-qsv] [--color-matrix bt601|bt709] [--payload-size 1200] [--verbose]\n\
   agoralink_media screen-recv --bind <ip> --port <port> [--duration-sec <seconds>] [--frame-timeout-ms <ms>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--json-interval-ms <ms>] [--title <text>] [--verbose]\n\
   agoralink_media h264-file-viewer --input <path>\n\n\
   agoralink_media color-test-pattern --output <path> --width <pixels> --height <pixels> --duration-sec <seconds> [--fps <fps>] [--bitrate-mbps <mbps>] [--color-matrix bt601|bt709]\n\n\
@@ -1295,11 +1315,11 @@ Defaults:\n\
   receiver: --bind 0.0.0.0 --port 50120\n\
   capture-probe: --duration-sec 10 --target-fps 30\n\
   encode-probe: --width 1280 --height 720 --fps 30 --duration-sec 5 --bitrate-mbps 4 --output synthetic_720p30.h264 --encoder auto --color-matrix bt709\n\
-  capture-encode-probe: --duration-sec 5 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --output capture_720p30.h264 --color-matrix bt709\n\
-  h264-send-probe: --host 127.0.0.1 --port 50130 --duration-sec 10 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --color-matrix bt709\n\
+  capture-encode-probe: --duration-sec 5 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --output capture_720p30.h264 --encoder auto --color-matrix bt709\n\
+  h264-send-probe: --host 127.0.0.1 --port 50130 --duration-sec 10 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --encoder auto --color-matrix bt709\n\
   h264-recv-dump: --bind 0.0.0.0 --port 50130 --output received_capture.h264 --idle-timeout-sec 3\n\
   h264-recv-view: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --debug-dump-limit 10 --json-interval-ms 1000 --title \"AgoraLink Native Viewer\"\n\
-  screen-send: --host required --port required --width 1280 --height 720 --fps 30 --bitrate-mbps 4 --color-matrix bt709 --payload-size 1200 --duration-sec unlimited --verbose off\n\
+  screen-send: --host required --port required --width 1280 --height 720 --fps 30 --bitrate-mbps 4 --encoder auto --color-matrix bt709 --payload-size 1200 --duration-sec unlimited --verbose off\n\
   screen-recv: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --json-interval-ms 1000 --title \"AgoraLink Native Viewer\" --duration-sec unlimited --verbose off\n\
   h264-file-viewer: --input received_capture_lan.h264\n\
   color-test-pattern: --output color_test_1080p.h264 --width 1920 --height 1080 --fps 30 --duration-sec 3 --bitrate-mbps 8 --color-matrix bt709"

@@ -1,10 +1,3 @@
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EncoderChoice {
-    Auto,
-    Software,
-    Hardware,
-}
-
 #[derive(Debug)]
 pub struct EncodeProbeConfig {
     pub width: u32,
@@ -13,7 +6,7 @@ pub struct EncodeProbeConfig {
     pub duration_sec: u64,
     pub bitrate_mbps: f64,
     pub output: String,
-    pub encoder: EncoderChoice,
+    pub encoder: crate::wmf_h264_encoder::EncoderChoice,
     pub color_spec: crate::color_spec::ColorSpec,
 }
 
@@ -28,9 +21,9 @@ mod platform {
         SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
     };
 
-    use super::{EncodeProbeConfig, EncoderChoice};
+    use super::EncodeProbeConfig;
     use crate::nv12_synthetic;
-    use crate::wmf_h264_encoder::{EncoderStats, WmfH264Encoder, ENCODER_NAME};
+    use crate::wmf_h264_encoder::{EncoderStats, WmfH264Encoder};
 
     static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -65,25 +58,21 @@ mod platform {
 
     pub fn run(config: EncodeProbeConfig) -> Result<(), String> {
         validate_config(&config)?;
-        if config.encoder == EncoderChoice::Hardware {
-            return Err(
-                "hardware encoder is not implemented in stage 3A; use --encoder software or auto"
-                    .to_string(),
-            );
-        }
         let _console_ctrl = ConsoleCtrlGuard::install()?;
         let frame_size = nv12_synthetic::buffer_size(config.width, config.height)?;
-        let mut encoder = WmfH264Encoder::new_with_color(
+        let mut encoder = WmfH264Encoder::new_with_color_and_choice(
             config.width,
             config.height,
             config.fps,
             config.bitrate_mbps,
             &config.output,
             config.color_spec,
+            config.encoder,
         )?;
         eprintln!(
-            "encode-probe encoder=\"{}\" input=NV12 output=H264 size={}x{} fps={} bitrate_mbps={} color_matrix={} range={} output_buffer={} profile_main={} encoder_input_metadata={:?} encoder_output_metadata={:?}",
-            ENCODER_NAME,
+            "encode-probe encoder=\"{}\" requested={} input=NV12 output=H264 size={}x{} fps={} bitrate_mbps={} color_matrix={} range={} output_buffer={} profile_main={} encoder_input_metadata={:?} encoder_output_metadata={:?}",
+            encoder.encoder_selection().selected_name,
+            config.encoder.name(),
             config.width,
             config.height,
             config.fps,
@@ -117,7 +106,13 @@ mod platform {
             let now = Instant::now();
             if now.duration_since(report_at) >= Duration::from_secs(1) {
                 let current = encoder.stats();
-                print_stats(&config, current, previous, now.duration_since(report_at));
+                print_stats(
+                    &config,
+                    encoder.encoder_selection(),
+                    current,
+                    previous,
+                    now.duration_since(report_at),
+                );
                 previous = current;
                 report_at = now;
             }
@@ -128,8 +123,8 @@ mod platform {
         let wall_time_sec = started_at.elapsed().as_secs_f64();
         let media_duration_sec = stats.frames_in as f64 / f64::from(config.fps);
         println!(
-            r#"{{"type":"ENCODE_DONE","encoder":"{}","frames_in":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"keyframes":{},"width":{},"height":{},"output":"{}",{},{},{}}}"#,
-            ENCODER_NAME,
+            r#"{{"type":"ENCODE_DONE","encoder":"{}","frames_in":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"target_bitrate_mbps":{:.3},"keyframes":{},"width":{},"height":{},"output":"{}",{},{},{},{}}}"#,
+            json_escape(&encoder.encoder_selection().selected_name),
             stats.frames_in,
             stats.samples_out,
             stats.bytes_out,
@@ -138,10 +133,12 @@ mod platform {
             config.fps,
             stats.frames_in as f64 / wall_time_sec.max(0.001),
             stats.bytes_out as f64 * 8.0 / media_duration_sec.max(0.001) / 1_000_000.0,
+            config.bitrate_mbps,
             keyframes_json(stats),
             config.width,
             config.height,
             json_escape(&config.output),
+            encoder.encoder_selection().json_fragment(),
             config.color_spec.json_fragment(),
             encoder
                 .input_color_metadata()
@@ -188,6 +185,7 @@ mod platform {
 
     fn print_stats(
         config: &EncodeProbeConfig,
+        selection: &crate::wmf_h264_encoder::EncoderSelection,
         current: EncoderStats,
         previous: EncoderStats,
         elapsed: Duration,
@@ -199,17 +197,19 @@ mod platform {
             / media_elapsed_sec.max(0.001)
             / 1_000_000.0;
         println!(
-            r#"{{"type":"ENCODE_STATS","mode":"encode_probe","encoder":"{}","frames_in":{},"samples_out":{},"bytes_out":{},"mbps":{:.3},"fps":{},"processing_fps":{:.2},"keyframes":{},"width":{},"height":{},{} }}"#,
-            ENCODER_NAME,
+            r#"{{"type":"ENCODE_STATS","mode":"encode_probe","encoder":"{}","frames_in":{},"samples_out":{},"bytes_out":{},"mbps":{:.3},"target_bitrate_mbps":{:.3},"fps":{},"processing_fps":{:.2},"keyframes":{},"width":{},"height":{},{},{} }}"#,
+            json_escape(&selection.selected_name),
             current.frames_in,
             current.samples_out,
             current.bytes_out,
             mbps,
+            config.bitrate_mbps,
             config.fps,
             frame_delta as f64 / elapsed_sec,
             keyframes_json(current),
             config.width,
             config.height,
+            selection.json_fragment(),
             config.color_spec.json_fragment()
         );
         io::stdout().flush().ok();

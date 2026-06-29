@@ -7,6 +7,7 @@ pub struct CaptureEncodeConfig {
     pub out_height: u32,
     pub output: String,
     pub color_spec: crate::color_spec::ColorSpec,
+    pub encoder: crate::wmf_h264_encoder::EncoderChoice,
     pub verbose: bool,
 }
 
@@ -27,12 +28,12 @@ mod platform {
     use crate::bgra_to_nv12;
     use crate::color_spec::{ColorSpec, MediaColorMetadata};
     use crate::wgc_latest_capture::{LatestCapture, LatestCaptureStats};
-    use crate::wmf_h264_encoder::{EncodedSample, EncoderStats, WmfH264Encoder, ENCODER_NAME};
+    use crate::wmf_h264_encoder::{EncodedSample, EncoderSelection, EncoderStats, WmfH264Encoder};
 
     const PIXEL_FORMAT_NAME: &str = "B8G8R8A8";
     static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Debug)]
     pub struct CapturePipelineStats {
         pub capture_raw_frames: u64,
         pub capture_latest_updates: u64,
@@ -50,28 +51,31 @@ mod platform {
         pub encode_fps: f64,
         pub target_fps: u32,
         pub mbps: f64,
+        pub target_bitrate_mbps: f64,
         pub width: u32,
         pub height: u32,
         pub copy_ms_avg: f64,
         pub convert_ms_avg: f64,
         pub encode_ms_avg: f64,
         pub color_spec: ColorSpec,
+        pub encoder_selection: EncoderSelection,
         pub encoder_input_color_metadata: MediaColorMetadata,
         pub encoder_output_color_metadata: MediaColorMetadata,
     }
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Debug)]
     pub struct CapturePipelineStarted {
         pub target_fps: u32,
         pub bitrate_mbps: f64,
         pub width: u32,
         pub height: u32,
         pub color_spec: ColorSpec,
+        pub encoder_selection: EncoderSelection,
         pub encoder_input_color_metadata: MediaColorMetadata,
         pub encoder_output_color_metadata: MediaColorMetadata,
     }
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Debug)]
     pub struct CapturePipelineDone {
         pub capture_raw_frames: u64,
         pub capture_latest_updates: u64,
@@ -87,6 +91,7 @@ mod platform {
         pub wall_time_sec: f64,
         pub processing_fps: f64,
         pub mbps: f64,
+        pub bitrate_mbps: f64,
         pub width: u32,
         pub height: u32,
         pub copy_ms_avg: f64,
@@ -94,6 +99,7 @@ mod platform {
         pub encode_ms_avg: f64,
         pub stopped_by_console: bool,
         pub color_spec: ColorSpec,
+        pub encoder_selection: EncoderSelection,
         pub encoder_input_color_metadata: MediaColorMetadata,
         pub encoder_output_color_metadata: MediaColorMetadata,
     }
@@ -131,7 +137,7 @@ mod platform {
 
         fn on_stats(&mut self, stats: &CapturePipelineStats) -> Result<(), String> {
             println!(
-                r#"{{"type":"CAPTURE_ENCODE_STATS","mode":"capture_encode_probe","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"mbps":{:.3},"width":{},"height":{},"format_in":"{}","format_encode":"NV12","copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},{},{},{}}}"#,
+                r#"{{"type":"CAPTURE_ENCODE_STATS","mode":"capture_encode_probe","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"mbps":{:.3},"target_bitrate_mbps":{:.3},"width":{},"height":{},"format_in":"{}","format_encode":"NV12","copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},{},{},{},{}}}"#,
                 stats.capture_raw_frames,
                 stats.capture_latest_updates,
                 stats.capture_callback_skipped,
@@ -148,12 +154,14 @@ mod platform {
                 stats.encode_fps,
                 stats.target_fps,
                 stats.mbps,
+                stats.target_bitrate_mbps,
                 stats.width,
                 stats.height,
                 PIXEL_FORMAT_NAME,
                 stats.copy_ms_avg,
                 stats.convert_ms_avg,
                 stats.encode_ms_avg,
+                stats.encoder_selection.json_fragment(),
                 stats.color_spec.json_fragment(),
                 stats
                     .encoder_input_color_metadata
@@ -207,8 +215,8 @@ mod platform {
             .flush()
             .map_err(|err| format!("flush output failed: {err}"))?;
         println!(
-            r#"{{"type":"CAPTURE_ENCODE_DONE","encoder":"{}","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"keyframes":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"output":"{}",{},{},{}}}"#,
-            ENCODER_NAME,
+            r#"{{"type":"CAPTURE_ENCODE_DONE","encoder":"{}","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"target_bitrate_mbps":{:.3},"keyframes":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"output":"{}",{},{},{},{}}}"#,
+            json_escape(&done.encoder_selection.selected_name),
             done.capture_raw_frames,
             done.capture_latest_updates,
             done.capture_callback_skipped,
@@ -225,6 +233,7 @@ mod platform {
             config.target_fps,
             done.processing_fps,
             done.mbps,
+            config.bitrate_mbps,
             keyframes_json(done.encoder),
             done.width,
             done.height,
@@ -232,6 +241,7 @@ mod platform {
             done.convert_ms_avg,
             done.encode_ms_avg,
             json_escape(&config.output),
+            done.encoder_selection.json_fragment(),
             done.color_spec.json_fragment(),
             done.encoder_input_color_metadata
                 .json_fragment("encoder_input"),
@@ -260,12 +270,13 @@ mod platform {
         let _console_ctrl = ConsoleCtrlGuard::install()?;
         let capture = LatestCapture::start()?;
         let capture_info = capture.info();
-        let mut encoder = WmfH264Encoder::new_stream_with_color(
+        let mut encoder = WmfH264Encoder::new_stream_with_color_and_choice(
             config.out_width,
             config.out_height,
             config.target_fps,
             config.bitrate_mbps,
             config.color_spec,
+            config.encoder,
         )?;
         let mut nv12 = vec![0u8; bgra_to_nv12::buffer_size(config.out_width, config.out_height)?];
         let frame_interval = Duration::from_nanos(1_000_000_000u64 / u64::from(config.target_fps));
@@ -281,13 +292,14 @@ mod platform {
 
         if config.verbose {
             eprintln!(
-                "capture-encode target=primary-monitor source={}x{} output={}x{} input={} encode=NV12 encoder=\"{}\" target_fps={} bitrate_mbps={} color_matrix={} range={} d3d_driver={} output_buffer={} profile_main={} encoder_input_metadata={:?} encoder_output_metadata={:?} duration_sec={}",
+                "capture-encode target=primary-monitor source={}x{} output={}x{} input={} encode=NV12 encoder=\"{}\" requested={} target_fps={} bitrate_mbps={} color_matrix={} range={} d3d_driver={} output_buffer={} profile_main={} encoder_input_metadata={:?} encoder_output_metadata={:?} duration_sec={}",
                 capture_info.width,
                 capture_info.height,
                 config.out_width,
                 config.out_height,
                 PIXEL_FORMAT_NAME,
-                ENCODER_NAME,
+                encoder.encoder_selection().selected_name,
+                config.encoder.name(),
                 config.target_fps,
                 config.bitrate_mbps,
                 config.color_spec.yuv_matrix(),
@@ -306,6 +318,7 @@ mod platform {
             width: config.out_width,
             height: config.out_height,
             color_spec: config.color_spec,
+            encoder_selection: encoder.encoder_selection().clone(),
             encoder_input_color_metadata: encoder.input_color_metadata(),
             encoder_output_color_metadata: encoder.output_color_metadata(),
         })?;
@@ -370,6 +383,7 @@ mod platform {
                     previous_encoder,
                     encoder.input_color_metadata(),
                     encoder.output_color_metadata(),
+                    encoder.encoder_selection().clone(),
                     after_work.duration_since(report_at),
                 );
                 observer.on_stats(&stats)?;
@@ -403,6 +417,7 @@ mod platform {
             mbps: encoder_stats.bytes_out as f64 * 8.0
                 / media_duration_sec.max(0.001)
                 / 1_000_000.0,
+            bitrate_mbps: config.bitrate_mbps,
             width: config.out_width,
             height: config.out_height,
             copy_ms_avg: average_ms(capture_stats.copy_ms_total, capture_stats.latest_updates),
@@ -410,6 +425,7 @@ mod platform {
             encode_ms_avg: average_ms(counters.encode_ms_total, counters.frames_encoded),
             stopped_by_console: STOP_REQUESTED.load(Ordering::SeqCst),
             color_spec: config.color_spec,
+            encoder_selection: encoder.encoder_selection().clone(),
             encoder_input_color_metadata: encoder.input_color_metadata(),
             encoder_output_color_metadata: encoder.output_color_metadata(),
         })
@@ -426,6 +442,7 @@ mod platform {
         previous_encoder: EncoderStats,
         encoder_input_color_metadata: MediaColorMetadata,
         encoder_output_color_metadata: MediaColorMetadata,
+        encoder_selection: EncoderSelection,
         elapsed: Duration,
     ) -> CapturePipelineStats {
         let elapsed_sec = elapsed.as_secs_f64().max(0.001);
@@ -455,12 +472,14 @@ mod platform {
             mbps: encoder.bytes_out.saturating_sub(previous_encoder.bytes_out) as f64 * 8.0
                 / elapsed_sec
                 / 1_000_000.0,
+            target_bitrate_mbps: config.bitrate_mbps,
             width: config.out_width,
             height: config.out_height,
             copy_ms_avg: average_ms(capture.copy_ms_total, capture.latest_updates),
             convert_ms_avg: average_ms(pipeline.convert_ms_total, pipeline.frames_encoded),
             encode_ms_avg: average_ms(pipeline.encode_ms_total, pipeline.frames_encoded),
             color_spec: config.color_spec,
+            encoder_selection,
             encoder_input_color_metadata,
             encoder_output_color_metadata,
         }

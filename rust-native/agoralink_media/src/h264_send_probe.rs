@@ -8,6 +8,7 @@ pub struct H264SendConfig {
     pub out_width: u32,
     pub out_height: u32,
     pub color_spec: crate::color_spec::ColorSpec,
+    pub encoder: crate::wmf_h264_encoder::EncoderChoice,
     pub mode: H264SendMode,
     pub verbose: bool,
 }
@@ -30,7 +31,7 @@ mod platform {
         self, CaptureEncodeObserver, CapturePipelineDone, CapturePipelineStarted,
         CapturePipelineStats,
     };
-    use crate::wmf_h264_encoder::{EncodedSample, ENCODER_NAME};
+    use crate::wmf_h264_encoder::EncodedSample;
     use crate::{
         make_session_id, now_millis, packetize_media_payload, FLAG_CONFIG, FLAG_H264_ANNEX_B,
         FLAG_KEYFRAME,
@@ -92,13 +93,14 @@ mod platform {
                 return;
             }
             println!(
-                r#"{{"type":"NATIVE_SCREEN_STARTED","role":"sender","mode":"screen-send","host":"{}","port":{},"width":{},"height":{},"fps":{},"bitrate_mbps":{:.3},{},{},{}}}"#,
+                r#"{{"type":"NATIVE_SCREEN_STARTED","role":"sender","mode":"screen-send","host":"{}","port":{},"width":{},"height":{},"fps":{},"bitrate_mbps":{:.3},{},{},{},{}}}"#,
                 json_escape(&self.host),
                 self.port,
                 started.width,
                 started.height,
                 started.target_fps,
                 started.bitrate_mbps,
+                started.encoder_selection.json_fragment(),
                 started.color_spec.json_fragment(),
                 started
                     .encoder_input_color_metadata
@@ -114,8 +116,8 @@ mod platform {
             match self.mode {
                 H264SendMode::Probe => {
                     println!(
-                        r#"{{"type":"H264_SEND_DONE","mode":"h264_send_probe","encoder":"{}","target":"{}","session_id":{},"packets_sent":{},"frames_sent":{},"bytes_sent":{},"h264_bytes":{},"keyframes":{},"config_frames":{},"capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{:.2},"mbps":{:.3},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"packetize_send_ms_avg":{:.3},{},{},{}}}"#,
-                        ENCODER_NAME,
+                        r#"{{"type":"H264_SEND_DONE","mode":"h264_send_probe","encoder":"{}","target":"{}","session_id":{},"packets_sent":{},"frames_sent":{},"bytes_sent":{},"h264_bytes":{},"keyframes":{},"config_frames":{},"capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{:.2},"mbps":{:.3},"target_bitrate_mbps":{:.3},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"packetize_send_ms_avg":{:.3},{},{},{},{}}}"#,
+                        json_escape(&done.encoder_selection.selected_name),
                         json_escape(&self.target),
                         self.session_id,
                         self.packets_sent,
@@ -138,12 +140,14 @@ mod platform {
                         done.wall_time_sec,
                         self.frames_sent as f64 / done.wall_time_sec.max(0.001),
                         self.bytes_sent as f64 * 8.0 / done.wall_time_sec.max(0.001) / 1_000_000.0,
+                        done.bitrate_mbps,
                         done.width,
                         done.height,
                         done.copy_ms_avg,
                         done.convert_ms_avg,
                         done.encode_ms_avg,
                         average_ms(self.packetize_send_ms_total, self.frames_sent),
+                        done.encoder_selection.json_fragment(),
                         done.color_spec.json_fragment(),
                         done.encoder_input_color_metadata
                             .json_fragment("encoder_input"),
@@ -153,7 +157,7 @@ mod platform {
                 }
                 H264SendMode::Screen => {
                     println!(
-                        r#"{{"type":"NATIVE_SCREEN_STOPPED","role":"sender","mode":"screen-send","reason":"{}","host":"{}","port":{},"frames_sent":{},"packets_sent":{},"bytes_sent":{},"duration_sec":{:.3},"fps":{:.2},"mbps":{:.3},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"packetize_send_ms_avg":{:.3},{},{},{}}}"#,
+                        r#"{{"type":"NATIVE_SCREEN_STOPPED","role":"sender","mode":"screen-send","reason":"{}","host":"{}","port":{},"frames_sent":{},"packets_sent":{},"bytes_sent":{},"duration_sec":{:.3},"fps":{:.2},"mbps":{:.3},"target_bitrate_mbps":{:.3},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"packetize_send_ms_avg":{:.3},{},{},{},{}}}"#,
                         stop_reason(done.stopped_by_console, self.duration_sec),
                         json_escape(&self.host),
                         self.port,
@@ -163,12 +167,14 @@ mod platform {
                         done.wall_time_sec,
                         self.frames_sent as f64 / done.wall_time_sec.max(0.001),
                         self.bytes_sent as f64 * 8.0 / done.wall_time_sec.max(0.001) / 1_000_000.0,
+                        done.bitrate_mbps,
                         done.width,
                         done.height,
                         done.copy_ms_avg,
                         done.convert_ms_avg,
                         done.encode_ms_avg,
                         average_ms(self.packetize_send_ms_total, self.frames_sent),
+                        done.encoder_selection.json_fragment(),
                         done.color_spec.json_fragment(),
                         done.encoder_input_color_metadata
                             .json_fragment("encoder_input"),
@@ -246,8 +252,8 @@ mod platform {
             match self.mode {
                 H264SendMode::Probe => {
                     println!(
-                        r#"{{"type":"H264_SEND_STATS","mode":"h264_send_probe","encoder":"{}","target":"{}","session_id":{},"packets_sent":{},"frames_sent":{},"bytes_sent":{},"packets_per_sec":{},"fps":{},"mbps":{:.3},"capture_raw_frames":{},"capture_latest_updates":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"packetize_send_ms_avg":{:.3},"capture_dropped":{},{},{},{}}}"#,
-                        ENCODER_NAME,
+                        r#"{{"type":"H264_SEND_STATS","mode":"h264_send_probe","encoder":"{}","target":"{}","session_id":{},"packets_sent":{},"frames_sent":{},"bytes_sent":{},"packets_per_sec":{},"fps":{},"mbps":{:.3},"target_bitrate_mbps":{:.3},"capture_raw_frames":{},"capture_latest_updates":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"packetize_send_ms_avg":{:.3},"capture_dropped":{},{},{},{},{}}}"#,
+                        json_escape(&stats.encoder_selection.selected_name),
                         json_escape(&self.target),
                         self.session_id,
                         self.packets_sent,
@@ -256,6 +262,7 @@ mod platform {
                         packets_delta,
                         frames_delta,
                         bytes_delta as f64 * 8.0 / 1_000_000.0,
+                        stats.target_bitrate_mbps,
                         stats.capture_raw_frames,
                         stats.capture_latest_updates,
                         stats.encode_ticks,
@@ -274,6 +281,7 @@ mod platform {
                         stats.encode_ms_avg,
                         average_ms(self.packetize_send_ms_total, self.frames_sent),
                         stats.capture_dropped,
+                        stats.encoder_selection.json_fragment(),
                         stats.color_spec.json_fragment(),
                         stats
                             .encoder_input_color_metadata
@@ -285,7 +293,7 @@ mod platform {
                 }
                 H264SendMode::Screen => {
                     println!(
-                        r#"{{"type":"NATIVE_SCREEN_STATS","role":"sender","mode":"screen-send","host":"{}","port":{},"session_id":{},"frames_sent":{},"packets_sent":{},"bytes_sent":{},"packets_per_sec":{},"fps":{},"mbps":{:.3},"capture_raw_frames":{},"capture_latest_updates":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"target_fps":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"packetize_send_ms_avg":{:.3},"capture_dropped":{},{},{},{}}}"#,
+                        r#"{{"type":"NATIVE_SCREEN_STATS","role":"sender","mode":"screen-send","host":"{}","port":{},"session_id":{},"frames_sent":{},"packets_sent":{},"bytes_sent":{},"packets_per_sec":{},"fps":{},"mbps":{:.3},"target_bitrate_mbps":{:.3},"capture_raw_frames":{},"capture_latest_updates":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"target_fps":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"packetize_send_ms_avg":{:.3},"capture_dropped":{},{},{},{},{}}}"#,
                         json_escape(&self.host),
                         self.port,
                         self.session_id,
@@ -295,6 +303,7 @@ mod platform {
                         packets_delta,
                         frames_delta,
                         bytes_delta as f64 * 8.0 / 1_000_000.0,
+                        stats.target_bitrate_mbps,
                         stats.capture_raw_frames,
                         stats.capture_latest_updates,
                         stats.encode_ticks,
@@ -310,6 +319,7 @@ mod platform {
                         stats.encode_ms_avg,
                         average_ms(self.packetize_send_ms_total, self.frames_sent),
                         stats.capture_dropped,
+                        stats.encoder_selection.json_fragment(),
                         stats.color_spec.json_fragment(),
                         stats
                             .encoder_input_color_metadata
@@ -333,13 +343,14 @@ mod platform {
         let mut observer = UdpObserver::new(&config)?;
         if config.verbose {
             eprintln!(
-                "h264-send-probe target={} duration_sec={} target_fps={} bitrate_mbps={} output={}x{} color_matrix={} range={} packet_payload_max=1200",
+                "h264-send-probe target={} duration_sec={} target_fps={} bitrate_mbps={} output={}x{} encoder={} color_matrix={} range={} packet_payload_max=1200",
                 observer.target,
                 optional_duration_text(config.duration_sec),
                 config.target_fps,
                 config.bitrate_mbps,
                 config.out_width,
                 config.out_height,
+                config.encoder.name(),
                 config.color_spec.yuv_matrix(),
                 config.color_spec.color_range()
             );
@@ -352,6 +363,7 @@ mod platform {
             out_height: config.out_height,
             output: String::new(),
             color_spec: config.color_spec,
+            encoder: config.encoder,
             verbose: config.verbose,
         };
         let done = capture_encode_probe::run_with_observer(&pipeline_config, &mut observer)?;
