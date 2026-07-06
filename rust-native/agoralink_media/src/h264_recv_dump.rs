@@ -4,6 +4,8 @@ pub struct H264RecvConfig {
     pub port: u16,
     pub output: String,
     pub idle_timeout_sec: u64,
+    pub drop_damaged_gop: bool,
+    pub reorder_wait_ms: Option<u64>,
 }
 
 #[cfg(windows)]
@@ -20,7 +22,9 @@ mod platform {
     };
 
     use super::H264RecvConfig;
-    use crate::h264_reassembly::{EncodedFrame, H264Reassembler, ReassemblyConfig};
+    use crate::h264_reassembly::{
+        DamagedGopTracker, EncodedFrame, H264Reassembler, ReassemblyConfig, ReorderWait,
+    };
 
     const RECEIVE_POLL: Duration = Duration::from_millis(50);
     const MAX_DATAGRAM_SIZE: usize = 2048;
@@ -63,6 +67,10 @@ mod platform {
         let _console_ctrl = ConsoleCtrlGuard::install()?;
         let socket = UdpSocket::bind(format!("{}:{}", config.bind, config.port))
             .map_err(|err| format!("UDP bind failed: {err}"))?;
+        let udp_recv_buffer_bytes = crate::udp_socket::configure_receive_buffer(
+            &socket,
+            crate::udp_socket::DEFAULT_UDP_BUFFER_BYTES,
+        )?;
         socket
             .set_read_timeout(Some(RECEIVE_POLL))
             .map_err(|err| format!("set UDP read timeout failed: {err}"))?;
@@ -70,8 +78,15 @@ mod platform {
             .map_err(|err| format!("create output failed: {err}"))?;
         let mut reassembler = H264Reassembler::new(ReassemblyConfig {
             frame_timeout: Duration::from_millis(1000),
+            reorder_wait: config
+                .reorder_wait_ms
+                .map_or(ReorderWait::Auto, |milliseconds| {
+                    ReorderWait::Fixed(Duration::from_millis(milliseconds))
+                }),
             max_inflight_frames: 120,
         })?;
+        let mut damaged_gop = DamagedGopTracker::new(config.drop_damaged_gop);
+        let mut previous_expired = 0u64;
         let mut buffer = [0u8; MAX_DATAGRAM_SIZE];
         let started_at = Instant::now();
         let mut report_at = started_at;
@@ -84,8 +99,12 @@ mod platform {
         let mut last_packet_at: Option<Instant> = None;
 
         eprintln!(
-            "h264-recv-dump bind={}:{} output={} idle_timeout_sec={}",
-            config.bind, config.port, config.output, config.idle_timeout_sec
+            "h264-recv-dump bind={}:{} output={} idle_timeout_sec={} drop_damaged_gop={}",
+            config.bind,
+            config.port,
+            config.output,
+            config.idle_timeout_sec,
+            config.drop_damaged_gop
         );
         loop {
             match socket.recv_from(&mut buffer) {
@@ -94,12 +113,22 @@ mod platform {
                     first_packet_at.get_or_insert(received_at);
                     last_packet_at = Some(received_at);
                     match reassembler.accept_datagram(&buffer[..length], received_at) {
-                        Ok(frames) => write_frames(
-                            &mut output,
-                            frames,
-                            &mut frames_written,
-                            &mut bytes_written,
-                        )?,
+                        Ok(frames) => {
+                            detect_damage(
+                                &reassembler,
+                                &mut previous_expired,
+                                &mut damaged_gop,
+                                received_at,
+                            );
+                            write_frames(
+                                &mut output,
+                                frames,
+                                &mut damaged_gop,
+                                received_at,
+                                &mut frames_written,
+                                &mut bytes_written,
+                            )?
+                        }
                         Err(err) => eprintln!("discarding invalid AGM1 packet: {err}"),
                     }
                 }
@@ -110,9 +139,13 @@ mod platform {
             }
 
             let now = Instant::now();
+            let expired_frames = reassembler.expire(now);
+            detect_damage(&reassembler, &mut previous_expired, &mut damaged_gop, now);
             write_frames(
                 &mut output,
-                reassembler.expire(now),
+                expired_frames,
+                &mut damaged_gop,
+                now,
                 &mut frames_written,
                 &mut bytes_written,
             )?;
@@ -124,7 +157,7 @@ mod platform {
                 let frame_delta = frames_written.saturating_sub(previous_frames);
                 let byte_delta = stats.bytes_received.saturating_sub(previous_bytes);
                 println!(
-                    r#"{{"type":"H264_RECV_STATS","mode":"h264_recv_dump","session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_incomplete_expired":{},"frames_written":{},"bytes_received":{},"bytes_written":{},"packets_per_sec":{:.2},"fps":{:.2},"mbps":{:.3},"last_frame_id":{},"inflight_frames":{},"completed_waiting":{}}}"#,
+                    r#"{{"type":"H264_RECV_STATS","mode":"h264_recv_dump","session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_incomplete_expired":{},"frames_written":{},"bytes_received":{},"bytes_written":{},"packets_per_sec":{:.2},"fps":{:.2},"mbps":{:.3},"last_frame_id":{},"inflight_frames":{},"completed_waiting":{},"udp_recv_buffer_bytes":{},{} }}"#,
                     optional_u64_json(reassembler.session_id()),
                     stats.packets_received,
                     stats.packets_invalid,
@@ -139,7 +172,9 @@ mod platform {
                     byte_delta as f64 * 8.0 / elapsed / 1_000_000.0,
                     optional_u64_json(stats.last_frame_id),
                     reassembler.inflight_len(),
-                    reassembler.completed_waiting_len()
+                    reassembler.completed_waiting_len(),
+                    udp_recv_buffer_bytes,
+                    recovery_fragment(&damaged_gop, &reassembler)
                 );
                 io::stdout().flush().ok();
                 previous_packets = stats.packets_received;
@@ -157,9 +192,19 @@ mod platform {
             }
         }
 
+        let finished_frames = reassembler.finish();
+        let finished_at = Instant::now();
+        detect_damage(
+            &reassembler,
+            &mut previous_expired,
+            &mut damaged_gop,
+            finished_at,
+        );
         write_frames(
             &mut output,
-            reassembler.finish(),
+            finished_frames,
+            &mut damaged_gop,
+            finished_at,
             &mut frames_written,
             &mut bytes_written,
         )?;
@@ -173,7 +218,7 @@ mod platform {
             _ => 0.0,
         };
         println!(
-            r#"{{"type":"H264_RECV_DONE","mode":"h264_recv_dump","session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_incomplete_expired":{},"frames_written":{},"bytes_received":{},"bytes_written":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{:.2},"mbps":{:.3},"last_frame_id":{},"output":"{}"}}"#,
+            r#"{{"type":"H264_RECV_DONE","mode":"h264_recv_dump","session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_incomplete_expired":{},"frames_written":{},"bytes_received":{},"bytes_written":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{:.2},"mbps":{:.3},"last_frame_id":{},"output":"{}","udp_recv_buffer_bytes":{},{} }}"#,
             optional_u64_json(reassembler.session_id()),
             stats.packets_received,
             stats.packets_invalid,
@@ -188,7 +233,9 @@ mod platform {
             frames_written as f64 / active_duration_sec.max(0.001),
             stats.bytes_received as f64 * 8.0 / active_duration_sec.max(0.001) / 1_000_000.0,
             optional_u64_json(stats.last_frame_id),
-            json_escape(&config.output)
+            json_escape(&config.output),
+            udp_recv_buffer_bytes,
+            recovery_fragment(&damaged_gop, &reassembler)
         );
         io::stdout().flush().ok();
         eprintln!(
@@ -205,10 +252,15 @@ mod platform {
     fn write_frames(
         output: &mut File,
         frames: Vec<EncodedFrame>,
+        damaged_gop: &mut DamagedGopTracker,
+        now: Instant,
         frames_written: &mut u64,
         bytes_written: &mut u64,
     ) -> Result<(), String> {
         for frame in frames {
+            let Some(frame) = damaged_gop.prepare_frame(frame, now) else {
+                continue;
+            };
             output
                 .write_all(&frame.bytes)
                 .map_err(|err| format!("write H.264 dump failed: {err}"))?;
@@ -216,6 +268,63 @@ mod platform {
             *bytes_written += frame.bytes.len() as u64;
         }
         Ok(())
+    }
+
+    fn detect_damage(
+        reassembler: &H264Reassembler,
+        previous_expired: &mut u64,
+        damaged_gop: &mut DamagedGopTracker,
+        now: Instant,
+    ) {
+        let current_expired = reassembler.stats().frames_incomplete_expired;
+        if current_expired > *previous_expired {
+            damaged_gop.mark_damaged(now, reassembler.stats().last_damaged_frame_id);
+            *previous_expired = current_expired;
+        }
+    }
+
+    fn recovery_fragment(tracker: &DamagedGopTracker, reassembler: &H264Reassembler) -> String {
+        let stats = tracker.stats();
+        let reassembly = reassembler.stats();
+        format!(
+            r#""fec_mode":"{}","fec_packets_received":{},"fec_frames_recovered":{},"fec_packets_recovered":{},"fec_recovery_failed_multi_missing":{},"fec_recovery_failed_no_parity":{},"fec_recovery_failed_invalid":{},"frames_missing_after_fec":{},"frames_dropped_after_fec":{},"damaged_gop_count":{},"frames_discarded_damaged_gop":{},"frames_discarded_waiting_keyframe":{},"waiting_keyframe":{},"waiting_keyframe_entries":{},"waiting_keyframe_exits":{},"idr_frames_received":{},"idr_frames_used_for_recovery":{},"non_idr_frames_discarded_waiting":{},"recovery_wait_ms_avg":{:.3},"recovery_wait_ms_max":{:.3},"recovery_wait_frames_avg":{:.3},"recovery_wait_frames_max":{},"next_decode_frame_id":{},"decode_gate_stalls":{},"decode_gate_gap_events":{},"decode_gate_gap_to_damage_ms_avg":{:.3},"decode_gate_gap_to_damage_ms_max":{:.3},"frames_buffered_waiting_order":{},"frames_discarded_decode_gate":{},"reorder_wait_ms":{}"#,
+            if reassembly.fec_packets_received > 0
+                || reassembly.fec_protected_data_packets_received > 0
+            {
+                "single-xor"
+            } else {
+                "off"
+            },
+            reassembly.fec_packets_received,
+            reassembly.fec_frames_recovered,
+            reassembly.fec_packets_recovered,
+            reassembly.fec_recovery_failed_multi_missing,
+            reassembly.fec_recovery_failed_no_parity,
+            reassembly.fec_recovery_failed_invalid,
+            reassembly.frames_missing_after_fec,
+            reassembly.frames_dropped_after_fec,
+            stats.damaged_gop_count,
+            stats.frames_discarded_damaged_gop,
+            stats.frames_discarded_waiting_keyframe,
+            tracker.waiting_keyframe(),
+            stats.waiting_keyframe_entries,
+            stats.waiting_keyframe_exits,
+            stats.idr_frames_received,
+            stats.idr_frames_used_for_recovery,
+            stats.non_idr_frames_discarded_waiting,
+            stats.recovery_wait_ms_avg(),
+            stats.recovery_wait_ms_max,
+            stats.recovery_wait_frames_avg(),
+            stats.recovery_wait_frames_max,
+            optional_u64_json(reassembly.next_decode_frame_id),
+            reassembly.decode_gate_stalls,
+            reassembly.decode_gate_gap_events,
+            reassembly.decode_gate_gap_to_damage_ms_avg(),
+            reassembly.decode_gate_gap_to_damage_ms_max,
+            reassembler.completed_waiting_len(),
+            reassembly.frames_discarded_decode_gate,
+            reassembly.reorder_wait_ms,
+        )
     }
 
     pub fn run_self_test() -> Result<(), String> {

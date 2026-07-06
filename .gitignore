@@ -46,3 +46,10 @@ stereo_mix_test.wav
 rust-native/agoralink_media/*.h264
 
 rust-native/agoralink_media/*.h264
+
+# local test artifacts
+_local_artifacts/
+native_*_test_package*/
+agoralink_media_*_test*.zip
+rust-native/agoralink_media/send_stdout.txt
+rust-native/agoralink_media/send_stderr.txt

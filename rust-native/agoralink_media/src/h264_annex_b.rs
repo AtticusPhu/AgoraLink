@@ -12,6 +12,89 @@ struct NalUnit {
     nal_type: u8,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct AnnexBParameterSets {
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AnnexBNalSummary {
+    pub has_sps: bool,
+    pub has_pps: bool,
+    pub has_idr_slice: bool,
+    pub has_non_idr_slice: bool,
+    pub has_aud: bool,
+}
+
+impl AnnexBParameterSets {
+    pub fn update_from(&mut self, data: &[u8]) {
+        for nal in scan_nals(data) {
+            match nal.nal_type {
+                7 => self.sps = Some(data[nal.start..nal.end].to_vec()),
+                8 => self.pps = Some(data[nal.start..nal.end].to_vec()),
+                _ => {}
+            }
+        }
+    }
+
+    pub fn prepend_missing_to_keyframe(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+        let (has_sps, has_pps) = parameter_set_presence(data);
+        if has_sps && has_pps {
+            return Ok(data.to_vec());
+        }
+
+        let mut output = Vec::with_capacity(
+            data.len()
+                + self.sps.as_ref().map_or(0, Vec::len)
+                + self.pps.as_ref().map_or(0, Vec::len),
+        );
+        if !has_sps {
+            output.extend_from_slice(
+                self.sps
+                    .as_deref()
+                    .ok_or_else(|| "keyframe is missing cached SPS".to_string())?,
+            );
+        }
+        if !has_pps {
+            output.extend_from_slice(
+                self.pps
+                    .as_deref()
+                    .ok_or_else(|| "keyframe is missing cached PPS".to_string())?,
+            );
+        }
+        output.extend_from_slice(data);
+        Ok(output)
+    }
+}
+
+pub fn nal_types(data: &[u8]) -> Vec<u8> {
+    scan_nals(data)
+        .into_iter()
+        .map(|nal| nal.nal_type)
+        .collect()
+}
+
+pub fn summarize_nals(data: &[u8]) -> AnnexBNalSummary {
+    let mut summary = AnnexBNalSummary::default();
+    for nal in scan_nals(data) {
+        match nal.nal_type {
+            1 => summary.has_non_idr_slice = true,
+            5 => summary.has_idr_slice = true,
+            7 => summary.has_sps = true,
+            8 => summary.has_pps = true,
+            9 => summary.has_aud = true,
+            _ => {}
+        }
+    }
+    summary
+}
+
+pub fn parameter_set_presence(data: &[u8]) -> (bool, bool) {
+    let summary = summarize_nals(data);
+    (summary.has_sps, summary.has_pps)
+}
+
 pub fn split_access_units(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let nals = scan_nals(data);
     if nals.is_empty() {
@@ -343,6 +426,20 @@ pub fn run_self_test() -> Result<(), String> {
         })
     {
         return Err(format!("SPS dimension parse mismatch: {dimensions:?}"));
+    }
+
+    let config = [&[0, 0, 0, 1, 7, 0x64][..], &[0, 0, 0, 1, 8, 0xee][..]].concat();
+    let keyframe = [0, 0, 0, 1, 5, 0x80];
+    let mut parameter_sets = AnnexBParameterSets::default();
+    parameter_sets.update_from(&config);
+    let repaired = parameter_sets.prepend_missing_to_keyframe(&keyframe)?;
+    let repaired_summary = summarize_nals(&repaired);
+    if !repaired_summary.has_sps
+        || !repaired_summary.has_pps
+        || !repaired_summary.has_idr_slice
+        || repaired_summary.has_non_idr_slice
+    {
+        return Err("Annex-B keyframe parameter-set repetition failed".to_string());
     }
     Ok(())
 }

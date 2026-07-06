@@ -1,6 +1,7 @@
 #[derive(Debug)]
 pub struct H264FileViewerConfig {
     pub input: String,
+    pub render_scale: crate::win32_gdi_viewer::RenderScaleMode,
 }
 
 #[cfg(windows)]
@@ -32,14 +33,15 @@ mod platform {
         let access_units = split_access_units(&bytes)?;
         let mut decoder = WmfH264Decoder::new(dimensions.width, dimensions.height, PLAYBACK_FPS)?;
         let title = format!("AgoraLink Native H.264 Viewer - {}", config.input);
-        let mut window = GdiViewerWindow::create(&title)?;
+        let mut window = GdiViewerWindow::create(&title, config.render_scale)?;
 
         eprintln!(
-            "h264-file-viewer input={} bytes={} access_units={} decoder=\"{}\" output=NV12 render=GDI size={}x{} playback_fps={}",
+            "h264-file-viewer input={} bytes={} access_units={} decoder=\"{}\" output=NV12 render=GDI render_scale={} size={}x{} playback_fps={}",
             config.input,
             bytes.len(),
             access_units.len(),
             DECODER_NAME,
+            config.render_scale.name(),
             dimensions.width,
             dimensions.height,
             PLAYBACK_FPS
@@ -104,6 +106,7 @@ mod platform {
                     last_uv_stride,
                     last_uv_offset,
                     last_allocated_height,
+                    window.render_stats(),
                 );
             }
             if closed_by_user {
@@ -150,13 +153,14 @@ mod platform {
                     last_uv_stride,
                     last_uv_offset,
                     last_allocated_height,
+                    window.render_stats(),
                 );
             }
         }
 
         let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
         println!(
-            r#"{{"type":"VIEWER_DONE","mode":"h264_file_viewer","decoder":"{}","render":"GDI","frames_decoded":{},"frames_rendered":{},"fps":{:.2},"width":{},"height":{},"closed_by_user":{},"input":"{}","nv12_y_stride":{},"nv12_uv_stride":{},"nv12_uv_offset":{},"nv12_allocated_height":{},{},{}}}"#,
+            r#"{{"type":"VIEWER_DONE","mode":"h264_file_viewer","decoder":"{}","render":"GDI","frames_decoded":{},"frames_rendered":{},"fps":{:.2},"width":{},"height":{},"closed_by_user":{},"input":"{}","nv12_y_stride":{},"nv12_uv_stride":{},"nv12_uv_offset":{},"nv12_allocated_height":{},{},{},{}}}"#,
             DECODER_NAME,
             frames_decoded,
             frames_rendered,
@@ -170,7 +174,8 @@ mod platform {
             last_uv_offset,
             last_allocated_height,
             last_color_spec.json_fragment(),
-            last_color_metadata.json_fragment("decoder_output")
+            last_color_metadata.json_fragment("decoder_output"),
+            window.render_stats().json_fragment(),
         );
         io::stdout().flush().ok();
         eprintln!(
@@ -221,6 +226,7 @@ mod platform {
         uv_stride: usize,
         uv_offset: usize,
         allocated_height: usize,
+        render_stats: crate::win32_gdi_viewer::GdiRenderStats,
     ) {
         let now = Instant::now();
         let elapsed = now.duration_since(*report_at);
@@ -229,7 +235,7 @@ mod platform {
         }
         let rendered_delta = frames_rendered.saturating_sub(*previous_rendered);
         println!(
-            r#"{{"type":"VIEWER_STATS","mode":"h264_file_viewer","frames_decoded":{},"frames_rendered":{},"fps":{:.2},"width":{},"height":{},"nv12_y_stride":{},"nv12_uv_stride":{},"nv12_uv_offset":{},"nv12_allocated_height":{},{},{}}}"#,
+            r#"{{"type":"VIEWER_STATS","mode":"h264_file_viewer","frames_decoded":{},"frames_rendered":{},"fps":{:.2},"width":{},"height":{},"nv12_y_stride":{},"nv12_uv_stride":{},"nv12_uv_offset":{},"nv12_allocated_height":{},{},{},{}}}"#,
             frames_decoded,
             frames_rendered,
             rendered_delta as f64 / elapsed.as_secs_f64().max(0.001),
@@ -240,7 +246,8 @@ mod platform {
             uv_offset,
             allocated_height,
             color_spec.json_fragment(),
-            color_metadata.json_fragment("decoder_output")
+            color_metadata.json_fragment("decoder_output"),
+            render_stats.json_fragment(),
         );
         io::stdout().flush().ok();
         *previous_rendered = frames_rendered;

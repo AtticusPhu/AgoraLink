@@ -7,12 +7,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod bgra_to_nv12;
+mod bitrate;
 mod capture_encode_probe;
 mod capture_probe;
 mod color_spec;
 mod color_test_pattern;
 mod decoded_frame_renderer;
 mod encode_probe;
+mod fec;
 mod gpu_convert_probe;
 mod gpu_nv12_capture;
 mod h264_annex_b;
@@ -23,6 +25,8 @@ mod h264_recv_view;
 mod h264_send_probe;
 mod nv12_synthetic;
 mod nv12_to_bgra;
+mod playout_buffer;
+mod udp_socket;
 mod wgc_latest_capture;
 mod win32_gdi_viewer;
 mod wmf_h264_decoder;
@@ -36,9 +40,15 @@ pub(crate) const FLAG_KEYFRAME: u16 = 1 << 0;
 pub(crate) const FLAG_END_OF_FRAME: u16 = 1 << 1;
 pub(crate) const FLAG_CONFIG: u16 = 1 << 2;
 pub(crate) const FLAG_H264_ANNEX_B: u16 = 1 << 3;
-const HEADER_LEN: usize = 38;
-const MAX_UDP_PAYLOAD: usize = 1200;
-pub(crate) const MAX_MEDIA_PAYLOAD: usize = MAX_UDP_PAYLOAD - HEADER_LEN;
+pub(crate) const FLAG_FEC: u16 = 1 << 4;
+pub(crate) const FLAG_FEC_PROTECTED: u16 = 1 << 5;
+pub(crate) const HEADER_LEN: usize = 38;
+pub(crate) const MIN_UDP_PAYLOAD_SIZE: usize = 576;
+pub(crate) const LEGACY_UDP_PAYLOAD_SIZE: usize = 1200;
+pub(crate) const DEFAULT_REALTIME_UDP_PAYLOAD_SIZE: usize = 1452;
+pub(crate) const MAX_UDP_PAYLOAD_SIZE: usize = 1472;
+pub(crate) const MAX_MEDIA_PAYLOAD: usize = MAX_UDP_PAYLOAD_SIZE - HEADER_LEN;
+pub(crate) const LEGACY_MEDIA_PAYLOAD: usize = LEGACY_UDP_PAYLOAD_SIZE - HEADER_LEN;
 const FRAME_TTL: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, Clone)]
@@ -55,7 +65,16 @@ pub(crate) struct MediaPacket {
 
 impl MediaPacket {
     pub(crate) fn encode(&self) -> Result<Vec<u8>, String> {
-        if self.payload.len() > MAX_MEDIA_PAYLOAD {
+        self.encode_with_udp_payload_size(LEGACY_UDP_PAYLOAD_SIZE)
+    }
+
+    pub(crate) fn encode_with_udp_payload_size(
+        &self,
+        udp_payload_size: usize,
+    ) -> Result<Vec<u8>, String> {
+        validate_udp_payload_size(udp_payload_size)?;
+        let media_payload_size = udp_payload_size - HEADER_LEN;
+        if self.payload.len() > media_payload_size {
             return Err(format!("payload too large: {}", self.payload.len()));
         }
         if self.payload.len() > u16::MAX as usize {
@@ -84,6 +103,9 @@ impl MediaPacket {
     }
 
     pub(crate) fn decode(buf: &[u8]) -> Result<Self, String> {
+        if buf.len() > MAX_UDP_PAYLOAD_SIZE {
+            return Err(format!("datagram exceeds UDP payload limit: {}", buf.len()));
+        }
         if buf.len() < HEADER_LEN {
             return Err("packet too short".to_string());
         }
@@ -654,7 +676,8 @@ fn parse_encode_probe_args(args: &[String]) -> Result<Command, String> {
 fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
     let mut duration_sec = 5u64;
     let mut target_fps = 30u32;
-    let mut bitrate_mbps = 4.0f64;
+    let mut explicit_bitrate_mbps = None;
+    let mut quality_bpf = None;
     let mut out_width = 1280u32;
     let mut out_height = 720u32;
     let mut output = "capture_720p30.h264".to_string();
@@ -675,7 +698,16 @@ fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
             }
             "--bitrate-mbps" => {
                 i += 1;
-                bitrate_mbps = parse_bitrate(required_value(args, i, "--bitrate-mbps")?)?;
+                explicit_bitrate_mbps =
+                    Some(parse_bitrate(required_value(args, i, "--bitrate-mbps")?)?);
+            }
+            "--quality-bpf" => {
+                i += 1;
+                quality_bpf = Some(parse_quality_bpf(required_value(
+                    args,
+                    i,
+                    "--quality-bpf",
+                )?)?);
             }
             "--out-width" => {
                 i += 1;
@@ -714,17 +746,29 @@ fn parse_capture_encode_probe_args(args: &[String]) -> Result<Command, String> {
         i += 1;
     }
 
+    let bitrate_selection = bitrate::BitrateSelection::resolve(
+        out_width,
+        out_height,
+        target_fps,
+        4.0,
+        explicit_bitrate_mbps,
+        quality_bpf,
+    )?;
+    let bitrate_mbps = bitrate_selection.target_mbps;
+
     Ok(Command::CaptureEncodeProbe(
         capture_encode_probe::CaptureEncodeConfig {
             duration_sec: Some(duration_sec),
             target_fps,
             bitrate_mbps,
+            bitrate_selection,
             out_width,
             out_height,
             output,
             color_spec,
             encoder,
             convert_backend,
+            keyframe_interval_sec: None,
             verbose: true,
         },
     ))
@@ -735,11 +779,17 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
     let mut port = 50130u16;
     let mut duration_sec = 10u64;
     let mut target_fps = 30u32;
-    let mut bitrate_mbps = 4.0f64;
+    let mut explicit_bitrate_mbps = None;
+    let mut quality_bpf = None;
     let mut out_width = 1280u32;
     let mut out_height = 720u32;
     let mut color_spec = color_spec::ColorSpec::default();
     let mut encoder = wmf_h264_encoder::EncoderChoice::Auto;
+    let mut convert_backend = capture_encode_probe::ConvertBackend::Auto;
+    let mut packet_pacing = h264_send_probe::PacketPacing::Auto;
+    let mut fec_mode = fec::FecMode::Off;
+    let mut udp_payload_size = DEFAULT_REALTIME_UDP_PAYLOAD_SIZE;
+    let mut keyframe_interval_sec = 1.0f64;
     let mut i = 0;
 
     while i < args.len() {
@@ -762,7 +812,16 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
             }
             "--bitrate-mbps" => {
                 i += 1;
-                bitrate_mbps = parse_bitrate(required_value(args, i, "--bitrate-mbps")?)?;
+                explicit_bitrate_mbps =
+                    Some(parse_bitrate(required_value(args, i, "--bitrate-mbps")?)?);
+            }
+            "--quality-bpf" => {
+                i += 1;
+                quality_bpf = Some(parse_quality_bpf(required_value(
+                    args,
+                    i,
+                    "--quality-bpf",
+                )?)?);
             }
             "--out-width" => {
                 i += 1;
@@ -783,11 +842,47 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
                 i += 1;
                 encoder = parse_encoder_choice(required_value(args, i, "--encoder")?)?;
             }
+            "--convert-backend" => {
+                i += 1;
+                convert_backend =
+                    parse_convert_backend(required_value(args, i, "--convert-backend")?)?;
+            }
+            "--packet-pacing" => {
+                i += 1;
+                packet_pacing = parse_packet_pacing(required_value(args, i, "--packet-pacing")?)?;
+            }
+            "--fec" => {
+                i += 1;
+                fec_mode = parse_fec_mode(required_value(args, i, "--fec")?)?;
+            }
+            "--udp-payload-size" => {
+                i += 1;
+                udp_payload_size =
+                    parse_udp_payload_size(required_value(args, i, "--udp-payload-size")?)?;
+            }
+            "--keyframe-interval-sec" => {
+                i += 1;
+                keyframe_interval_sec = parse_keyframe_interval_sec(required_value(
+                    args,
+                    i,
+                    "--keyframe-interval-sec",
+                )?)?;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unknown h264-send-probe argument: {other}")),
         }
         i += 1;
     }
+
+    let bitrate_selection = bitrate::BitrateSelection::resolve(
+        out_width,
+        out_height,
+        target_fps,
+        4.0,
+        explicit_bitrate_mbps,
+        quality_bpf,
+    )?;
+    let bitrate_mbps = bitrate_selection.target_mbps;
 
     Ok(Command::H264SendProbe(h264_send_probe::H264SendConfig {
         host,
@@ -795,10 +890,16 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
         duration_sec: Some(duration_sec),
         target_fps,
         bitrate_mbps,
+        bitrate_selection,
         out_width,
         out_height,
         color_spec,
         encoder,
+        convert_backend,
+        packet_pacing,
+        fec_mode,
+        udp_payload_size,
+        keyframe_interval_sec,
         mode: h264_send_probe::H264SendMode::Probe,
         verbose: true,
     }))
@@ -870,6 +971,8 @@ fn parse_h264_recv_dump_args(args: &[String]) -> Result<Command, String> {
     let mut port = 50130u16;
     let mut output = "received_capture.h264".to_string();
     let mut idle_timeout_sec = 3u64;
+    let mut drop_damaged_gop = true;
+    let mut reorder_wait_ms = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -894,6 +997,15 @@ fn parse_h264_recv_dump_args(args: &[String]) -> Result<Command, String> {
                 idle_timeout_sec =
                     parse_idle_timeout(required_value(args, i, "--idle-timeout-sec")?)?;
             }
+            "--drop-damaged-gop" => {
+                i += 1;
+                drop_damaged_gop = parse_bool(required_value(args, i, "--drop-damaged-gop")?)?;
+            }
+            "--reorder-wait-ms" => {
+                i += 1;
+                reorder_wait_ms =
+                    parse_reorder_wait_ms(required_value(args, i, "--reorder-wait-ms")?)?;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unknown h264-recv-dump argument: {other}")),
         }
@@ -905,11 +1017,14 @@ fn parse_h264_recv_dump_args(args: &[String]) -> Result<Command, String> {
         port,
         output,
         idle_timeout_sec,
+        drop_damaged_gop,
+        reorder_wait_ms,
     }))
 }
 
 fn parse_h264_file_viewer_args(args: &[String]) -> Result<Command, String> {
     let mut input = String::new();
+    let mut render_scale = win32_gdi_viewer::RenderScaleMode::Exact;
     let mut i = 0;
 
     while i < args.len() {
@@ -917,6 +1032,14 @@ fn parse_h264_file_viewer_args(args: &[String]) -> Result<Command, String> {
             "--input" => {
                 i += 1;
                 input = required_value(args, i, "--input")?.to_string();
+            }
+            "--render-scale" => {
+                i += 1;
+                render_scale = win32_gdi_viewer::RenderScaleMode::parse(required_value(
+                    args,
+                    i,
+                    "--render-scale",
+                )?)?;
             }
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unknown h264-file-viewer argument: {other}")),
@@ -927,7 +1050,10 @@ fn parse_h264_file_viewer_args(args: &[String]) -> Result<Command, String> {
         return Err("h264-file-viewer requires --input <path>".to_string());
     }
     Ok(Command::H264FileViewer(
-        h264_file_viewer::H264FileViewerConfig { input },
+        h264_file_viewer::H264FileViewerConfig {
+            input,
+            render_scale,
+        },
     ))
 }
 
@@ -938,10 +1064,14 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
     let mut max_inflight_frames = 120usize;
     let mut max_decode_queue = 30usize;
     let mut strict_decode_order = true;
+    let mut drop_damaged_gop = true;
+    let mut reorder_wait_ms = None;
+    let mut playout_delay_ms = 120u64;
     let mut debug_dump_frames = None;
     let mut debug_dump_limit = 10usize;
     let mut json_interval_ms = 1000u64;
     let mut title = "AgoraLink Native Viewer".to_string();
+    let mut render_scale = win32_gdi_viewer::RenderScaleMode::Exact;
     let mut i = 0;
 
     while i < args.len() {
@@ -986,6 +1116,24 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
                 strict_decode_order =
                     parse_bool(required_value(args, i, "--strict-decode-order")?)?;
             }
+            "--drop-damaged-gop" => {
+                i += 1;
+                drop_damaged_gop = parse_bool(required_value(args, i, "--drop-damaged-gop")?)?;
+            }
+            "--reorder-wait-ms" => {
+                i += 1;
+                reorder_wait_ms =
+                    parse_reorder_wait_ms(required_value(args, i, "--reorder-wait-ms")?)?;
+            }
+            "--playout-delay-ms" => {
+                i += 1;
+                playout_delay_ms = parse_milliseconds(
+                    required_value(args, i, "--playout-delay-ms")?,
+                    "playout-delay-ms",
+                    0,
+                    500,
+                )?;
+            }
             "--debug-dump-frames" => {
                 i += 1;
                 debug_dump_frames =
@@ -1016,6 +1164,14 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
                     return Err("title must not be empty".to_string());
                 }
             }
+            "--render-scale" => {
+                i += 1;
+                render_scale = win32_gdi_viewer::RenderScaleMode::parse(required_value(
+                    args,
+                    i,
+                    "--render-scale",
+                )?)?;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unknown h264-recv-view argument: {other}")),
         }
@@ -1027,13 +1183,17 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
         port: port.ok_or_else(|| "h264-recv-view requires --port <port>".to_string())?,
         duration_sec: None,
         frame_timeout_ms,
+        reorder_wait_ms,
+        playout_delay_ms,
         max_inflight_frames,
         max_decode_queue,
         strict_decode_order,
+        drop_damaged_gop,
         debug_dump_frames,
         debug_dump_limit,
         json_interval_ms,
         title,
+        render_scale,
         mode: h264_recv_view::H264RecvViewMode::Probe,
         verbose: true,
     }))
@@ -1044,11 +1204,17 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
     let mut port = None;
     let mut duration_sec = None;
     let mut target_fps = 30u32;
-    let mut bitrate_mbps = 4.0f64;
+    let mut explicit_bitrate_mbps = None;
+    let mut quality_bpf = None;
     let mut out_width = 1280u32;
     let mut out_height = 720u32;
     let mut color_spec = color_spec::ColorSpec::default();
     let mut encoder = wmf_h264_encoder::EncoderChoice::Auto;
+    let mut convert_backend = capture_encode_probe::ConvertBackend::Auto;
+    let mut packet_pacing = h264_send_probe::PacketPacing::Auto;
+    let mut fec_mode = fec::FecMode::Off;
+    let mut udp_payload_size = DEFAULT_REALTIME_UDP_PAYLOAD_SIZE;
+    let mut keyframe_interval_sec = 1.0f64;
     let mut verbose = false;
     let mut i = 0;
 
@@ -1076,7 +1242,16 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
             }
             "--bitrate-mbps" => {
                 i += 1;
-                bitrate_mbps = parse_bitrate(required_value(args, i, "--bitrate-mbps")?)?;
+                explicit_bitrate_mbps =
+                    Some(parse_bitrate(required_value(args, i, "--bitrate-mbps")?)?);
+            }
+            "--quality-bpf" => {
+                i += 1;
+                quality_bpf = Some(parse_quality_bpf(required_value(
+                    args,
+                    i,
+                    "--quality-bpf",
+                )?)?);
             }
             "--width" | "--out-width" => {
                 i += 1;
@@ -1098,9 +1273,31 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
                 i += 1;
                 encoder = parse_encoder_choice(required_value(args, i, "--encoder")?)?;
             }
-            "--payload-size" => {
+            "--convert-backend" => {
                 i += 1;
-                parse_screen_payload_size(required_value(args, i, "--payload-size")?)?;
+                convert_backend =
+                    parse_convert_backend(required_value(args, i, "--convert-backend")?)?;
+            }
+            "--packet-pacing" => {
+                i += 1;
+                packet_pacing = parse_packet_pacing(required_value(args, i, "--packet-pacing")?)?;
+            }
+            "--fec" => {
+                i += 1;
+                fec_mode = parse_fec_mode(required_value(args, i, "--fec")?)?;
+            }
+            "--udp-payload-size" | "--payload-size" => {
+                i += 1;
+                udp_payload_size =
+                    parse_udp_payload_size(required_value(args, i, args[i - 1].as_str())?)?;
+            }
+            "--keyframe-interval-sec" => {
+                i += 1;
+                keyframe_interval_sec = parse_keyframe_interval_sec(required_value(
+                    args,
+                    i,
+                    "--keyframe-interval-sec",
+                )?)?;
             }
             "--verbose" => {
                 verbose = true;
@@ -1111,16 +1308,32 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
         i += 1;
     }
 
+    let bitrate_selection = bitrate::BitrateSelection::resolve(
+        out_width,
+        out_height,
+        target_fps,
+        4.0,
+        explicit_bitrate_mbps,
+        quality_bpf,
+    )?;
+    let bitrate_mbps = bitrate_selection.target_mbps;
+
     Ok(Command::ScreenSend(h264_send_probe::H264SendConfig {
         host: host.ok_or_else(|| "screen-send requires --host <ip>".to_string())?,
         port: port.ok_or_else(|| "screen-send requires --port <port>".to_string())?,
         duration_sec,
         target_fps,
         bitrate_mbps,
+        bitrate_selection,
         out_width,
         out_height,
         color_spec,
         encoder,
+        convert_backend,
+        packet_pacing,
+        fec_mode,
+        udp_payload_size,
+        keyframe_interval_sec,
         mode: h264_send_probe::H264SendMode::Screen,
         verbose,
     }))
@@ -1134,10 +1347,14 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
     let mut max_inflight_frames = 120usize;
     let mut max_decode_queue = 30usize;
     let mut strict_decode_order = true;
+    let mut drop_damaged_gop = true;
+    let mut reorder_wait_ms = None;
+    let mut playout_delay_ms = 120u64;
     let mut debug_dump_frames = None;
     let mut debug_dump_limit = 10usize;
     let mut json_interval_ms = 1000u64;
     let mut title = "AgoraLink Native Viewer".to_string();
+    let mut render_scale = win32_gdi_viewer::RenderScaleMode::Exact;
     let mut verbose = false;
     let mut i = 0;
 
@@ -1191,6 +1408,24 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
                 strict_decode_order =
                     parse_bool(required_value(args, i, "--strict-decode-order")?)?;
             }
+            "--drop-damaged-gop" => {
+                i += 1;
+                drop_damaged_gop = parse_bool(required_value(args, i, "--drop-damaged-gop")?)?;
+            }
+            "--reorder-wait-ms" => {
+                i += 1;
+                reorder_wait_ms =
+                    parse_reorder_wait_ms(required_value(args, i, "--reorder-wait-ms")?)?;
+            }
+            "--playout-delay-ms" => {
+                i += 1;
+                playout_delay_ms = parse_milliseconds(
+                    required_value(args, i, "--playout-delay-ms")?,
+                    "playout-delay-ms",
+                    0,
+                    500,
+                )?;
+            }
             "--debug-dump-frames" => {
                 i += 1;
                 debug_dump_frames =
@@ -1221,6 +1456,14 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
                     return Err("title must not be empty".to_string());
                 }
             }
+            "--render-scale" => {
+                i += 1;
+                render_scale = win32_gdi_viewer::RenderScaleMode::parse(required_value(
+                    args,
+                    i,
+                    "--render-scale",
+                )?)?;
+            }
             "--verbose" => {
                 verbose = true;
             }
@@ -1235,13 +1478,17 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
         port: port.ok_or_else(|| "screen-recv requires --port <port>".to_string())?,
         duration_sec,
         frame_timeout_ms,
+        reorder_wait_ms,
+        playout_delay_ms,
         max_inflight_frames,
         max_decode_queue,
         strict_decode_order,
+        drop_damaged_gop,
         debug_dump_frames,
         debug_dump_limit,
         json_interval_ms,
         title,
+        render_scale,
         mode: h264_recv_view::H264RecvViewMode::Screen,
         verbose,
     }))
@@ -1290,6 +1537,48 @@ fn parse_bitrate(text: &str) -> Result<f64, String> {
     }
 }
 
+fn parse_quality_bpf(text: &str) -> Result<f64, String> {
+    let value: f64 = text
+        .parse()
+        .map_err(|_| format!("invalid quality-bpf: {text}"))?;
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err("quality-bpf must be a finite value greater than zero".to_string())
+    }
+}
+
+fn parse_packet_pacing(text: &str) -> Result<h264_send_probe::PacketPacing, String> {
+    match text.to_ascii_lowercase().as_str() {
+        "auto" => Ok(h264_send_probe::PacketPacing::Auto),
+        "off" => Ok(h264_send_probe::PacketPacing::Off),
+        _ => Err(format!(
+            "invalid packet-pacing: {text}; expected auto or off"
+        )),
+    }
+}
+
+fn parse_fec_mode(text: &str) -> Result<fec::FecMode, String> {
+    match text.to_ascii_lowercase().as_str() {
+        "off" => Ok(fec::FecMode::Off),
+        "single-xor" => Ok(fec::FecMode::SingleXor),
+        _ => Err(format!(
+            "invalid fec mode: {text}; expected off or single-xor"
+        )),
+    }
+}
+
+fn parse_keyframe_interval_sec(text: &str) -> Result<f64, String> {
+    let seconds: f64 = text
+        .parse()
+        .map_err(|_| format!("invalid keyframe-interval-sec: {text}"))?;
+    if seconds.is_finite() && (0.5..=60.0).contains(&seconds) {
+        Ok(seconds)
+    } else {
+        Err("keyframe-interval-sec must be between 0.5 and 60".to_string())
+    }
+}
+
 fn parse_duration_sec(text: &str) -> Result<u64, String> {
     let duration: u64 = text
         .parse()
@@ -1323,6 +1612,13 @@ fn parse_milliseconds(text: &str, name: &str, minimum: u64, maximum: u64) -> Res
     }
 }
 
+fn parse_reorder_wait_ms(text: &str) -> Result<Option<u64>, String> {
+    if text.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    parse_milliseconds(text, "reorder-wait-ms", 1, 1000).map(Some)
+}
+
 fn parse_count(text: &str, name: &str, minimum: usize, maximum: usize) -> Result<usize, String> {
     let value: usize = text
         .parse()
@@ -1347,16 +1643,20 @@ fn parse_dimension(text: &str, name: &str) -> Result<u32, String> {
     Ok(value)
 }
 
-fn parse_screen_payload_size(text: &str) -> Result<usize, String> {
+fn parse_udp_payload_size(text: &str) -> Result<usize, String> {
     let value: usize = text
         .parse()
-        .map_err(|_| format!("invalid payload-size: {text}"))?;
-    if value == MAX_UDP_PAYLOAD {
-        Ok(value)
+        .map_err(|_| format!("invalid udp-payload-size: {text}"))?;
+    validate_udp_payload_size(value)?;
+    Ok(value)
+}
+
+pub(crate) fn validate_udp_payload_size(value: usize) -> Result<(), String> {
+    if (MIN_UDP_PAYLOAD_SIZE..=MAX_UDP_PAYLOAD_SIZE).contains(&value) {
+        Ok(())
     } else {
         Err(format!(
-            "screen-send currently supports --payload-size {} only",
-            MAX_UDP_PAYLOAD
+            "udp-payload-size must be between {MIN_UDP_PAYLOAD_SIZE} and {MAX_UDP_PAYLOAD_SIZE}"
         ))
     }
 }
@@ -1402,13 +1702,13 @@ Usage:\n\
   agoralink_media wmf-probe\n\
   agoralink_media gpu-convert-probe --duration-sec <seconds> --target-fps <fps> --out-width <pixels> --out-height <pixels> [--debug-dump-nv12 <dir>] [--debug-dump-bgra <dir>] [--debug-dump-limit <n>]\n\
   agoralink_media encode-probe --width <pixels> --height <pixels> --fps <fps> --duration-sec <seconds> --bitrate-mbps <mbps> --output <path> [--encoder auto|hardware|software|microsoft|intel-qsv] [--color-matrix bt601|bt709]\n\
-  agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels> --output <path> [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--color-matrix bt601|bt709]\n\
-  agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> --bitrate-mbps <mbps> --out-width <pixels> --out-height <pixels> [--encoder auto|hardware|software|microsoft|intel-qsv] [--color-matrix bt601|bt709]\n\
-  agoralink_media h264-recv-dump --bind <ip> --port <port> --output <path> [--idle-timeout-sec <seconds>]\n\
-  agoralink_media h264-recv-view --bind <ip> --port <port> [--frame-timeout-ms <ms>] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--debug-dump-frames <dir>] [--debug-dump-limit <n>] [--json-interval-ms <ms>] [--title <text>]\n\
-  agoralink_media screen-send --host <ip> --port <port> [--width <pixels>] [--height <pixels>] [--fps <fps>] [--bitrate-mbps <mbps>] [--duration-sec <seconds>] [--encoder auto|hardware|software|microsoft|intel-qsv] [--color-matrix bt601|bt709] [--payload-size 1200] [--verbose]\n\
-  agoralink_media screen-recv --bind <ip> --port <port> [--duration-sec <seconds>] [--frame-timeout-ms <ms>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--json-interval-ms <ms>] [--title <text>] [--verbose]\n\
-  agoralink_media h264-file-viewer --input <path>\n\n\
+  agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> [--bitrate-mbps <mbps>] [--quality-bpf <float>] --out-width <pixels> --out-height <pixels> --output <path> [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--color-matrix bt601|bt709]\n\
+  agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> [--bitrate-mbps <mbps>] [--quality-bpf <float>] --out-width <pixels> --out-height <pixels> [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--packet-pacing auto|off] [--fec off|single-xor] [--udp-payload-size <576-1472>] [--keyframe-interval-sec <seconds>] [--color-matrix bt601|bt709]\n\
+  agoralink_media h264-recv-dump --bind <ip> --port <port> --output <path> [--idle-timeout-sec <seconds>] [--drop-damaged-gop <true|false>] [--reorder-wait-ms auto|<ms>]\n\
+  agoralink_media h264-recv-view --bind <ip> --port <port> [--frame-timeout-ms <ms>] [--reorder-wait-ms auto|<ms>] [--playout-delay-ms <0-500>] [--render-scale exact|fit|stretch] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--drop-damaged-gop <true|false>] [--debug-dump-frames <dir>] [--debug-dump-limit <n>] [--json-interval-ms <ms>] [--title <text>]\n\
+  agoralink_media screen-send --host <ip> --port <port> [--width <pixels>] [--height <pixels>] [--fps <fps>] [--bitrate-mbps <mbps>] [--quality-bpf <float>] [--duration-sec <seconds>] [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--packet-pacing auto|off] [--fec off|single-xor] [--udp-payload-size <576-1472>] [--keyframe-interval-sec <seconds>] [--color-matrix bt601|bt709] [--verbose]\n\
+  agoralink_media screen-recv --bind <ip> --port <port> [--duration-sec <seconds>] [--frame-timeout-ms <ms>] [--reorder-wait-ms auto|<ms>] [--playout-delay-ms <0-500>] [--render-scale exact|fit|stretch] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--drop-damaged-gop <true|false>] [--json-interval-ms <ms>] [--title <text>] [--verbose]\n\
+  agoralink_media h264-file-viewer --input <path> [--render-scale exact|fit|stretch]\n\n\
   agoralink_media color-test-pattern --output <path> --width <pixels> --height <pixels> --duration-sec <seconds> [--fps <fps>] [--bitrate-mbps <mbps>] [--color-matrix bt601|bt709]\n\n\
 Defaults:\n\
   sender: --host 127.0.0.1 --port 50120 --fps 30 --bitrate-mbps 4\n\
@@ -1417,12 +1717,12 @@ Defaults:\n\
   gpu-convert-probe: --duration-sec 5 --target-fps 30 --out-width 1280 --out-height 720 --color-matrix bt709 --debug-dump-limit 3\n\
   encode-probe: --width 1280 --height 720 --fps 30 --duration-sec 5 --bitrate-mbps 4 --output synthetic_720p30.h264 --encoder auto --color-matrix bt709\n\
   capture-encode-probe: --duration-sec 5 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --output capture_720p30.h264 --encoder auto --convert-backend auto --color-matrix bt709\n\
-  h264-send-probe: --host 127.0.0.1 --port 50130 --duration-sec 10 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --encoder auto --color-matrix bt709\n\
-  h264-recv-dump: --bind 0.0.0.0 --port 50130 --output received_capture.h264 --idle-timeout-sec 3\n\
-  h264-recv-view: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --debug-dump-limit 10 --json-interval-ms 1000 --title \"AgoraLink Native Viewer\"\n\
-  screen-send: --host required --port required --width 1280 --height 720 --fps 30 --bitrate-mbps 4 --encoder auto --color-matrix bt709 --payload-size 1200 --duration-sec unlimited --verbose off\n\
-  screen-recv: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --json-interval-ms 1000 --title \"AgoraLink Native Viewer\" --duration-sec unlimited --verbose off\n\
-  h264-file-viewer: --input received_capture_lan.h264\n\
+  h264-send-probe: --host 127.0.0.1 --port 50130 --duration-sec 10 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --encoder auto --convert-backend auto --packet-pacing auto --fec off --udp-payload-size 1452 --keyframe-interval-sec 1 --color-matrix bt709\n\
+  h264-recv-dump: --bind 0.0.0.0 --port 50130 --output received_capture.h264 --idle-timeout-sec 3 --drop-damaged-gop true --reorder-wait-ms auto\n\
+  h264-recv-view: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --reorder-wait-ms auto --playout-delay-ms 120 --render-scale exact --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --drop-damaged-gop true --debug-dump-limit 10 --json-interval-ms 1000 --title \"AgoraLink Native Viewer\"\n\
+  screen-send: --host required --port required --width 1280 --height 720 --fps 30 --bitrate-mbps 4 --encoder auto --convert-backend auto --packet-pacing auto --fec off --udp-payload-size 1452 --keyframe-interval-sec 1 --color-matrix bt709 --duration-sec unlimited --verbose off\n\
+  screen-recv: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --reorder-wait-ms auto --playout-delay-ms 120 --render-scale exact --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --drop-damaged-gop true --json-interval-ms 1000 --title \"AgoraLink Native Viewer\" --duration-sec unlimited --verbose off\n\
+  h264-file-viewer: --input received_capture_lan.h264 --render-scale exact\n\
   color-test-pattern: --output color_test_1080p.h264 --width 1920 --height 1080 --fps 30 --duration-sec 3 --bitrate-mbps 8 --color-matrix bt709"
     );
 }
@@ -1569,7 +1869,7 @@ fn build_frame_packets(
     payload_size: usize,
     keyframe: bool,
 ) -> Result<Vec<Vec<u8>>, String> {
-    let packet_count = payload_size.div_ceil(MAX_MEDIA_PAYLOAD).max(1);
+    let packet_count = payload_size.div_ceil(LEGACY_MEDIA_PAYLOAD).max(1);
     if packet_count > u16::MAX as usize {
         return Err(format!("frame too large: {} packets", packet_count));
     }
@@ -1577,7 +1877,7 @@ fn build_frame_packets(
     let mut packets = Vec::with_capacity(packet_count);
     let mut remaining = payload_size;
     for packet_index in 0..packet_count {
-        let chunk_len = remaining.min(MAX_MEDIA_PAYLOAD);
+        let chunk_len = remaining.min(LEGACY_MEDIA_PAYLOAD);
         remaining = remaining.saturating_sub(chunk_len);
         let mut flags = 0u16;
         if keyframe {
@@ -1610,15 +1910,15 @@ pub(crate) fn packetize_media_payload(
     payload: &[u8],
     frame_flags: u16,
 ) -> Result<Vec<Vec<u8>>, String> {
-    let packet_count = payload.len().div_ceil(MAX_MEDIA_PAYLOAD).max(1);
+    let packet_count = payload.len().div_ceil(LEGACY_MEDIA_PAYLOAD).max(1);
     if packet_count > u16::MAX as usize {
         return Err(format!("encoded frame too large: {packet_count} packets"));
     }
 
     let mut packets = Vec::with_capacity(packet_count);
     for packet_index in 0..packet_count {
-        let start = packet_index * MAX_MEDIA_PAYLOAD;
-        let end = (start + MAX_MEDIA_PAYLOAD).min(payload.len());
+        let start = packet_index * LEGACY_MEDIA_PAYLOAD;
+        let end = (start + LEGACY_MEDIA_PAYLOAD).min(payload.len());
         let mut flags = if packet_index == 0 { frame_flags } else { 0 };
         if packet_index + 1 == packet_count {
             flags |= FLAG_END_OF_FRAME;
@@ -1657,12 +1957,92 @@ pub(crate) fn now_millis() -> u64 {
 }
 
 fn run_self_test() -> Result<(), String> {
+    for value in [1200, 1452, 1472] {
+        if parse_udp_payload_size(&value.to_string())? != value {
+            return Err(format!("UDP payload size parsing failed for {value}"));
+        }
+    }
+    if parse_udp_payload_size("500").is_ok() || parse_udp_payload_size("1600").is_ok() {
+        return Err("invalid UDP payload size was accepted".to_string());
+    }
+    for value in ["0", "120", "500"] {
+        parse_milliseconds(value, "playout-delay-ms", 0, 500)?;
+    }
+    if parse_milliseconds("-1", "playout-delay-ms", 0, 500).is_ok()
+        || parse_milliseconds("501", "playout-delay-ms", 0, 500).is_ok()
+    {
+        return Err("invalid playout delay was accepted".to_string());
+    }
+    if parse_fec_mode("off")? != fec::FecMode::Off
+        || parse_fec_mode("single-xor")? != fec::FecMode::SingleXor
+        || parse_fec_mode("invalid").is_ok()
+    {
+        return Err("FEC mode parsing failed".to_string());
+    }
+    if (parse_keyframe_interval_sec("0.5")? - 0.5).abs() > f64::EPSILON {
+        return Err("fractional keyframe interval parsing failed".to_string());
+    }
+    if parse_reorder_wait_ms("auto")?.is_some() || parse_reorder_wait_ms("42")? != Some(42) {
+        return Err("reorder-wait-ms parsing failed".to_string());
+    }
+    match parse_args(vec![
+        "h264-recv-dump".to_string(),
+        "--drop-damaged-gop".to_string(),
+        "false".to_string(),
+    ])? {
+        Command::H264RecvDump(config) if !config.drop_damaged_gop => {}
+        _ => return Err("drop-damaged-gop parsing failed".to_string()),
+    }
+    match parse_args(vec![
+        "screen-send".to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        "55134".to_string(),
+    ])? {
+        Command::ScreenSend(config)
+            if config.udp_payload_size == DEFAULT_REALTIME_UDP_PAYLOAD_SIZE => {}
+        _ => return Err("screen-send UDP payload default mismatch".to_string()),
+    }
+    match parse_args(vec![
+        "screen-recv".to_string(),
+        "--port".to_string(),
+        "55134".to_string(),
+    ])? {
+        Command::ScreenRecv(config)
+            if config.playout_delay_ms == 120
+                && config.render_scale == win32_gdi_viewer::RenderScaleMode::Exact => {}
+        _ => return Err("screen-recv playout delay default mismatch".to_string()),
+    }
+    match parse_args(vec![
+        "h264-recv-view".to_string(),
+        "--port".to_string(),
+        "55135".to_string(),
+    ])? {
+        Command::H264RecvView(config)
+            if config.playout_delay_ms == 120
+                && config.render_scale == win32_gdi_viewer::RenderScaleMode::Exact => {}
+        _ => return Err("h264-recv-view playout delay default mismatch".to_string()),
+    }
+    match parse_args(vec![
+        "h264-file-viewer".to_string(),
+        "--input".to_string(),
+        "test.h264".to_string(),
+    ])? {
+        Command::H264FileViewer(config)
+            if config.render_scale == win32_gdi_viewer::RenderScaleMode::Exact => {}
+        _ => return Err("h264-file-viewer render scale default mismatch".to_string()),
+    }
     bgra_to_nv12::run_self_test()?;
+    bitrate::run_self_test()?;
     color_spec::run_self_test()?;
     h264_annex_b::run_self_test()?;
     h264_recv_dump::run_self_test()?;
     h264_recv_view::run_self_test()?;
+    h264_send_probe::run_self_test()?;
     nv12_to_bgra::run_self_test()?;
+    playout_buffer::run_self_test()?;
+    win32_gdi_viewer::run_self_test()?;
     let nv12_size = nv12_synthetic::buffer_size(16, 16)?;
     if nv12_size != 16 * 16 * 3 / 2 {
         return Err("NV12 buffer size mismatch".to_string());
@@ -1704,7 +2084,7 @@ fn run_self_test() -> Result<(), String> {
     }
     if frame_packets
         .iter()
-        .any(|item| item.len() > MAX_UDP_PAYLOAD)
+        .any(|item| item.len() > LEGACY_UDP_PAYLOAD_SIZE)
     {
         return Err("packet exceeded UDP payload limit".to_string());
     }

@@ -20,12 +20,14 @@ pub struct CaptureEncodeConfig {
     pub duration_sec: Option<u64>,
     pub target_fps: u32,
     pub bitrate_mbps: f64,
+    pub bitrate_selection: crate::bitrate::BitrateSelection,
     pub out_width: u32,
     pub out_height: u32,
     pub output: String,
     pub color_spec: crate::color_spec::ColorSpec,
     pub encoder: crate::wmf_h264_encoder::EncoderChoice,
     pub convert_backend: ConvertBackend,
+    pub keyframe_interval_sec: Option<f64>,
     pub verbose: bool,
 }
 
@@ -44,6 +46,7 @@ mod platform {
 
     use super::{CaptureEncodeConfig, ConvertBackend};
     use crate::bgra_to_nv12;
+    use crate::bitrate::BitrateSelection;
     use crate::color_spec::{ColorSpec, MediaColorMetadata};
     use crate::gpu_nv12_capture::{GpuCaptureStats, GpuNv12Capture};
     use crate::wgc_latest_capture::{LatestCapture, LatestCaptureStats};
@@ -120,6 +123,8 @@ mod platform {
         pub no_new_frame_reused: u64,
         pub frames_encoded: u64,
         pub encode_lag_skips: u64,
+        pub keyframe_force_requests: u64,
+        pub keyframe_force_failures: u64,
         pub samples_out: u64,
         pub bytes_out: u64,
         pub raw_fps: f64,
@@ -128,6 +133,7 @@ mod platform {
         pub target_fps: u32,
         pub mbps: f64,
         pub target_bitrate_mbps: f64,
+        pub bitrate_selection: BitrateSelection,
         pub width: u32,
         pub height: u32,
         pub copy_ms_avg: f64,
@@ -146,6 +152,7 @@ mod platform {
     pub struct CapturePipelineStarted {
         pub target_fps: u32,
         pub bitrate_mbps: f64,
+        pub bitrate_selection: BitrateSelection,
         pub width: u32,
         pub height: u32,
         pub color_spec: ColorSpec,
@@ -153,6 +160,9 @@ mod platform {
         pub encoder_selection: EncoderSelection,
         pub encoder_input_color_metadata: MediaColorMetadata,
         pub encoder_output_color_metadata: MediaColorMetadata,
+        pub keyframe_interval_applied: bool,
+        pub keyframe_interval_target_frames: Option<u32>,
+        pub keyframe_force_supported: bool,
     }
 
     #[derive(Clone, Debug)]
@@ -172,6 +182,7 @@ mod platform {
         pub processing_fps: f64,
         pub mbps: f64,
         pub bitrate_mbps: f64,
+        pub bitrate_selection: BitrateSelection,
         pub width: u32,
         pub height: u32,
         pub copy_ms_avg: f64,
@@ -185,6 +196,8 @@ mod platform {
         pub encoder_selection: EncoderSelection,
         pub encoder_input_color_metadata: MediaColorMetadata,
         pub encoder_output_color_metadata: MediaColorMetadata,
+        pub keyframe_force_requests: u64,
+        pub keyframe_force_failures: u64,
     }
 
     pub trait CaptureEncodeObserver {
@@ -203,6 +216,8 @@ mod platform {
         no_new_frame_reused: u64,
         frames_encoded: u64,
         encode_lag_skips: u64,
+        keyframe_force_requests: u64,
+        keyframe_force_failures: u64,
         cpu_convert_ms_total: f64,
         encode_ms_total: f64,
     }
@@ -385,7 +400,7 @@ mod platform {
 
         fn on_stats(&mut self, stats: &CapturePipelineStats) -> Result<(), String> {
             println!(
-                r#"{{"type":"CAPTURE_ENCODE_STATS","mode":"capture_encode_probe","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"mbps":{:.3},"target_bitrate_mbps":{:.3},"width":{},"height":{},"format_in":"{}","format_encode":"NV12","copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"gpu_convert_ms_avg":{:.3},"cpu_convert_ms_avg":{:.3},"encode_ms_avg":{:.3},{},{},{},{},{}}}"#,
+                r#"{{"type":"CAPTURE_ENCODE_STATS","mode":"capture_encode_probe","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"mbps":{:.3},"target_bitrate_mbps":{:.3},"width":{},"height":{},"format_in":"{}","format_encode":"NV12","copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"gpu_convert_ms_avg":{:.3},"cpu_convert_ms_avg":{:.3},"encode_ms_avg":{:.3},{},{},{},{},{},{}}}"#,
                 stats.capture_raw_frames,
                 stats.capture_latest_updates,
                 stats.capture_callback_skipped,
@@ -411,6 +426,7 @@ mod platform {
                 stats.gpu_convert_ms_avg,
                 stats.cpu_convert_ms_avg,
                 stats.encode_ms_avg,
+                stats.bitrate_selection.json_fragment(Some(stats.mbps)),
                 stats.conversion_selection.json_fragment(),
                 stats.encoder_selection.json_fragment(),
                 stats.color_spec.json_fragment(),
@@ -466,7 +482,7 @@ mod platform {
             .flush()
             .map_err(|err| format!("flush output failed: {err}"))?;
         println!(
-            r#"{{"type":"CAPTURE_ENCODE_DONE","encoder":"{}","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"target_bitrate_mbps":{:.3},"keyframes":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"gpu_convert_ms_avg":{:.3},"cpu_convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"output":"{}",{},{},{},{},{}}}"#,
+            r#"{{"type":"CAPTURE_ENCODE_DONE","encoder":"{}","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"target_bitrate_mbps":{:.3},"keyframes":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"gpu_convert_ms_avg":{:.3},"cpu_convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"output":"{}",{},{},{},{},{},{}}}"#,
             json_escape(&done.encoder_selection.selected_name),
             done.capture_raw_frames,
             done.capture_latest_updates,
@@ -494,6 +510,7 @@ mod platform {
             done.cpu_convert_ms_avg,
             done.encode_ms_avg,
             json_escape(&config.output),
+            done.bitrate_selection.json_fragment(Some(done.mbps)),
             done.conversion_selection.json_fragment(),
             done.encoder_selection.json_fragment(),
             done.color_spec.json_fragment(),
@@ -532,6 +549,31 @@ mod platform {
             config.color_spec,
             config.encoder,
         )?;
+        let keyframe_interval_target_frames = config.keyframe_interval_sec.map(|seconds| {
+            (seconds * f64::from(config.target_fps))
+                .round()
+                .clamp(1.0, f64::from(u32::MAX)) as u32
+        });
+        let mut keyframe_interval_applied = false;
+        if let Some(frames) = keyframe_interval_target_frames {
+            match encoder.set_keyframe_interval_frames(frames) {
+                Ok(()) => keyframe_interval_applied = true,
+                Err(err) => {
+                    if config.verbose {
+                        eprintln!(
+                            "encoder could not apply keyframe interval {:.3}s ({} frames): {}",
+                            config.keyframe_interval_sec.unwrap_or_default(),
+                            frames,
+                            err
+                        );
+                    }
+                }
+            }
+        }
+        let keyframe_force_supported =
+            keyframe_interval_target_frames.is_some() && encoder.supports_force_keyframe();
+        let mut keyframe_force_enabled = keyframe_force_supported;
+        keyframe_interval_applied |= keyframe_force_supported;
         let mut nv12 = vec![0u8; bgra_to_nv12::buffer_size(config.out_width, config.out_height)?];
         let frame_interval = Duration::from_nanos(1_000_000_000u64 / u64::from(config.target_fps));
         let started_at = Instant::now();
@@ -570,6 +612,7 @@ mod platform {
         observer.on_started(&CapturePipelineStarted {
             target_fps: config.target_fps,
             bitrate_mbps: config.bitrate_mbps,
+            bitrate_selection: config.bitrate_selection.clone(),
             width: config.out_width,
             height: config.out_height,
             color_spec: config.color_spec,
@@ -577,6 +620,9 @@ mod platform {
             encoder_selection: encoder.encoder_selection().clone(),
             encoder_input_color_metadata: encoder.input_color_metadata(),
             encoder_output_color_metadata: encoder.output_color_metadata(),
+            keyframe_interval_applied,
+            keyframe_interval_target_frames,
+            keyframe_force_supported,
         })?;
 
         while !duration_elapsed(started_at, config.duration_sec)
@@ -593,6 +639,20 @@ mod platform {
                 counters.no_new_frame_reused += 1;
             }
             if have_nv12 {
+                if counters.frames_encoded > 0
+                    && keyframe_interval_target_frames
+                        .is_some_and(|frames| counters.frames_encoded % u64::from(frames) == 0)
+                    && keyframe_force_enabled
+                {
+                    counters.keyframe_force_requests += 1;
+                    if let Err(err) = encoder.request_keyframe() {
+                        counters.keyframe_force_failures += 1;
+                        keyframe_force_enabled = false;
+                        if config.verbose {
+                            eprintln!("encoder forced-IDR request failed: {err}");
+                        }
+                    }
+                }
                 let encode_started = Instant::now();
                 encoder.encode_nv12(&nv12, counters.frames_encoded)?;
                 counters.encode_ms_total += encode_started.elapsed().as_secs_f64() * 1000.0;
@@ -661,6 +721,7 @@ mod platform {
                 / media_duration_sec.max(0.001)
                 / 1_000_000.0,
             bitrate_mbps: config.bitrate_mbps,
+            bitrate_selection: config.bitrate_selection.clone(),
             width: config.out_width,
             height: config.out_height,
             copy_ms_avg: average_ms(capture_stats.copy_ms_total, capture_stats.latest_updates),
@@ -684,6 +745,8 @@ mod platform {
             encoder_selection: encoder.encoder_selection().clone(),
             encoder_input_color_metadata: encoder.input_color_metadata(),
             encoder_output_color_metadata: encoder.output_color_metadata(),
+            keyframe_force_requests: counters.keyframe_force_requests,
+            keyframe_force_failures: counters.keyframe_force_failures,
         })
     }
 
@@ -713,6 +776,8 @@ mod platform {
             no_new_frame_reused: pipeline.no_new_frame_reused,
             frames_encoded: pipeline.frames_encoded,
             encode_lag_skips: pipeline.encode_lag_skips,
+            keyframe_force_requests: pipeline.keyframe_force_requests,
+            keyframe_force_failures: pipeline.keyframe_force_failures,
             samples_out: encoder.samples_out,
             bytes_out: encoder.bytes_out,
             raw_fps: capture
@@ -730,6 +795,7 @@ mod platform {
                 / elapsed_sec
                 / 1_000_000.0,
             target_bitrate_mbps: config.bitrate_mbps,
+            bitrate_selection: config.bitrate_selection.clone(),
             width: config.out_width,
             height: config.out_height,
             copy_ms_avg: average_ms(capture.copy_ms_total, capture.latest_updates),
@@ -843,7 +909,7 @@ mod platform {
 #[cfg(windows)]
 pub use platform::{
     run, run_with_observer, CaptureEncodeObserver, CapturePipelineDone, CapturePipelineStarted,
-    CapturePipelineStats,
+    CapturePipelineStats, ConversionSelection,
 };
 
 #[cfg(not(windows))]

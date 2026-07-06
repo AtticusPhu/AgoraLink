@@ -12,20 +12,22 @@ mod platform {
     use crate::color_spec::{ColorMatrix, ColorSpec, MediaColorMetadata};
     use windows::core::{IUnknown, Interface, Result as WindowsResult, GUID, PWSTR};
     use windows::Win32::Media::MediaFoundation::{
-        eAVEncH264VProfile_Main, IMFActivate, IMFMediaBuffer, IMFMediaEventGenerator, IMFMediaType,
-        IMFSample, IMFTransform, MEError, METransformDrainComplete, METransformHaveOutput,
-        METransformNeedInput, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
-        MFMediaType_Video, MFNominalRange_16_235, MFSampleExtension_CleanPoint, MFShutdown,
-        MFStartup, MFTEnumEx, MFT_ENUM_HARDWARE_URL_Attribute,
-        MFT_ENUM_HARDWARE_VENDOR_ID_Attribute, MFT_FRIENDLY_NAME_Attribute,
-        MFT_TRANSFORM_CLSID_Attribute, MFVideoFormat_H264, MFVideoFormat_NV12,
-        MFVideoInterlace_Progressive, MFVideoPrimaries_BT709, MFVideoPrimaries_SMPTE170M,
-        MFVideoTransFunc_709, MFVideoTransferMatrix_BT601, MFVideoTransferMatrix_BT709,
-        MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER,
-        MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN,
-        MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-        MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-        MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_INFO,
+        eAVEncH264VProfile_Main, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame,
+        CODECAPI_AVEncVideoNumGOPsPerIDR, ICodecAPI, IMFActivate, IMFMediaBuffer,
+        IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, MEError,
+        METransformDrainComplete, METransformHaveOutput, METransformNeedInput, MFCreateMediaType,
+        MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFNominalRange_16_235,
+        MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFTEnumEx,
+        MFT_ENUM_HARDWARE_URL_Attribute, MFT_ENUM_HARDWARE_VENDOR_ID_Attribute,
+        MFT_FRIENDLY_NAME_Attribute, MFT_TRANSFORM_CLSID_Attribute, MFVideoFormat_H264,
+        MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709,
+        MFVideoPrimaries_SMPTE170M, MFVideoTransFunc_709, MFVideoTransferMatrix_BT601,
+        MFVideoTransferMatrix_BT709, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MFSTARTUP_FULL,
+        MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_SORTANDFILTER,
+        MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+        MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
+        MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+        MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_INFO,
         MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT,
         MF_E_NOTACCEPTING, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
         MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE,
@@ -39,6 +41,7 @@ mod platform {
         CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_MULTITHREADED,
     };
+    use windows::Win32::System::Variant::VARIANT;
 
     pub const ENCODER_NAME: &str = "Microsoft H264 Encoder MFT";
     const SOFTWARE_H264_ENCODER_CLSID: GUID =
@@ -566,6 +569,51 @@ mod platform {
                 )?;
             }
             Ok(())
+        }
+
+        pub fn set_keyframe_interval_frames(&mut self, frames: u32) -> Result<(), String> {
+            if frames == 0 {
+                return Err("keyframe interval frames must be greater than zero".to_string());
+            }
+            let codec_api = self
+                .transform
+                .cast::<ICodecAPI>()
+                .map_err(|err| format!("encoder does not expose ICodecAPI: {err}"))?;
+            unsafe { codec_api.IsSupported(&CODECAPI_AVEncMPVGOPSize) }
+                .map_err(|err| format!("encoder does not support GOP size control: {err}"))?;
+            let value = VARIANT::from(frames);
+            unsafe { codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &value) }
+                .map_err(|err| format!("set encoder GOP size to {frames} frames failed: {err}"))?;
+
+            if unsafe { codec_api.IsSupported(&CODECAPI_AVEncVideoNumGOPsPerIDR) }.is_ok() {
+                let one_gop_per_idr = VARIANT::from(1u32);
+                unsafe { codec_api.SetValue(&CODECAPI_AVEncVideoNumGOPsPerIDR, &one_gop_per_idr) }
+                    .map_err(|err| format!("set one GOP per IDR failed: {err}"))?;
+            }
+            Ok(())
+        }
+
+        pub fn supports_force_keyframe(&self) -> bool {
+            self.transform
+                .cast::<ICodecAPI>()
+                .ok()
+                .is_some_and(|codec_api| unsafe {
+                    codec_api
+                        .IsSupported(&CODECAPI_AVEncVideoForceKeyFrame)
+                        .is_ok()
+                })
+        }
+
+        pub fn request_keyframe(&mut self) -> Result<(), String> {
+            let codec_api = self
+                .transform
+                .cast::<ICodecAPI>()
+                .map_err(|err| format!("encoder does not expose ICodecAPI: {err}"))?;
+            unsafe { codec_api.IsSupported(&CODECAPI_AVEncVideoForceKeyFrame) }
+                .map_err(|err| format!("encoder does not support forced keyframes: {err}"))?;
+            let force = VARIANT::from(true);
+            unsafe { codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &force) }
+                .map_err(|err| format!("force next encoder frame to IDR failed: {err}"))
         }
 
         pub fn finish(&mut self) -> Result<EncoderStats, String> {
