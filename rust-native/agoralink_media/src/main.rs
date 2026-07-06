@@ -6,12 +6,14 @@ use std::process;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod bench_reassembly;
 mod bgra_to_nv12;
 mod bitrate;
 mod capture_encode_probe;
 mod capture_probe;
 mod color_spec;
 mod color_test_pattern;
+mod d3d11_nv12_renderer;
 mod decoded_frame_renderer;
 mod encode_probe;
 mod fec;
@@ -27,6 +29,7 @@ mod nv12_synthetic;
 mod nv12_to_bgra;
 mod playout_buffer;
 mod udp_socket;
+mod video_renderer;
 mod wgc_latest_capture;
 mod win32_gdi_viewer;
 mod wmf_h264_decoder;
@@ -179,6 +182,7 @@ enum Command {
     ScreenRecv(h264_recv_view::H264RecvViewConfig),
     H264FileViewer(h264_file_viewer::H264FileViewerConfig),
     ColorTestPattern(color_test_pattern::ColorTestPatternConfig),
+    BenchReassembly(bench_reassembly::BenchReassemblyConfig),
     Help,
 }
 
@@ -392,6 +396,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        Ok(Command::BenchReassembly(config)) => {
+            if let Err(err) = bench_reassembly::run(config) {
+                eprintln!("bench-reassembly error: {err}");
+                process::exit(1);
+            }
+        }
         Ok(Command::Help) => {
             print_help();
         }
@@ -438,6 +448,7 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         "screen-recv" => parse_screen_recv_args(&args[1..]),
         "h264-file-viewer" => parse_h264_file_viewer_args(&args[1..]),
         "color-test-pattern" => parse_color_test_pattern_args(&args[1..]),
+        "bench-reassembly" => parse_bench_reassembly_args(&args[1..]),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -905,6 +916,67 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
     }))
 }
 
+fn parse_bench_reassembly_args(args: &[String]) -> Result<Command, String> {
+    let mut frames = 1800u64;
+    let mut packets_per_frame = 120u16;
+    let mut payload_size = 1414usize;
+    let mut loss_rate = 0.0f64;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--frames" => {
+                i += 1;
+                frames = required_value(args, i, "--frames")?
+                    .parse()
+                    .map_err(|_| "frames must be a positive integer".to_string())?;
+                if frames == 0 {
+                    return Err("frames must be greater than zero".to_string());
+                }
+            }
+            "--packets-per-frame" => {
+                i += 1;
+                packets_per_frame = required_value(args, i, "--packets-per-frame")?
+                    .parse()
+                    .map_err(|_| "packets-per-frame must be between 1 and 65535".to_string())?;
+                if packets_per_frame == 0 {
+                    return Err("packets-per-frame must be greater than zero".to_string());
+                }
+            }
+            "--payload-size" => {
+                i += 1;
+                payload_size = required_value(args, i, "--payload-size")?
+                    .parse()
+                    .map_err(|_| "payload-size must be a positive integer".to_string())?;
+                if payload_size == 0 || payload_size > MAX_MEDIA_PAYLOAD {
+                    return Err(format!(
+                        "payload-size must be between 1 and {MAX_MEDIA_PAYLOAD}"
+                    ));
+                }
+            }
+            "--loss-rate" => {
+                i += 1;
+                loss_rate = required_value(args, i, "--loss-rate")?
+                    .parse()
+                    .map_err(|_| "loss-rate must be between 0 and 1".to_string())?;
+                if !loss_rate.is_finite() || !(0.0..=1.0).contains(&loss_rate) {
+                    return Err("loss-rate must be between 0 and 1".to_string());
+                }
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown bench-reassembly argument: {other}")),
+        }
+        i += 1;
+    }
+    Ok(Command::BenchReassembly(
+        bench_reassembly::BenchReassemblyConfig {
+            frames,
+            packets_per_frame,
+            payload_size,
+            loss_rate,
+        },
+    ))
+}
+
 fn parse_color_test_pattern_args(args: &[String]) -> Result<Command, String> {
     let mut output = "color_test_1080p.h264".to_string();
     let mut width = 1920u32;
@@ -1025,6 +1097,8 @@ fn parse_h264_recv_dump_args(args: &[String]) -> Result<Command, String> {
 fn parse_h264_file_viewer_args(args: &[String]) -> Result<Command, String> {
     let mut input = String::new();
     let mut render_scale = win32_gdi_viewer::RenderScaleMode::Exact;
+    let mut window_mode = win32_gdi_viewer::WindowMode::Windowed;
+    let mut render_backend = video_renderer::RenderBackend::Gdi;
     let mut i = 0;
 
     while i < args.len() {
@@ -1041,6 +1115,19 @@ fn parse_h264_file_viewer_args(args: &[String]) -> Result<Command, String> {
                     "--render-scale",
                 )?)?;
             }
+            "--window-mode" => {
+                i += 1;
+                window_mode =
+                    win32_gdi_viewer::WindowMode::parse(required_value(args, i, "--window-mode")?)?;
+            }
+            "--render-backend" => {
+                i += 1;
+                render_backend = video_renderer::RenderBackend::parse(required_value(
+                    args,
+                    i,
+                    "--render-backend",
+                )?)?;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unknown h264-file-viewer argument: {other}")),
         }
@@ -1053,6 +1140,8 @@ fn parse_h264_file_viewer_args(args: &[String]) -> Result<Command, String> {
         h264_file_viewer::H264FileViewerConfig {
             input,
             render_scale,
+            window_mode,
+            render_backend,
         },
     ))
 }
@@ -1072,6 +1161,8 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
     let mut json_interval_ms = 1000u64;
     let mut title = "AgoraLink Native Viewer".to_string();
     let mut render_scale = win32_gdi_viewer::RenderScaleMode::Exact;
+    let mut window_mode = win32_gdi_viewer::WindowMode::Windowed;
+    let mut render_backend = video_renderer::RenderBackend::D3d11;
     let mut i = 0;
 
     while i < args.len() {
@@ -1172,6 +1263,19 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
                     "--render-scale",
                 )?)?;
             }
+            "--window-mode" => {
+                i += 1;
+                window_mode =
+                    win32_gdi_viewer::WindowMode::parse(required_value(args, i, "--window-mode")?)?;
+            }
+            "--render-backend" => {
+                i += 1;
+                render_backend = video_renderer::RenderBackend::parse(required_value(
+                    args,
+                    i,
+                    "--render-backend",
+                )?)?;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unknown h264-recv-view argument: {other}")),
         }
@@ -1194,6 +1298,8 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
         json_interval_ms,
         title,
         render_scale,
+        window_mode,
+        render_backend,
         mode: h264_recv_view::H264RecvViewMode::Probe,
         verbose: true,
     }))
@@ -1355,6 +1461,8 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
     let mut json_interval_ms = 1000u64;
     let mut title = "AgoraLink Native Viewer".to_string();
     let mut render_scale = win32_gdi_viewer::RenderScaleMode::Exact;
+    let mut window_mode = win32_gdi_viewer::WindowMode::Windowed;
+    let mut render_backend = video_renderer::RenderBackend::D3d11;
     let mut verbose = false;
     let mut i = 0;
 
@@ -1464,6 +1572,19 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
                     "--render-scale",
                 )?)?;
             }
+            "--window-mode" => {
+                i += 1;
+                window_mode =
+                    win32_gdi_viewer::WindowMode::parse(required_value(args, i, "--window-mode")?)?;
+            }
+            "--render-backend" => {
+                i += 1;
+                render_backend = video_renderer::RenderBackend::parse(required_value(
+                    args,
+                    i,
+                    "--render-backend",
+                )?)?;
+            }
             "--verbose" => {
                 verbose = true;
             }
@@ -1489,6 +1610,8 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
         json_interval_ms,
         title,
         render_scale,
+        window_mode,
+        render_backend,
         mode: h264_recv_view::H264RecvViewMode::Screen,
         verbose,
     }))
@@ -1551,9 +1674,10 @@ fn parse_quality_bpf(text: &str) -> Result<f64, String> {
 fn parse_packet_pacing(text: &str) -> Result<h264_send_probe::PacketPacing, String> {
     match text.to_ascii_lowercase().as_str() {
         "auto" => Ok(h264_send_probe::PacketPacing::Auto),
+        "batch" => Ok(h264_send_probe::PacketPacing::Batch),
         "off" => Ok(h264_send_probe::PacketPacing::Off),
         _ => Err(format!(
-            "invalid packet-pacing: {text}; expected auto or off"
+            "invalid packet-pacing: {text}; expected auto, batch, or off"
         )),
     }
 }
@@ -1696,6 +1820,7 @@ fn print_help() {
         "AgoraLink Native Media prototype\n\n\
 Usage:\n\
   agoralink_media self-test\n\
+  agoralink_media bench-reassembly [--frames <n>] [--packets-per-frame <n>] [--payload-size <bytes>] [--loss-rate <0-1>]\n\
   agoralink_media sender --host <ip> --port <port> --fps <fps> --bitrate-mbps <mbps>\n\
   agoralink_media receiver --bind <ip> --port <port>\n\
   agoralink_media capture-probe --duration-sec <seconds> --target-fps <fps>\n\
@@ -1703,14 +1828,15 @@ Usage:\n\
   agoralink_media gpu-convert-probe --duration-sec <seconds> --target-fps <fps> --out-width <pixels> --out-height <pixels> [--debug-dump-nv12 <dir>] [--debug-dump-bgra <dir>] [--debug-dump-limit <n>]\n\
   agoralink_media encode-probe --width <pixels> --height <pixels> --fps <fps> --duration-sec <seconds> --bitrate-mbps <mbps> --output <path> [--encoder auto|hardware|software|microsoft|intel-qsv] [--color-matrix bt601|bt709]\n\
   agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> [--bitrate-mbps <mbps>] [--quality-bpf <float>] --out-width <pixels> --out-height <pixels> --output <path> [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--color-matrix bt601|bt709]\n\
-  agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> [--bitrate-mbps <mbps>] [--quality-bpf <float>] --out-width <pixels> --out-height <pixels> [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--packet-pacing auto|off] [--fec off|single-xor] [--udp-payload-size <576-1472>] [--keyframe-interval-sec <seconds>] [--color-matrix bt601|bt709]\n\
+  agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> [--bitrate-mbps <mbps>] [--quality-bpf <float>] --out-width <pixels> --out-height <pixels> [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--packet-pacing auto|off|batch] [--fec off|single-xor] [--udp-payload-size <576-1472>] [--keyframe-interval-sec <seconds>] [--color-matrix bt601|bt709]\n\
   agoralink_media h264-recv-dump --bind <ip> --port <port> --output <path> [--idle-timeout-sec <seconds>] [--drop-damaged-gop <true|false>] [--reorder-wait-ms auto|<ms>]\n\
-  agoralink_media h264-recv-view --bind <ip> --port <port> [--frame-timeout-ms <ms>] [--reorder-wait-ms auto|<ms>] [--playout-delay-ms <0-500>] [--render-scale exact|fit|stretch] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--drop-damaged-gop <true|false>] [--debug-dump-frames <dir>] [--debug-dump-limit <n>] [--json-interval-ms <ms>] [--title <text>]\n\
-  agoralink_media screen-send --host <ip> --port <port> [--width <pixels>] [--height <pixels>] [--fps <fps>] [--bitrate-mbps <mbps>] [--quality-bpf <float>] [--duration-sec <seconds>] [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--packet-pacing auto|off] [--fec off|single-xor] [--udp-payload-size <576-1472>] [--keyframe-interval-sec <seconds>] [--color-matrix bt601|bt709] [--verbose]\n\
-  agoralink_media screen-recv --bind <ip> --port <port> [--duration-sec <seconds>] [--frame-timeout-ms <ms>] [--reorder-wait-ms auto|<ms>] [--playout-delay-ms <0-500>] [--render-scale exact|fit|stretch] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--drop-damaged-gop <true|false>] [--json-interval-ms <ms>] [--title <text>] [--verbose]\n\
-  agoralink_media h264-file-viewer --input <path> [--render-scale exact|fit|stretch]\n\n\
+  agoralink_media h264-recv-view --bind <ip> --port <port> [--frame-timeout-ms <ms>] [--reorder-wait-ms auto|<ms>] [--playout-delay-ms <0-500>] [--render-scale exact|fit|stretch] [--window-mode windowed|borderless-fullscreen] [--render-backend gdi|d3d11] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--drop-damaged-gop <true|false>] [--debug-dump-frames <dir>] [--debug-dump-limit <n>] [--json-interval-ms <ms>] [--title <text>]\n\
+  agoralink_media screen-send --host <ip> --port <port> [--width <pixels>] [--height <pixels>] [--fps <fps>] [--bitrate-mbps <mbps>] [--quality-bpf <float>] [--duration-sec <seconds>] [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--packet-pacing auto|off|batch] [--fec off|single-xor] [--udp-payload-size <576-1472>] [--keyframe-interval-sec <seconds>] [--color-matrix bt601|bt709] [--verbose]\n\
+  agoralink_media screen-recv --bind <ip> --port <port> [--duration-sec <seconds>] [--frame-timeout-ms <ms>] [--reorder-wait-ms auto|<ms>] [--playout-delay-ms <0-500>] [--render-scale exact|fit|stretch] [--window-mode windowed|borderless-fullscreen] [--render-backend gdi|d3d11] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--drop-damaged-gop <true|false>] [--json-interval-ms <ms>] [--title <text>] [--verbose]\n\
+  agoralink_media h264-file-viewer --input <path> [--render-scale exact|fit|stretch] [--window-mode windowed|borderless-fullscreen] [--render-backend gdi|d3d11]\n\n\
   agoralink_media color-test-pattern --output <path> --width <pixels> --height <pixels> --duration-sec <seconds> [--fps <fps>] [--bitrate-mbps <mbps>] [--color-matrix bt601|bt709]\n\n\
 Defaults:\n\
+  bench-reassembly: --frames 1800 --packets-per-frame 120 --payload-size 1414 --loss-rate 0\n\
   sender: --host 127.0.0.1 --port 50120 --fps 30 --bitrate-mbps 4\n\
   receiver: --bind 0.0.0.0 --port 50120\n\
   capture-probe: --duration-sec 10 --target-fps 30\n\
@@ -1719,10 +1845,10 @@ Defaults:\n\
   capture-encode-probe: --duration-sec 5 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --output capture_720p30.h264 --encoder auto --convert-backend auto --color-matrix bt709\n\
   h264-send-probe: --host 127.0.0.1 --port 50130 --duration-sec 10 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --encoder auto --convert-backend auto --packet-pacing auto --fec off --udp-payload-size 1452 --keyframe-interval-sec 1 --color-matrix bt709\n\
   h264-recv-dump: --bind 0.0.0.0 --port 50130 --output received_capture.h264 --idle-timeout-sec 3 --drop-damaged-gop true --reorder-wait-ms auto\n\
-  h264-recv-view: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --reorder-wait-ms auto --playout-delay-ms 120 --render-scale exact --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --drop-damaged-gop true --debug-dump-limit 10 --json-interval-ms 1000 --title \"AgoraLink Native Viewer\"\n\
+  h264-recv-view: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --reorder-wait-ms auto --playout-delay-ms 120 --render-scale exact --window-mode windowed --render-backend d3d11 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --drop-damaged-gop true --debug-dump-limit 10 --json-interval-ms 1000 --title \"AgoraLink Native Viewer\"\n\
   screen-send: --host required --port required --width 1280 --height 720 --fps 30 --bitrate-mbps 4 --encoder auto --convert-backend auto --packet-pacing auto --fec off --udp-payload-size 1452 --keyframe-interval-sec 1 --color-matrix bt709 --duration-sec unlimited --verbose off\n\
-  screen-recv: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --reorder-wait-ms auto --playout-delay-ms 120 --render-scale exact --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --drop-damaged-gop true --json-interval-ms 1000 --title \"AgoraLink Native Viewer\" --duration-sec unlimited --verbose off\n\
-  h264-file-viewer: --input received_capture_lan.h264 --render-scale exact\n\
+  screen-recv: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --reorder-wait-ms auto --playout-delay-ms 120 --render-scale exact --window-mode windowed --render-backend d3d11 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --drop-damaged-gop true --json-interval-ms 1000 --title \"AgoraLink Native Viewer\" --duration-sec unlimited --verbose off\n\
+  h264-file-viewer: --input received_capture_lan.h264 --render-scale exact --window-mode windowed --render-backend gdi\n\
   color-test-pattern: --output color_test_1080p.h264 --width 1920 --height 1080 --fps 30 --duration-sec 3 --bitrate-mbps 8 --color-matrix bt709"
     );
 }
@@ -1957,6 +2083,11 @@ pub(crate) fn now_millis() -> u64 {
 }
 
 fn run_self_test() -> Result<(), String> {
+    if parse_packet_pacing("batch")? != h264_send_probe::PacketPacing::Batch
+        || parse_packet_pacing("auto")?.effective_name() != "batch"
+    {
+        return Err("batch packet pacing parsing failed".to_string());
+    }
     for value in [1200, 1452, 1472] {
         if parse_udp_payload_size(&value.to_string())? != value {
             return Err(format!("UDP payload size parsing failed for {value}"));
@@ -2011,7 +2142,9 @@ fn run_self_test() -> Result<(), String> {
     ])? {
         Command::ScreenRecv(config)
             if config.playout_delay_ms == 120
-                && config.render_scale == win32_gdi_viewer::RenderScaleMode::Exact => {}
+                && config.render_scale == win32_gdi_viewer::RenderScaleMode::Exact
+                && config.window_mode == win32_gdi_viewer::WindowMode::Windowed
+                && config.render_backend == video_renderer::RenderBackend::D3d11 => {}
         _ => return Err("screen-recv playout delay default mismatch".to_string()),
     }
     match parse_args(vec![
@@ -2021,7 +2154,9 @@ fn run_self_test() -> Result<(), String> {
     ])? {
         Command::H264RecvView(config)
             if config.playout_delay_ms == 120
-                && config.render_scale == win32_gdi_viewer::RenderScaleMode::Exact => {}
+                && config.render_scale == win32_gdi_viewer::RenderScaleMode::Exact
+                && config.window_mode == win32_gdi_viewer::WindowMode::Windowed
+                && config.render_backend == video_renderer::RenderBackend::D3d11 => {}
         _ => return Err("h264-recv-view playout delay default mismatch".to_string()),
     }
     match parse_args(vec![
@@ -2030,12 +2165,28 @@ fn run_self_test() -> Result<(), String> {
         "test.h264".to_string(),
     ])? {
         Command::H264FileViewer(config)
-            if config.render_scale == win32_gdi_viewer::RenderScaleMode::Exact => {}
-        _ => return Err("h264-file-viewer render scale default mismatch".to_string()),
+            if config.render_scale == win32_gdi_viewer::RenderScaleMode::Exact
+                && config.window_mode == win32_gdi_viewer::WindowMode::Windowed
+                && config.render_backend == video_renderer::RenderBackend::Gdi => {}
+        _ => return Err("h264-file-viewer render defaults mismatch".to_string()),
+    }
+    match parse_args(vec![
+        "h264-file-viewer".to_string(),
+        "--input".to_string(),
+        "test.h264".to_string(),
+        "--window-mode".to_string(),
+        "borderless-fullscreen".to_string(),
+    ])? {
+        Command::H264FileViewer(config)
+            if config.render_scale == win32_gdi_viewer::RenderScaleMode::Exact
+                && config.window_mode == win32_gdi_viewer::WindowMode::BorderlessFullscreen => {}
+        _ => return Err("h264-file-viewer window mode parsing mismatch".to_string()),
     }
     bgra_to_nv12::run_self_test()?;
+    bench_reassembly::run_self_test()?;
     bitrate::run_self_test()?;
     color_spec::run_self_test()?;
+    d3d11_nv12_renderer::run_self_test()?;
     h264_annex_b::run_self_test()?;
     h264_recv_dump::run_self_test()?;
     h264_recv_view::run_self_test()?;

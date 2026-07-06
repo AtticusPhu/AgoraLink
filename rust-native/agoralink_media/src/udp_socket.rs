@@ -1,4 +1,4 @@
-pub const DEFAULT_UDP_BUFFER_BYTES: i32 = 16 * 1024 * 1024;
+pub const DEFAULT_UDP_BUFFER_BYTES: i32 = 64 * 1024 * 1024;
 const MIN_UDP_BUFFER_BYTES: i32 = 8 * 1024 * 1024;
 
 #[cfg(windows)]
@@ -65,14 +65,19 @@ mod platform {
         match set_buffer(socket, option, bytes, label) {
             Ok(actual) => Ok(actual),
             Err(primary) if bytes > super::MIN_UDP_BUFFER_BYTES => {
-                set_buffer(socket, option, super::MIN_UDP_BUFFER_BYTES, label).map_err(|fallback| {
-                    format!(
-                        "{primary}; fallback to {} bytes also failed: {fallback}",
-                        super::MIN_UDP_BUFFER_BYTES
-                    )
-                })
+                match set_buffer(socket, option, super::MIN_UDP_BUFFER_BYTES, label) {
+                    Ok(actual) => Ok(actual),
+                    Err(fallback) => get_buffer(socket, option, label).map_err(|read_error| {
+                        format!(
+                            "{primary}; fallback to {} bytes also failed: {fallback}; unable to read existing buffer: {read_error}",
+                            super::MIN_UDP_BUFFER_BYTES
+                        )
+                    }),
+                }
             }
-            Err(error) => Err(error),
+            Err(error) => get_buffer(socket, option, label).map_err(|read_error| {
+                format!("{error}; unable to read existing UDP {label} buffer: {read_error}")
+            }),
         }
     }
 }

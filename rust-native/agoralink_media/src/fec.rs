@@ -58,7 +58,19 @@ impl FecParity {
         Ok(payload)
     }
 
-    pub fn decode(payload: &[u8]) -> Result<Self, String> {
+    pub fn decode_owned(mut payload: Vec<u8>) -> Result<Self, String> {
+        let (data_packet_count, data_payload_size, last_data_payload_len, _) =
+            Self::decode_metadata(&payload)?;
+        let parity = payload.split_off(FEC_METADATA_LEN);
+        Ok(Self {
+            data_packet_count,
+            data_payload_size,
+            last_data_payload_len,
+            parity,
+        })
+    }
+
+    fn decode_metadata(payload: &[u8]) -> Result<(u16, u16, u16, usize), String> {
         if payload.len() < FEC_METADATA_LEN || &payload[..4] != FEC_MAGIC {
             return Err("invalid FEC1 payload".to_string());
         }
@@ -77,12 +89,12 @@ impl FecParity {
         {
             return Err("invalid FEC1 metadata".to_string());
         }
-        Ok(Self {
+        Ok((
             data_packet_count,
             data_payload_size,
             last_data_payload_len,
-            parity: payload[FEC_METADATA_LEN..].to_vec(),
-        })
+            parity_len,
+        ))
     }
 
     pub fn expected_payload_len(&self, packet_index: usize) -> Result<usize, String> {

@@ -2,6 +2,8 @@
 pub struct H264FileViewerConfig {
     pub input: String,
     pub render_scale: crate::win32_gdi_viewer::RenderScaleMode,
+    pub window_mode: crate::win32_gdi_viewer::WindowMode,
+    pub render_backend: crate::video_renderer::RenderBackend,
 }
 
 #[cfg(windows)]
@@ -13,9 +15,8 @@ mod platform {
 
     use super::H264FileViewerConfig;
     use crate::color_spec::{ColorSpec, MediaColorMetadata};
-    use crate::decoded_frame_renderer::OwnedBgraFrame;
     use crate::h264_annex_b::{dimensions_from_sps, split_access_units};
-    use crate::win32_gdi_viewer::GdiViewerWindow;
+    use crate::video_renderer::{VideoRenderStats, VideoRenderer};
     use crate::wmf_h264_decoder::{DecodedFrame, WmfH264Decoder, DECODER_NAME};
 
     const PLAYBACK_FPS: u32 = 30;
@@ -33,15 +34,23 @@ mod platform {
         let access_units = split_access_units(&bytes)?;
         let mut decoder = WmfH264Decoder::new(dimensions.width, dimensions.height, PLAYBACK_FPS)?;
         let title = format!("AgoraLink Native H.264 Viewer - {}", config.input);
-        let mut window = GdiViewerWindow::create(&title, config.render_scale)?;
+        let mut window = VideoRenderer::create(
+            &title,
+            config.render_scale,
+            config.window_mode,
+            config.render_backend,
+        )?;
+        window.prepare_video(dimensions.width, dimensions.height, None)?;
 
         eprintln!(
-            "h264-file-viewer input={} bytes={} access_units={} decoder=\"{}\" output=NV12 render=GDI render_scale={} size={}x{} playback_fps={}",
+            "h264-file-viewer input={} bytes={} access_units={} decoder=\"{}\" output=NV12 render_backend={} render_scale={} window_mode={} size={}x{} playback_fps={}",
             config.input,
             bytes.len(),
             access_units.len(),
             DECODER_NAME,
+            window.stats().selected.name(),
             config.render_scale.name(),
+            config.window_mode.name(),
             dimensions.width,
             dimensions.height,
             PLAYBACK_FPS
@@ -106,7 +115,7 @@ mod platform {
                     last_uv_stride,
                     last_uv_offset,
                     last_allocated_height,
-                    window.render_stats(),
+                    window.stats(),
                 );
             }
             if closed_by_user {
@@ -153,7 +162,7 @@ mod platform {
                     last_uv_stride,
                     last_uv_offset,
                     last_allocated_height,
-                    window.render_stats(),
+                    window.stats(),
                 );
             }
         }
@@ -175,7 +184,7 @@ mod platform {
             last_allocated_height,
             last_color_spec.json_fragment(),
             last_color_metadata.json_fragment("decoder_output"),
-            window.render_stats().json_fragment(),
+            window.stats().json_fragment(),
         );
         io::stdout().flush().ok();
         eprintln!(
@@ -190,17 +199,18 @@ mod platform {
     }
 
     fn render_frame(
-        window: &mut GdiViewerWindow,
+        window: &mut VideoRenderer,
         frame: &DecodedFrame,
         width: u32,
         height: u32,
         generation: &mut u64,
     ) -> Result<(), String> {
         *generation += 1;
-        OwnedBgraFrame::from_decoded(frame, width, height, *generation)?.render(window)
+        window.render_decoded(frame, width, height, *generation)?;
+        Ok(())
     }
 
-    fn wait_until_frame(window: &mut GdiViewerWindow, target: Instant) -> bool {
+    fn wait_until_frame(window: &mut VideoRenderer, target: Instant) -> bool {
         loop {
             if !window.pump_messages() {
                 return false;
@@ -226,7 +236,7 @@ mod platform {
         uv_stride: usize,
         uv_offset: usize,
         allocated_height: usize,
-        render_stats: crate::win32_gdi_viewer::GdiRenderStats,
+        render_stats: VideoRenderStats,
     ) {
         let now = Instant::now();
         let elapsed = now.duration_since(*report_at);

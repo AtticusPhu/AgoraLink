@@ -15,6 +15,8 @@ pub struct H264RecvViewConfig {
     pub json_interval_ms: u64,
     pub title: String,
     pub render_scale: crate::win32_gdi_viewer::RenderScaleMode,
+    pub window_mode: crate::win32_gdi_viewer::WindowMode,
+    pub render_backend: crate::video_renderer::RenderBackend,
     pub mode: H264RecvViewMode,
     pub verbose: bool,
 }
@@ -32,7 +34,7 @@ mod platform {
     use std::net::UdpSocket;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -49,8 +51,8 @@ mod platform {
         ReassemblyStats, ReorderWait,
     };
     use crate::playout_buffer::{PlayoutBuffer, PlayoutStats};
-    use crate::win32_gdi_viewer::{GdiRenderStats, GdiViewerWindow};
-    use crate::wmf_h264_decoder::{WmfH264Decoder, DECODER_NAME};
+    use crate::video_renderer::{VideoRenderStats, VideoRenderer};
+    use crate::wmf_h264_decoder::{DecodedFrame, WmfH264Decoder, DECODER_NAME};
 
     const MAX_DATAGRAM_SIZE: usize = 2048;
     const MAX_DATAGRAMS_PER_TICK: usize = 1024;
@@ -98,6 +100,7 @@ mod platform {
         frames_predecode_dropped: u64,
         frames_waiting_keyframe_dropped: u64,
         keyframe_recovery_count: u64,
+        complete_frame_queue_drops: u64,
         decode_queue_peak: usize,
         last_keyframe_id: Option<u64>,
         damaged_gop: DamagedGopTracker,
@@ -111,6 +114,7 @@ mod platform {
                 frames_predecode_dropped: 0,
                 frames_waiting_keyframe_dropped: 0,
                 keyframe_recovery_count: 0,
+                complete_frame_queue_drops: 0,
                 decode_queue_peak: 0,
                 last_keyframe_id: None,
                 damaged_gop: DamagedGopTracker::new(drop_damaged_gop),
@@ -126,6 +130,7 @@ mod platform {
 
         fn begin_keyframe_recovery(&mut self) {
             let dropped = self.frame_len() as u64;
+            self.complete_frame_queue_drops += dropped;
             self.frames_predecode_dropped += dropped;
             self.items.clear();
             self.items.push_back(DecodeQueueItem::Reset);
@@ -175,6 +180,7 @@ mod platform {
                 if !frame.is_idr() {
                     self.frames_predecode_dropped += 1;
                     self.frames_waiting_keyframe_dropped += 1;
+                    self.complete_frame_queue_drops += 1;
                     return;
                 }
             }
@@ -207,6 +213,9 @@ mod platform {
         damaged_gop: DamagedGopStats,
         drop_damaged_gop: bool,
         udp_recv_buffer_bytes: i32,
+        udp_recv_buffer_bytes_requested: i32,
+        udp_recv_loop_overruns: u64,
+        complete_frame_queue_drops: u64,
         playout: PlayoutStats,
         playout_buffer_frames: usize,
         playout_delay_ms: u64,
@@ -231,6 +240,8 @@ mod platform {
         decoder_errors: u64,
         decoder_resets: u64,
         render_queue_peak: usize,
+        decoded_frame_queue_len: usize,
+        decoded_frame_queue_drops: u64,
         render_frame_copies: u64,
         render_buffer_reused: u64,
         render_buffer_generation: u64,
@@ -245,12 +256,26 @@ mod platform {
         decoder_color_metadata: MediaColorMetadata,
         decode_ms_total: f64,
         render_ms_total: f64,
-        render_state: GdiRenderStats,
+        render_state: VideoRenderStats,
     }
 
     struct PendingRender {
         frame_id: u64,
-        frame: OwnedBgraFrame,
+        frame: DecodedFrame,
+        width: u32,
+        height: u32,
+    }
+
+    #[derive(Default)]
+    struct RenderWorkerState {
+        pending: Option<PendingRender>,
+        render_state: VideoRenderStats,
+        frames_rendered: u64,
+        frames_replaced: u64,
+        queue_peak: usize,
+        render_ms_total: f64,
+        closed_by_user: bool,
+        error: Option<String>,
     }
 
     struct DebugFrameDumper {
@@ -268,7 +293,13 @@ mod platform {
             }
         }
 
-        fn maybe_dump(&mut self, frame: &OwnedBgraFrame) -> Result<(), String> {
+        fn maybe_dump(
+            &mut self,
+            frame: &DecodedFrame,
+            width: u32,
+            height: u32,
+            generation: u64,
+        ) -> Result<(), String> {
             let Some(directory) = self.directory.as_deref() else {
                 return Ok(());
             };
@@ -276,7 +307,8 @@ mod platform {
                 return Ok(());
             }
             self.dumped += 1;
-            frame.dump_raw(directory, self.dumped as u64)
+            OwnedBgraFrame::from_decoded(frame, width, height, generation)?
+                .dump_raw(directory, self.dumped as u64)
         }
     }
 
@@ -286,7 +318,6 @@ mod platform {
         waiting_for_keyframe: bool,
         input_index: u64,
         last_keyframe_id: Option<u64>,
-        pending_render: Option<PendingRender>,
         next_render_generation: u64,
     }
 
@@ -298,7 +329,6 @@ mod platform {
                 waiting_for_keyframe: true,
                 input_index: 0,
                 last_keyframe_id: None,
-                pending_render: None,
                 next_render_generation: 0,
             }
         }
@@ -312,10 +342,6 @@ mod platform {
             }
             self.waiting_for_keyframe = true;
             self.input_index = 0;
-            if self.pending_render.take().is_some() {
-                stats.frames_decoded_not_rendered += 1;
-                stats.frames_render_skipped += 1;
-            }
         }
     }
 
@@ -331,7 +357,6 @@ mod platform {
         socket
             .set_nonblocking(true)
             .map_err(|err| format!("set UDP nonblocking failed: {err}"))?;
-        let mut window = GdiViewerWindow::create(&config.title, config.render_scale)?;
         let queue = Arc::new(Mutex::new(DecodeQueue::new(
             config.max_decode_queue,
             config.drop_damaged_gop,
@@ -339,8 +364,21 @@ mod platform {
         let network_state = Arc::new(Mutex::new(SharedNetworkState::default()));
         if let Ok(mut state) = network_state.lock() {
             state.snapshot.udp_recv_buffer_bytes = udp_recv_buffer_bytes;
+            state.snapshot.udp_recv_buffer_bytes_requested =
+                crate::udp_socket::DEFAULT_UDP_BUFFER_BYTES;
         }
         let stop = Arc::new(AtomicBool::new(false));
+        let render_state = Arc::new(Mutex::new(RenderWorkerState::default()));
+        let (render_thread, initial_render_stats) = spawn_render_thread(
+            Arc::clone(&render_state),
+            Arc::clone(&stop),
+            config.title.clone(),
+            config.render_scale,
+            config.window_mode,
+            config.render_backend,
+            config.debug_dump_frames.clone(),
+            config.debug_dump_limit,
+        )?;
         let network_thread = spawn_network_thread(
             socket,
             Arc::clone(&queue),
@@ -352,12 +390,11 @@ mod platform {
             config.max_inflight_frames,
             config.max_decode_queue,
             config.drop_damaged_gop,
-            config.verbose,
         )?;
 
         if config.verbose {
             eprintln!(
-                "h264-recv-view bind={}:{} frame_timeout_ms={} reorder_wait_ms={} playout_delay_ms={} max_inflight_frames={} max_decode_queue={} strict_decode_order={} drop_damaged_gop={} debug_dump_frames={:?} debug_dump_limit={} udp_receive_buffer={} decoder=\"{}\" output=NV12 render=GDI render_scale={} title=\"{}\" duration_sec={}",
+                "h264-recv-view bind={}:{} frame_timeout_ms={} reorder_wait_ms={} playout_delay_ms={} max_inflight_frames={} max_decode_queue={} strict_decode_order={} drop_damaged_gop={} debug_dump_frames={:?} debug_dump_limit={} udp_receive_buffer={} decoder=\"{}\" output=NV12 render_backend={} render_scale={} window_mode={} title=\"{}\" duration_sec={}",
                 config.bind,
                 config.port,
                 config.frame_timeout_ms,
@@ -373,12 +410,14 @@ mod platform {
                 config.debug_dump_limit,
                 udp_recv_buffer_bytes,
                 DECODER_NAME,
+                initial_render_stats.selected.name(),
                 config.render_scale.name(),
+                config.window_mode.name(),
                 config.title,
                 optional_duration_text(config.duration_sec)
             );
         }
-        print_started(&config, window.render_stats());
+        print_started(&config, initial_render_stats.clone());
 
         let started_at = Instant::now();
         let mut report_at = started_at;
@@ -388,9 +427,7 @@ mod platform {
         let mut previous_rendered = 0u64;
         let mut decode_state = DecodeState::new();
         let mut stats = ViewerStats::default();
-        stats.render_state = window.render_stats();
-        let mut debug_dumper =
-            DebugFrameDumper::new(config.debug_dump_frames.clone(), config.debug_dump_limit);
+        stats.render_state = initial_render_stats;
         let mut closed_by_user = false;
 
         loop {
@@ -400,7 +437,12 @@ mod platform {
             if duration_elapsed(started_at, config.duration_sec) {
                 break;
             }
-            if !window.pump_messages() {
+            sync_render_worker_stats(&render_state, &mut stats);
+            if render_state
+                .lock()
+                .map(|state| state.closed_by_user)
+                .unwrap_or(false)
+            {
                 closed_by_user = true;
                 break;
             }
@@ -410,32 +452,18 @@ mod platform {
                 |mut queue| queue.items.drain(..).collect::<Vec<_>>(),
             );
             if items.is_empty() {
-                render_latest_decoded(
-                    &mut decode_state,
-                    &mut window,
-                    &mut debug_dumper,
-                    &mut stats,
-                );
                 thread::sleep(Duration::from_millis(1));
             } else {
-                let mut remaining_frames = items
-                    .iter()
-                    .filter(|item| matches!(item, DecodeQueueItem::Frame(_)))
-                    .count();
-                let skip_stale_renders = remaining_frames > (config.max_decode_queue / 2).max(2);
                 for item in items {
                     match item {
                         DecodeQueueItem::Reset => {
                             decode_state.mark_discontinuity(&mut stats, false);
                         }
                         DecodeQueueItem::Frame(frame) => {
-                            remaining_frames = remaining_frames.saturating_sub(1);
                             process_encoded_frame(
                                 frame,
-                                !skip_stale_renders || remaining_frames == 0,
                                 &mut decode_state,
-                                &mut window,
-                                &mut debug_dumper,
+                                &render_state,
                                 &mut stats,
                             );
                         }
@@ -469,6 +497,14 @@ mod platform {
         }
 
         stop.store(true, Ordering::SeqCst);
+        render_thread
+            .join()
+            .map_err(|_| "H.264 render thread panicked".to_string())?;
+        sync_render_worker_stats(&render_state, &mut stats);
+        closed_by_user |= render_state
+            .lock()
+            .map(|state| state.closed_by_user)
+            .unwrap_or(false);
         network_thread
             .join()
             .map_err(|_| "H.264 receive thread panicked".to_string())?;
@@ -476,8 +512,14 @@ mod platform {
             .lock()
             .map_err(|_| "network state lock was poisoned".to_string())?;
         let snapshot = final_state.snapshot;
-        let network_error = final_state.error.clone();
+        let mut network_error = final_state.error.clone();
         drop(final_state);
+        if network_error.is_none() {
+            network_error = render_state
+                .lock()
+                .ok()
+                .and_then(|state| state.error.clone());
+        }
         let dimensions = decode_state.dimensions.unwrap_or(VideoDimensions {
             width: 0,
             height: 0,
@@ -518,7 +560,6 @@ mod platform {
         max_inflight_frames: usize,
         max_decode_queue: usize,
         drop_damaged_gop: bool,
-        verbose: bool,
     ) -> Result<thread::JoinHandle<()>, String> {
         thread::Builder::new()
             .name("agoralink-h264-recv".to_string())
@@ -534,7 +575,6 @@ mod platform {
                     max_inflight_frames,
                     max_decode_queue,
                     drop_damaged_gop,
-                    verbose,
                 ) {
                     if let Ok(mut shared) = state.lock() {
                         shared.error = Some(err);
@@ -556,7 +596,6 @@ mod platform {
         max_inflight_frames: usize,
         max_decode_queue: usize,
         drop_damaged_gop: bool,
-        verbose: bool,
     ) -> Result<(), String> {
         let mut reassembler = H264Reassembler::new(ReassemblyConfig {
             frame_timeout: Duration::from_millis(frame_timeout_ms),
@@ -568,13 +607,16 @@ mod platform {
         let mut datagram = [0u8; MAX_DATAGRAM_SIZE];
         let mut previous_expired = 0u64;
         let mut playout = PlayoutBuffer::new(playout_delay_ms)?;
+        let mut udp_recv_loop_overruns = 0u64;
 
         while !stop.load(Ordering::SeqCst) {
             let mut did_work = false;
+            let mut datagrams_this_tick = 0usize;
             for _ in 0..MAX_DATAGRAMS_PER_TICK {
                 match socket.recv_from(&mut datagram) {
                     Ok((length, _peer)) => {
                         did_work = true;
+                        datagrams_this_tick += 1;
                         let received_at = Instant::now();
                         match reassembler.accept_datagram(&datagram[..length], received_at) {
                             Ok(frames) => {
@@ -592,16 +634,15 @@ mod platform {
                                 }
                                 playout.push_frames(frames, received_at);
                             }
-                            Err(err) => {
-                                if verbose {
-                                    eprintln!("discarding invalid AGM1 packet: {err}");
-                                }
-                            }
+                            Err(_) => {}
                         }
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                     Err(err) => return Err(format!("UDP receive failed: {err}")),
                 }
+            }
+            if datagrams_this_tick == MAX_DATAGRAMS_PER_TICK {
+                udp_recv_loop_overruns += 1;
             }
 
             let now = Instant::now();
@@ -620,12 +661,12 @@ mod platform {
             }
             playout.push_frames(frames, now);
             enqueue_network_frames(playout.pop_due(now), queue, max_decode_queue)?;
-            update_network_snapshot(state, &reassembler, queue, &playout)?;
+            update_network_snapshot(state, &reassembler, queue, &playout, udp_recv_loop_overruns)?;
             if !did_work {
                 thread::sleep(Duration::from_millis(1));
             }
         }
-        update_network_snapshot(state, &reassembler, queue, &playout)
+        update_network_snapshot(state, &reassembler, queue, &playout, udp_recv_loop_overruns)
     }
 
     fn enqueue_network_frames(
@@ -665,6 +706,7 @@ mod platform {
         reassembler: &H264Reassembler,
         queue: &Arc<Mutex<DecodeQueue>>,
         playout: &PlayoutBuffer,
+        udp_recv_loop_overruns: u64,
     ) -> Result<(), String> {
         let queue = queue
             .lock()
@@ -673,6 +715,7 @@ mod platform {
             .lock()
             .map_err(|_| "network state lock was poisoned".to_string())?;
         let udp_recv_buffer_bytes = state.snapshot.udp_recv_buffer_bytes;
+        let udp_recv_buffer_bytes_requested = state.snapshot.udp_recv_buffer_bytes_requested;
         state.snapshot = NetworkSnapshot {
             reassembly: reassembler.stats(),
             session_id: reassembler.session_id(),
@@ -688,6 +731,9 @@ mod platform {
             damaged_gop: queue.damaged_gop_stats(),
             drop_damaged_gop: queue.damaged_gop.enabled(),
             udp_recv_buffer_bytes,
+            udp_recv_buffer_bytes_requested,
+            udp_recv_loop_overruns,
+            complete_frame_queue_drops: queue.complete_frame_queue_drops,
             playout: playout.stats(),
             playout_buffer_frames: playout.len(),
             playout_delay_ms: playout.delay_ms(),
@@ -697,10 +743,8 @@ mod platform {
 
     fn process_encoded_frame(
         frame: EncodedFrame,
-        render_output: bool,
         decode_state: &mut DecodeState,
-        window: &mut GdiViewerWindow,
-        debug_dumper: &mut DebugFrameDumper,
+        render_state: &Arc<Mutex<RenderWorkerState>>,
         stats: &mut ViewerStats,
     ) {
         if frame.is_idr() {
@@ -771,64 +815,131 @@ mod platform {
         };
         for decoded_frame in decoded {
             decode_state.next_render_generation += 1;
-            let owned_frame = match OwnedBgraFrame::from_decoded(
-                &decoded_frame,
-                dimensions.width,
-                dimensions.height,
-                decode_state.next_render_generation,
-            ) {
-                Ok(frame) => frame,
-                Err(err) => {
-                    eprintln!("convert decoded frame {} failed: {err}", frame.frame_id);
-                    continue;
-                }
-            };
-            stats.render_frame_copies += 1;
-            stats.render_buffer_generation = owned_frame.generation;
-            stats.nv12_y_stride = owned_frame.nv12_y_stride;
-            stats.nv12_uv_stride = owned_frame.nv12_uv_stride;
-            stats.nv12_uv_offset = owned_frame.nv12_uv_offset;
-            stats.nv12_allocated_height = owned_frame.nv12_allocated_height;
-            stats.nv12_buffer_len = owned_frame.nv12_buffer_len;
-            stats.expected_tight_len = owned_frame.expected_tight_len;
-            stats.decoder_used_2d_buffer = owned_frame.decoder_used_2d_buffer;
-            stats.color_spec = owned_frame.color_spec;
-            stats.decoder_color_metadata = owned_frame.color_metadata;
-            if decode_state.pending_render.is_some() {
-                stats.frames_decoded_not_rendered += 1;
-                stats.frames_render_skipped += 1;
-            }
-            decode_state.pending_render = Some(PendingRender {
-                frame_id: frame.frame_id,
-                frame: owned_frame,
-            });
-            stats.render_queue_peak = stats.render_queue_peak.max(1);
-            if render_output {
-                render_latest_decoded(decode_state, window, debug_dumper, stats);
-            }
+            stats.render_buffer_generation = decode_state.next_render_generation;
+            stats.nv12_y_stride = decoded_frame.y_stride;
+            stats.nv12_uv_stride = decoded_frame.uv_stride;
+            stats.nv12_uv_offset = decoded_frame.uv_offset;
+            stats.nv12_allocated_height = decoded_frame.allocated_height;
+            stats.nv12_buffer_len = decoded_frame.source_buffer_len;
+            stats.expected_tight_len = decoded_frame.expected_tight_len;
+            stats.decoder_used_2d_buffer = decoded_frame.used_2d_buffer;
+            stats.color_spec = decoded_frame.color_spec;
+            stats.decoder_color_metadata = decoded_frame.color_metadata;
+            submit_render_frame(
+                render_state,
+                PendingRender {
+                    frame_id: frame.frame_id,
+                    frame: decoded_frame,
+                    width: dimensions.width,
+                    height: dimensions.height,
+                },
+            );
         }
     }
 
-    fn render_latest_decoded(
-        decode_state: &mut DecodeState,
-        window: &mut GdiViewerWindow,
-        debug_dumper: &mut DebugFrameDumper,
-        stats: &mut ViewerStats,
-    ) {
-        let Some(pending) = decode_state.pending_render.take() else {
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_render_thread(
+        shared: Arc<Mutex<RenderWorkerState>>,
+        stop: Arc<AtomicBool>,
+        title: String,
+        scale_mode: crate::win32_gdi_viewer::RenderScaleMode,
+        window_mode: crate::win32_gdi_viewer::WindowMode,
+        backend: crate::video_renderer::RenderBackend,
+        debug_directory: Option<String>,
+        debug_limit: usize,
+    ) -> Result<(thread::JoinHandle<()>, VideoRenderStats), String> {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let handle = thread::Builder::new()
+            .name("agoralink-h264-render".to_string())
+            .spawn(move || {
+                let mut renderer =
+                    match VideoRenderer::create(&title, scale_mode, window_mode, backend) {
+                        Ok(renderer) => renderer,
+                        Err(err) => {
+                            let _ = started_tx.send(Err(err.clone()));
+                            if let Ok(mut state) = shared.lock() {
+                                state.error = Some(err);
+                            }
+                            return;
+                        }
+                    };
+                let initial_stats = renderer.stats();
+                let _ = started_tx.send(Ok(initial_stats.clone()));
+                if let Ok(mut state) = shared.lock() {
+                    state.render_state = initial_stats;
+                }
+                let mut dumper = DebugFrameDumper::new(debug_directory, debug_limit);
+                let mut generation = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    if !renderer.pump_messages() {
+                        if let Ok(mut state) = shared.lock() {
+                            state.closed_by_user = true;
+                        }
+                        stop.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    let pending = shared
+                        .lock()
+                        .ok()
+                        .and_then(|mut state| state.pending.take());
+                    let Some(pending) = pending else {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    };
+                    generation += 1;
+                    let started = Instant::now();
+                    let result = dumper
+                        .maybe_dump(&pending.frame, pending.width, pending.height, generation)
+                        .and_then(|_| {
+                            renderer.render_decoded(
+                                &pending.frame,
+                                pending.width,
+                                pending.height,
+                                pending.frame_id,
+                            )
+                        });
+                    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    if let Ok(mut state) = shared.lock() {
+                        state.render_state = renderer.stats();
+                        if let Err(err) = result {
+                            state.error = Some(err);
+                            stop.store(true, Ordering::SeqCst);
+                        } else {
+                            state.frames_rendered += 1;
+                            state.render_ms_total += elapsed_ms;
+                        }
+                    }
+                }
+            })
+            .map_err(|err| format!("spawn H.264 render thread failed: {err}"))?;
+        let initial = started_rx
+            .recv()
+            .map_err(|_| "render thread ended before initialization".to_string())??;
+        Ok((handle, initial))
+    }
+
+    fn submit_render_frame(shared: &Arc<Mutex<RenderWorkerState>>, frame: PendingRender) {
+        if let Ok(mut state) = shared.lock() {
+            if state.pending.replace(frame).is_some() {
+                state.frames_replaced += 1;
+            }
+            state.queue_peak = state.queue_peak.max(1);
+        }
+    }
+
+    fn sync_render_worker_stats(shared: &Arc<Mutex<RenderWorkerState>>, stats: &mut ViewerStats) {
+        let Ok(state) = shared.lock() else {
             return;
         };
-        let render_started = Instant::now();
-        if let Err(err) = debug_dumper
-            .maybe_dump(&pending.frame)
-            .and_then(|_| pending.frame.render(window))
-        {
-            eprintln!("render frame {} failed: {err}", pending.frame_id);
-            return;
-        }
-        stats.render_ms_total += render_started.elapsed().as_secs_f64() * 1000.0;
-        stats.frames_rendered += 1;
-        stats.render_state = window.render_stats();
+        stats.frames_rendered = state.frames_rendered;
+        stats.render_ms_total = state.render_ms_total;
+        stats.render_state = state.render_state.clone();
+        stats.frames_decoded_not_rendered = state.frames_replaced;
+        stats.frames_render_skipped = state.frames_replaced;
+        stats.render_queue_peak = state.queue_peak;
+        stats.decoded_frame_queue_len = usize::from(state.pending.is_some());
+        stats.decoded_frame_queue_drops = state.frames_replaced;
+        stats.render_buffer_reused = state.frames_replaced;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -963,21 +1074,19 @@ mod platform {
         io::stdout().flush().ok();
     }
 
-    fn print_started(config: &H264RecvViewConfig, render: GdiRenderStats) {
+    fn print_started(config: &H264RecvViewConfig, render: VideoRenderStats) {
         if config.mode != H264RecvViewMode::Screen {
             return;
         }
         println!(
-            r#"{{"type":"NATIVE_SCREEN_STARTED","role":"receiver","mode":"screen-recv","bind":"{}","port":{},"strict_decode_order":{},"drop_damaged_gop":{},"playout_delay_ms":{},"render_scale_mode":"{}","dpi_awareness_set":{},"dpi_awareness_mode":"{}","title":"{}"}}"#,
+            r#"{{"type":"NATIVE_SCREEN_STARTED","role":"receiver","mode":"screen-recv","bind":"{}","port":{},"strict_decode_order":{},"drop_damaged_gop":{},"playout_delay_ms":{},"title":"{}",{}}}"#,
             json_escape(&config.bind),
             config.port,
             config.strict_decode_order,
             config.drop_damaged_gop,
             config.playout_delay_ms,
-            config.render_scale.name(),
-            render.dpi.set,
-            render.dpi.mode,
-            json_escape(&config.title)
+            json_escape(&config.title),
+            render.json_fragment(),
         );
         io::stdout().flush().ok();
     }
@@ -1146,9 +1255,20 @@ mod platform {
             .saturating_sub(previous.packets_received) as f64
             / elapsed_sec.max(0.001);
         format!(
-            r#""udp_recv_buffer_bytes":{},"packets_per_second":{:.2},"playout_delay_ms":{},"playout_buffer_frames":{},"playout_buffer_peak_frames":{},"playout_late_frames":{},"playout_dropped_late_frames":{},"playout_dropped_discontinuity_frames":{},"playout_delay_actual_ms_avg":{:.3},"playout_delay_actual_ms_max":{:.3},"decoder_input_fps":{:.2},"render_output_fps":{:.2},"frames_missing_packets":{},"frames_dropped_incomplete":{},"fec_mode":"{}","fec_packets_received":{},"fec_frames_recovered":{},"fec_packets_recovered":{},"fec_recovery_failed_multi_missing":{},"fec_recovery_failed_no_parity":{},"fec_recovery_failed_invalid":{},"frames_missing_after_fec":{},"frames_dropped_after_fec":{},"keyframe_recovery_count":{},"last_keyframe_id":{},"decoder_resets":{},"drop_damaged_gop":{},"damaged_gop_count":{},"frames_discarded_damaged_gop":{},"frames_discarded_waiting_keyframe":{},"waiting_keyframe_entries":{},"waiting_keyframe_exits":{},"idr_frames_received":{},"idr_frames_used_for_recovery":{},"non_idr_frames_discarded_waiting":{},"recovery_wait_ms_avg":{:.3},"recovery_wait_ms_max":{:.3},"recovery_wait_frames_avg":{:.3},"recovery_wait_frames_max":{},"next_decode_frame_id":{},"decode_gate_stalls":{},"decode_gate_gap_events":{},"decode_gate_gap_to_damage_ms_avg":{:.3},"decode_gate_gap_to_damage_ms_max":{:.3},"frames_buffered_waiting_order":{},"frames_discarded_decode_gate":{},"reorder_wait_ms":{},{}"#,
+            r#""udp_recv_buffer_bytes":{},"udp_recv_buffer_bytes_requested":{},"udp_recv_buffer_bytes_actual":{},"packets_per_second":{:.2},"udp_recv_packets_per_second":{:.2},"udp_recv_loop_overruns":{},"complete_frame_queue_len":{},"complete_frame_queue_peak":{},"complete_frame_queue_drops":{},"reassembly_frames_active":{},"reassembly_packets_active":{},"reassembly_fast_path_enabled":true,"reassembly_allocations_estimate":{},"reassembly_complete_scan_count":{},"playout_delay_ms":{},"playout_buffer_frames":{},"playout_buffer_peak_frames":{},"playout_late_frames":{},"playout_dropped_late_frames":{},"playout_dropped_discontinuity_frames":{},"playout_delay_actual_ms_avg":{:.3},"playout_delay_actual_ms_max":{:.3},"decoder_input_fps":{:.2},"render_output_fps":{:.2},"decode_thread_fps":{:.2},"render_thread_fps":{:.2},"decoded_frame_queue_len":{},"decoded_frame_queue_peak":{},"decoded_frame_queue_drops":{},"decoded_frames_replaced_by_latest":{},"decoder_blocked_by_render_count":0,"frames_missing_packets":{},"frames_dropped_incomplete":{},"fec_mode":"{}","fec_packets_received":{},"fec_frames_recovered":{},"fec_packets_recovered":{},"fec_recovery_failed_multi_missing":{},"fec_recovery_failed_no_parity":{},"fec_recovery_failed_invalid":{},"frames_missing_after_fec":{},"frames_dropped_after_fec":{},"keyframe_recovery_count":{},"last_keyframe_id":{},"decoder_resets":{},"drop_damaged_gop":{},"damaged_gop_count":{},"frames_discarded_damaged_gop":{},"frames_discarded_waiting_keyframe":{},"waiting_keyframe_entries":{},"waiting_keyframe_exits":{},"idr_frames_received":{},"idr_frames_used_for_recovery":{},"non_idr_frames_discarded_waiting":{},"recovery_wait_ms_avg":{:.3},"recovery_wait_ms_max":{:.3},"recovery_wait_frames_avg":{:.3},"recovery_wait_frames_max":{},"next_decode_frame_id":{},"decode_gate_stalls":{},"decode_gate_gap_events":{},"decode_gate_gap_to_damage_ms_avg":{:.3},"decode_gate_gap_to_damage_ms_max":{:.3},"frames_buffered_waiting_order":{},"frames_discarded_decode_gate":{},"reorder_wait_ms":{},{}"#,
+            snapshot.udp_recv_buffer_bytes,
+            snapshot.udp_recv_buffer_bytes_requested,
             snapshot.udp_recv_buffer_bytes,
             packets_per_second,
+            packets_per_second,
+            snapshot.udp_recv_loop_overruns,
+            snapshot.decode_queue,
+            snapshot.decode_queue_peak,
+            snapshot.complete_frame_queue_drops,
+            snapshot.reassembly.reassembly_frames_active,
+            snapshot.reassembly.reassembly_packets_active,
+            snapshot.reassembly.reassembly_allocations_estimate,
+            snapshot.reassembly.reassembly_complete_scan_count,
             snapshot.playout_delay_ms,
             snapshot.playout_buffer_frames,
             snapshot.playout.buffer_peak_frames,
@@ -1162,6 +1282,15 @@ mod platform {
                 .saturating_sub(previous_decoder_input) as f64
                 / elapsed_sec.max(0.001),
             stats.frames_rendered.saturating_sub(previous_rendered) as f64 / elapsed_sec.max(0.001),
+            stats
+                .frames_decoder_input
+                .saturating_sub(previous_decoder_input) as f64
+                / elapsed_sec.max(0.001),
+            stats.frames_rendered.saturating_sub(previous_rendered) as f64 / elapsed_sec.max(0.001),
+            stats.decoded_frame_queue_len,
+            stats.render_queue_peak,
+            stats.decoded_frame_queue_drops,
+            stats.frames_decoded_not_rendered,
             snapshot.reassembly.frames_incomplete_expired,
             snapshot.reassembly.frames_incomplete_expired,
             if snapshot.reassembly.fec_packets_received > 0

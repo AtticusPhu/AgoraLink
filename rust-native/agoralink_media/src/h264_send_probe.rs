@@ -22,6 +22,7 @@ pub struct H264SendConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PacketPacing {
     Auto,
+    Batch,
     Off,
 }
 
@@ -29,8 +30,20 @@ impl PacketPacing {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::Batch => "batch",
             Self::Off => "off",
         }
+    }
+
+    pub const fn effective_name(self) -> &'static str {
+        match self {
+            Self::Auto | Self::Batch => "batch",
+            Self::Off => "off",
+        }
+    }
+
+    pub const fn uses_batch(self) -> bool {
+        matches!(self, Self::Auto | Self::Batch)
     }
 }
 
@@ -62,6 +75,7 @@ mod platform {
     use crate::{make_session_id, now_millis, FLAG_CONFIG, FLAG_H264_ANNEX_B, FLAG_KEYFRAME};
 
     const SEND_QUEUE_DEPTH: usize = 4;
+    const PACING_TICK: Duration = Duration::from_millis(1);
 
     struct PacedFrame {
         packets: Vec<Vec<u8>>,
@@ -81,6 +95,12 @@ mod platform {
         max_packets_per_frame: u64,
         pacing_sleep_ms_total: f64,
         pacing_overrun_frames: u64,
+        pacing_batches: u64,
+        pacing_batch_packets: u64,
+        pacing_batch_max: u64,
+        pacing_overrun_ticks: u64,
+        pacing_late_us_total: f64,
+        pacing_late_us_max: f64,
         send_errors: u64,
         error: Option<String>,
     }
@@ -151,34 +171,75 @@ mod platform {
                         let mut bytes_sent = 0u64;
                         let mut packets_sent = 0u64;
                         let mut sleep_ms = 0.0;
+                        let mut pacing_batches = 0u64;
+                        let mut pacing_batch_packets = 0u64;
+                        let mut pacing_batch_max = 0u64;
+                        let mut pacing_overrun_ticks = 0u64;
+                        let mut pacing_late_us_total = 0.0;
+                        let mut pacing_late_us_max: f64 = 0.0;
                         let mut failure = None;
-                        if packet_pacing == PacketPacing::Auto {
+                        if packet_pacing.uses_batch() {
                             sleep_ms += wait_until(frame_started);
                         }
-                        for (index, packet) in frame.packets.iter().enumerate() {
-                            if packet_pacing == PacketPacing::Auto && index != 0 {
-                                let offset = frame_interval.mul_f64(index as f64 / packet_count as f64);
-                                sleep_ms += wait_until(frame_started + offset);
+                        let batch_size = if packet_pacing.uses_batch() {
+                            batch_size_for_frame(packet_count, frame_interval, PACING_TICK)
+                        } else {
+                            packet_count
+                        };
+                        let mut packet_index = 0usize;
+                        let mut tick_index = 0u32;
+                        let mut schedule_origin = frame_started;
+                        while packet_index < frame.packets.len() {
+                            if packet_pacing.uses_batch() {
+                                let mut target = schedule_origin
+                                    + PACING_TICK.saturating_mul(tick_index);
+                                let now = Instant::now();
+                                let late = now.checked_duration_since(target).unwrap_or_default();
+                                if late > PACING_TICK.saturating_mul(2) {
+                                    pacing_overrun_ticks += 1;
+                                    schedule_origin = now;
+                                    tick_index = 0;
+                                    target = now;
+                                }
+                                let late_us = late.as_secs_f64() * 1_000_000.0;
+                                pacing_late_us_total += late_us;
+                                pacing_late_us_max = pacing_late_us_max.max(late_us);
+                                sleep_ms += wait_until(target);
                             }
-                            match socket.send(packet) {
-                                Ok(sent) if sent == packet.len() => {
-                                    packets_sent += 1;
-                                    bytes_sent += sent as u64;
-                                }
-                                Ok(sent) => {
-                                    failure = Some(format!(
-                                        "UDP short send to {worker_target}: expected {}, sent {sent}",
-                                        packet.len()
-                                    ));
-                                    break;
-                                }
-                                Err(err) => {
-                                    failure = Some(format!(
-                                        "UDP send to {worker_target} failed: {err}"
-                                    ));
-                                    break;
+                            let batch_end = (packet_index + batch_size).min(frame.packets.len());
+                            let mut sent_in_batch = 0u64;
+                            for packet in &frame.packets[packet_index..batch_end] {
+                                match socket.send(packet) {
+                                    Ok(sent) if sent == packet.len() => {
+                                        packets_sent += 1;
+                                        sent_in_batch += 1;
+                                        bytes_sent += sent as u64;
+                                    }
+                                    Ok(sent) => {
+                                        failure = Some(format!(
+                                            "UDP short send to {worker_target}: expected {}, sent {sent}",
+                                            packet.len()
+                                        ));
+                                        break;
+                                    }
+                                    Err(err) => {
+                                        failure = Some(format!(
+                                            "UDP send to {worker_target} failed: {err}"
+                                        ));
+                                        break;
+                                    }
                                 }
                             }
+                            if packet_pacing.uses_batch() {
+                                pacing_batches += 1;
+                                pacing_batch_packets += sent_in_batch;
+                                pacing_batch_max = pacing_batch_max.max(sent_in_batch);
+                            }
+                            if failure.is_some() {
+                                break;
+                            }
+                            packet_index = batch_end;
+                            tick_index = tick_index.saturating_add(1);
                         }
                         let elapsed = frame_started.elapsed();
                         let mut counters = match worker_counters.lock() {
@@ -197,6 +258,14 @@ mod platform {
                             .max_packets_per_frame
                             .max(frame.packets.len() as u64);
                         counters.pacing_sleep_ms_total += sleep_ms;
+                        counters.pacing_batches += pacing_batches;
+                        counters.pacing_batch_packets += pacing_batch_packets;
+                        counters.pacing_batch_max =
+                            counters.pacing_batch_max.max(pacing_batch_max);
+                        counters.pacing_overrun_ticks += pacing_overrun_ticks;
+                        counters.pacing_late_us_total += pacing_late_us_total;
+                        counters.pacing_late_us_max =
+                            counters.pacing_late_us_max.max(pacing_late_us_max);
                         if elapsed > frame_interval {
                             counters.pacing_overrun_frames += 1;
                         }
@@ -734,13 +803,27 @@ mod platform {
         started.elapsed().as_secs_f64() * 1000.0
     }
 
+    fn batch_size_for_frame(
+        packet_count: usize,
+        frame_interval: Duration,
+        tick: Duration,
+    ) -> usize {
+        if packet_count == 0 || tick.is_zero() {
+            return packet_count.max(1);
+        }
+        let ticks = frame_interval.as_nanos().div_ceil(tick.as_nanos()).max(1);
+        packet_count.div_ceil(ticks.min(usize::MAX as u128) as usize)
+    }
+
     fn transport_metrics_fragment(
         observer: &UdpObserver,
         sent: &SendCounters,
         packets_per_second: f64,
     ) -> String {
         format!(
-            r#""udp_send_buffer_bytes":{},"udp_payload_size":{},"packets_per_second":{:.2},"avg_packets_per_frame":{:.3},"max_packets_per_frame":{},"packet_pacing":"{}","packet_pacing_sleep_ms_avg":{:.3},"packet_pacing_overrun_frames":{},"send_errors":{},"fec_mode":"{}","fec_packets_sent":{},"fec_overhead_packets":{},"fec_overhead_bytes":{},"fec_overhead_ratio":{:.6},"data_payload_size":{},"keyframe_interval_sec":{:.3},"keyframe_interval_applied":{},"keyframes_sent":{},{}"#,
+            r#""udp_send_buffer_bytes":{},"udp_send_buffer_bytes_requested":{},"udp_send_buffer_bytes_actual":{},"udp_payload_size":{},"packets_per_second":{:.2},"avg_packets_per_frame":{:.3},"max_packets_per_frame":{},"packet_pacing":"{}","packet_pacing_mode":"{}","packet_pacing_tick_ms":{:.3},"packet_pacing_batch_avg":{:.3},"packet_pacing_batch_max":{},"packet_pacing_overrun_ticks":{},"packet_pacing_late_us_avg":{:.3},"packet_pacing_late_us_max":{:.3},"packet_pacing_sleep_ms_avg":{:.3},"packet_pacing_overrun_frames":{},"send_errors":{},"fec_mode":"{}","fec_packets_sent":{},"fec_overhead_packets":{},"fec_overhead_bytes":{},"fec_overhead_ratio":{:.6},"data_payload_size":{},"keyframe_interval_sec":{:.3},"keyframe_interval_applied":{},"keyframes_sent":{},{}"#,
+            observer.udp_send_buffer_bytes,
+            crate::udp_socket::DEFAULT_UDP_BUFFER_BYTES,
             observer.udp_send_buffer_bytes,
             observer.udp_payload_size,
             packets_per_second,
@@ -751,6 +834,25 @@ mod platform {
             },
             sent.max_packets_per_frame,
             observer.packet_pacing.name(),
+            observer.packet_pacing.effective_name(),
+            if observer.packet_pacing.uses_batch() {
+                PACING_TICK.as_secs_f64() * 1000.0
+            } else {
+                0.0
+            },
+            if sent.pacing_batches == 0 {
+                0.0
+            } else {
+                sent.pacing_batch_packets as f64 / sent.pacing_batches as f64
+            },
+            sent.pacing_batch_max,
+            sent.pacing_overrun_ticks,
+            if sent.pacing_batches == 0 {
+                0.0
+            } else {
+                sent.pacing_late_us_total / sent.pacing_batches as f64
+            },
+            sent.pacing_late_us_max,
             average_ms(sent.pacing_sleep_ms_total, sent.frames_sent),
             sent.pacing_overrun_frames,
             sent.send_errors,
@@ -830,6 +932,15 @@ mod platform {
     }
 
     pub fn run_self_test() -> Result<(), String> {
+        let batch = batch_size_for_frame(
+            120,
+            Duration::from_nanos(1_000_000_000 / 60),
+            Duration::from_millis(1),
+        );
+        if batch == 0 || batch > 120 || batch_size_for_frame(0, Duration::ZERO, Duration::ZERO) == 0
+        {
+            return Err("batch pacing calculation failed".to_string());
+        }
         if evaluate_keyframe_interval(true, 30, Some(30.0), 0).is_some() {
             return Err("matching IDR interval was reported as a warning".to_string());
         }

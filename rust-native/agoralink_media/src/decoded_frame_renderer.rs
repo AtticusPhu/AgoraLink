@@ -63,6 +63,15 @@ impl OwnedBgraFrame {
         window.render_bgra_with_stride(&self.pixels, self.width, self.height, self.stride)
     }
 
+    pub fn render_for_frame(
+        &self,
+        window: &mut GdiViewerWindow,
+        frame_id: u64,
+    ) -> Result<(), String> {
+        window.prepare_video(self.width, self.height, Some(frame_id))?;
+        self.render(window)
+    }
+
     pub fn dump_raw(&self, directory: &Path, index: u64) -> Result<(), String> {
         fs::create_dir_all(directory)
             .map_err(|err| format!("create debug frame directory failed: {err}"))?;
