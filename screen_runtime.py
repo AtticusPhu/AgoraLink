@@ -42,6 +42,17 @@ FFMPEG_MISSING_MESSAGE = (
 )
 RUST_NATIVE_MISSING_MESSAGE = "Rust native media executable not found"
 RUST_NATIVE_VIDEO_ONLY_MESSAGE = "Rust native backend currently supports video only"
+NATIVE_LITE_FLAVOR = "native_lite"
+FULL_PACKAGE_FLAVOR = "full"
+SOURCE_PACKAGE_FLAVOR = "source"
+NATIVE_LITE_FFMPEG_UNAVAILABLE_MESSAGE = (
+    "FFmpeg backend is unavailable in Native Lite package. "
+    "Switched to Rust native video backend."
+)
+NATIVE_LITE_VIDEO_ONLY_MESSAGE = (
+    "Native Lite currently supports video-only screen sharing. "
+    "System audio requires the Full package with FFmpeg backend."
+)
 
 class ScreenRuntime:
     def __init__(
@@ -179,12 +190,12 @@ class ScreenRuntime:
                 if not native_exe:
                     return self._set_error(RUST_NATIVE_MISSING_MESSAGE)
                 if audio_requested:
-                    audio_notice = RUST_NATIVE_VIDEO_ONLY_MESSAGE
+                    audio_notice = self.native_video_only_message()
                     audio_config = {
                         "enabled": False,
                         "mode": "none",
                         "state": "video_only",
-                        "error": RUST_NATIVE_VIDEO_ONLY_MESSAGE,
+                        "error": audio_notice,
                     }
                 cmd = self._build_native_sender_command(host=host, port=port, native_exe=native_exe)
                 self.last_command = list(cmd)
@@ -575,6 +586,7 @@ class ScreenRuntime:
         ffmpeg = self._find_media_tool("ffmpeg")
         ffplay = self._find_media_tool("ffplay")
         native = self._find_native_media_exe()
+        package_info = self.screen_package_info()
         ffmpeg_ok = bool(ffmpeg)
         ffplay_ok = bool(ffplay)
         native_ok = bool(native)
@@ -593,10 +605,42 @@ class ScreenRuntime:
             "ffplay_path": str(ffplay or ""),
             "rust_native_path": str(native or ""),
             "native_media_path": str(native or ""),
+            "package_flavor": package_info["package_flavor"],
+            "native_lite": package_info["native_lite"],
+            "bundled_ffmpeg_available": package_info["bundled_ffmpeg_available"],
+            "screen_backend_default": package_info["screen_backend_default"],
+            "native_screen_video_only": package_info["native_screen_video_only"],
             "error": "" if not missing else self._missing_tool_error(missing),
             "rust_error": "" if native_ok else RUST_NATIVE_MISSING_MESSAGE,
             "install_hint": FFMPEG_INSTALL_HINT,
         }
+
+    def screen_package_info(self) -> Dict[str, object]:
+        native = self._find_native_media_exe()
+        bundled_ffmpeg = self._find_bundled_media_tool("ffmpeg")
+        bundled_ffplay = self._find_bundled_media_tool("ffplay")
+        bundled_ffmpeg_available = bool(bundled_ffmpeg and bundled_ffplay)
+        if bool(getattr(sys, "frozen", False)):
+            package_flavor = NATIVE_LITE_FLAVOR if not bundled_ffmpeg_available else FULL_PACKAGE_FLAVOR
+        else:
+            package_flavor = SOURCE_PACKAGE_FLAVOR
+        return {
+            "package_flavor": package_flavor,
+            "native_lite": package_flavor == NATIVE_LITE_FLAVOR,
+            "rust_native_available": bool(native),
+            "native_media_ok": bool(native),
+            "rust_native_path": str(native or ""),
+            "bundled_ffmpeg_available": bundled_ffmpeg_available,
+            "bundled_ffmpeg_path": str(bundled_ffmpeg or ""),
+            "bundled_ffplay_path": str(bundled_ffplay or ""),
+            "screen_backend_default": SCREEN_BACKEND_RUST if package_flavor == NATIVE_LITE_FLAVOR else SCREEN_BACKEND_FFMPEG,
+            "native_screen_video_only": True,
+        }
+
+    def native_video_only_message(self) -> str:
+        if bool(self.screen_package_info().get("native_lite")):
+            return NATIVE_LITE_VIDEO_ONLY_MESSAGE
+        return RUST_NATIVE_VIDEO_ONLY_MESSAGE
 
     def _missing_tool_error(self, missing: List[str]) -> str:
         names = ", ".join(str(name or "").strip() for name in missing if str(name or "").strip())
@@ -1010,6 +1054,21 @@ class ScreenRuntime:
                 return str(Path(found).resolve())
 
         for base in self._winget_ffmpeg_dirs():
+            found = self._find_tool_in_dir(base, exe_names)
+            if found:
+                return found
+        return ""
+
+    def _find_bundled_media_tool(self, name: str) -> str:
+        exe_names = self._tool_executable_names(name)
+        dirs: List[Path] = []
+        if bool(getattr(sys, "frozen", False)):
+            dirs.extend(self._pyinstaller_internal_ffmpeg_dirs())
+            dirs.extend(self._pyinstaller_meipass_ffmpeg_dirs())
+            dirs.extend(self._exe_sibling_ffmpeg_dirs())
+        else:
+            dirs.extend(self._source_ffmpeg_dirs())
+        for base in dirs:
             found = self._find_tool_in_dir(base, exe_names)
             if found:
                 return found

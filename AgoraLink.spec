@@ -1,5 +1,6 @@
 ﻿# -*- mode: python ; coding: utf-8 -*-
 
+import os
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, copy_metadata
@@ -85,8 +86,11 @@ fonts_dir = project_dir / 'assets' / 'fonts'
 if fonts_dir.exists():
     datas.append((str(fonts_dir), 'assets/fonts'))
 
+package_flavor = str(os.environ.get('AGORALINK_PACKAGE_FLAVOR') or '').strip().lower()
+include_ffmpeg = package_flavor != 'native_lite'
+
 ffmpeg_dir = project_dir / 'tools' / 'ffmpeg'
-if ffmpeg_dir.exists():
+if include_ffmpeg and ffmpeg_dir.exists():
     datas.append((str(ffmpeg_dir), 'tools/ffmpeg'))
 
 rust_media_exe = project_dir / 'rust-native' / 'agoralink_media' / 'target' / 'release' / 'agoralink_media.exe'

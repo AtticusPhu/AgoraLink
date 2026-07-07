@@ -310,7 +310,11 @@ from screen_profile import (
     profile_id_from_info,
     profile_info,
 )
-from screen_runtime import ScreenRuntime
+from screen_runtime import (
+    NATIVE_LITE_FFMPEG_UNAVAILABLE_MESSAGE,
+    NATIVE_LITE_VIDEO_ONLY_MESSAGE,
+    ScreenRuntime,
+)
 from diagnostic_export import export_diagnostic_bundle
 from file_packaging import package_files_to_zip
 from port_utils import find_available_udp_port, udp_port_status, udp_ports_status
@@ -2133,7 +2137,12 @@ class RUDPTransferRoot(BoxLayout):
         self.gui_config = load_gui_config()
         self.auto_package_multi_selection = bool(self.gui_config.get("auto_package_multi_selection", True))
         self.share_system_audio = bool(self.gui_config.get("screen_share_system_audio", False))
-        self.screen_backend = self._normalize_screen_backend(self.gui_config.get("screen_backend", SCREEN_BACKEND_FFMPEG))
+        self.screen_package_info = self._screen_package_capabilities()
+        self.screen_backend_notice = ""
+        self.screen_backend = self._coerce_screen_backend_for_package(
+            self.gui_config.get("screen_backend", self._default_screen_backend()),
+            persist=True,
+        )
         self.current_chat_mode = "group"
         self.current_group_id = ""
         self.current_peer_id = ""
@@ -2165,7 +2174,7 @@ class RUDPTransferRoot(BoxLayout):
         self.screen_share_current_port: Optional[int] = None
         self.screen_share_selected_profile = ""
         self.screen_share_current_audio: Dict[str, object] = {"enabled": False, "mode": "none"}
-        self.screen_share_current_backend = str(self.screen_backend or SCREEN_BACKEND_FFMPEG)
+        self.screen_share_current_backend = str(self.screen_backend or self._default_screen_backend())
         self.current_screen_peer = ""
         self.current_screen_profile = ""
         self.current_screen_port: Optional[int] = None
@@ -2670,6 +2679,8 @@ class RUDPTransferRoot(BoxLayout):
         )
         bind_label_wrap(self.screen_share_status_label)
         center.add_widget(self.screen_share_status_label)
+        if str(getattr(self, "screen_backend_notice", "") or "").strip():
+            Clock.schedule_once(lambda _dt: self._set_screen_share_status(str(self.screen_backend_notice)), 0)
         if UIRoundedCard is not None and ui_component_color is not None:
             input_line = UIRoundedCard(
                 orientation="horizontal",
@@ -4139,14 +4150,59 @@ class RUDPTransferRoot(BoxLayout):
     def _screen_audio_enabled(self) -> bool:
         return bool(getattr(self, "share_system_audio", False))
 
-    def _normalize_screen_backend(self, backend: object) -> str:
-        value = str(backend or SCREEN_BACKEND_FFMPEG).strip().lower()
+    def _screen_package_capabilities(self) -> Dict[str, object]:
+        try:
+            runtime = getattr(self.app, "screen_runtime", None) or ScreenRuntime()
+            return dict(runtime.screen_package_info())
+        except Exception:
+            return {
+                "package_flavor": "unknown",
+                "native_lite": False,
+                "rust_native_available": False,
+                "bundled_ffmpeg_available": False,
+                "screen_backend_default": SCREEN_BACKEND_FFMPEG,
+                "native_screen_video_only": True,
+            }
+
+    def _screen_package_snapshot(self) -> Dict[str, object]:
+        info = dict(getattr(self, "screen_package_info", None) or {})
+        if not info:
+            info = self._screen_package_capabilities()
+            self.screen_package_info = dict(info)
+        return info
+
+    def _native_lite_package(self) -> bool:
+        return bool(self._screen_package_snapshot().get("native_lite"))
+
+    def _default_screen_backend(self) -> str:
+        default = str(self._screen_package_snapshot().get("screen_backend_default") or "").strip().lower()
+        return default if default in SCREEN_BACKEND_VALUES else SCREEN_BACKEND_FFMPEG
+
+    def _normalize_screen_backend(self, backend: object, default: object = None) -> str:
+        fallback = str(default or self._default_screen_backend() or SCREEN_BACKEND_FFMPEG).strip().lower()
+        if fallback not in SCREEN_BACKEND_VALUES:
+            fallback = SCREEN_BACKEND_FFMPEG
+        value = str(backend or fallback).strip().lower()
         if value not in SCREEN_BACKEND_VALUES:
-            return SCREEN_BACKEND_FFMPEG
+            return fallback
+        return value
+
+    def _coerce_screen_backend_for_package(self, backend: object, *, persist: bool = False) -> str:
+        value = self._normalize_screen_backend(backend)
+        package = self._screen_package_snapshot()
+        if bool(package.get("native_lite")) and value == SCREEN_BACKEND_FFMPEG and not bool(package.get("bundled_ffmpeg_available")):
+            value = SCREEN_BACKEND_RUST
+            self.screen_backend_notice = NATIVE_LITE_FFMPEG_UNAVAILABLE_MESSAGE
+            if persist:
+                try:
+                    self.gui_config["screen_backend"] = value
+                    save_gui_config(self.gui_config)
+                except Exception:
+                    pass
         return value
 
     def _screen_backend(self) -> str:
-        value = self._normalize_screen_backend(getattr(self, "screen_backend", SCREEN_BACKEND_FFMPEG))
+        value = self._coerce_screen_backend_for_package(getattr(self, "screen_backend", self._default_screen_backend()))
         self.screen_backend = value
         return value
 
@@ -4161,11 +4217,12 @@ class RUDPTransferRoot(BoxLayout):
     def _screen_audio_for_backend(self, backend: object, audio: Dict[str, object]) -> Dict[str, object]:
         backend_name = self._normalize_screen_backend(backend)
         if backend_name == SCREEN_BACKEND_RUST and bool((audio or {}).get("enabled")):
+            message = NATIVE_LITE_VIDEO_ONLY_MESSAGE if self._native_lite_package() else "Rust native backend currently supports video only"
             return {
                 "enabled": False,
                 "mode": "none",
                 "state": "video_only",
-                "error": "Rust native backend currently supports video only",
+                "error": message,
             }
         return dict(audio or {"enabled": False, "mode": "none"})
 
@@ -5420,6 +5477,17 @@ class RUDPTransferRoot(BoxLayout):
         )
         backend_line.add_widget(backend_spinner)
         content.add_widget(backend_line)
+        if self._native_lite_package():
+            native_lite_note = make_label(
+                text="Native Lite: Rust native video backend is the default. FFmpeg/system audio requires the Full package.",
+                size_hint_y=None,
+                height=dp(42),
+                halign="left",
+                valign="middle",
+                color=THEME["muted_text"],
+            )
+            bind_label_wrap(native_lite_note)
+            content.add_widget(native_lite_note)
         note = make_label(
             text="诊断日志已移到“诊断”窗口。普通设置只保留日常选项。",
             size_hint_y=None,
@@ -5439,7 +5507,9 @@ class RUDPTransferRoot(BoxLayout):
             old_backend = self._screen_backend()
             self.auto_package_multi_selection = bool(package_checkbox.active)
             self.share_system_audio = bool(audio_checkbox.active)
-            self.screen_backend = self._normalize_screen_backend(backend_spinner.text)
+            self.screen_backend = self._coerce_screen_backend_for_package(backend_spinner.text, persist=False)
+            if backend_spinner.text != self.screen_backend:
+                backend_spinner.text = self.screen_backend
             try:
                 self.gui_config["auto_package_multi_selection"] = bool(self.auto_package_multi_selection)
                 self.gui_config["screen_share_system_audio"] = bool(self.share_system_audio)
@@ -5451,6 +5521,8 @@ class RUDPTransferRoot(BoxLayout):
                 self._set_screen_share_status("共享系统音频设置将在下次投屏生效" if self.lang == "zh" else "System audio setting applies to the next screen share")
             if old_backend != self.screen_backend and self._screen_share_button_active():
                 self._set_screen_share_status("Screen backend setting applies to the next screen share")
+            if str(getattr(self, "screen_backend_notice", "") or "").strip():
+                self._set_screen_share_status(str(self.screen_backend_notice))
         buttons.add_widget(make_button("primary", text="应用", on_release=_apply_theme))
         export_btn = make_button("secondary", text="导出诊断包")
         export_btn.bind(on_release=lambda *_: self.export_diagnostic_logs_async(log_box=self.sender_log_box, button=export_btn))
@@ -5469,6 +5541,11 @@ class RUDPTransferRoot(BoxLayout):
             "platform": sys.platform,
             "frozen": FROZEN,
             "app_dir": str(APP_DIR),
+            "package_flavor": str(self._screen_package_snapshot().get("package_flavor") or ""),
+            "rust_native_available": bool(self._screen_package_snapshot().get("rust_native_available")),
+            "bundled_ffmpeg_available": bool(self._screen_package_snapshot().get("bundled_ffmpeg_available")),
+            "screen_backend_default": str(self._screen_package_snapshot().get("screen_backend_default") or ""),
+            "native_screen_video_only": bool(self._screen_package_snapshot().get("native_screen_video_only", True)),
             "user_data_dir": str(user_data_dir()),
             "chat_unlocked": bool(getattr(self, "chat_unlocked", False)),
             "local_peer_id": str(getattr(self, "chat_local_peer_id", "") or ""),
@@ -5939,6 +6016,11 @@ class RUDPTransferRoot(BoxLayout):
             deps = dict(self._screen_runtime().check_dependencies())
         except Exception as exc:
             deps = {"ok": False, "error": str(exc)}
+        package_info = dict(deps or {})
+        try:
+            package_info.update(self._screen_package_snapshot())
+        except Exception:
+            pass
         try:
             receiver_running = bool(getattr(self, "receiver_worker", None) and self.receiver_worker.is_running())
         except Exception:
@@ -5956,12 +6038,33 @@ class RUDPTransferRoot(BoxLayout):
         return {
             "runtime_state": runtime_state,
             "dependencies": deps,
+            "package_flavor": str(package_info.get("package_flavor") or ""),
+            "rust_native_available": bool(package_info.get("rust_native_available") or package_info.get("rust_native_ok") or package_info.get("native_media_ok")),
+            "bundled_ffmpeg_available": bool(package_info.get("bundled_ffmpeg_available")),
+            "screen_backend_default": str(package_info.get("screen_backend_default") or self._default_screen_backend()),
+            "native_screen_video_only": bool(package_info.get("native_screen_video_only", True)),
             "screen_backend": self._screen_backend(),
             "receiver_running": receiver_running,
             "main_port": main_port,
             "screen_ports": screen_ports,
             "recent_errors": self._recent_error_summary(),
         }
+
+    def _diagnostic_package_summary(self, snapshot: Dict[str, object]) -> Tuple[str, str, str]:
+        flavor = str(snapshot.get("package_flavor") or "unknown")
+        rust_ok = bool(snapshot.get("rust_native_available"))
+        bundled_ffmpeg = bool(snapshot.get("bundled_ffmpeg_available"))
+        default_backend = self._normalize_screen_backend(snapshot.get("screen_backend_default") or self._default_screen_backend())
+        video_only = bool(snapshot.get("native_screen_video_only"))
+        detail = (
+            f"package_flavor={flavor}; rust_native_available={str(rust_ok).lower()}; "
+            f"bundled_ffmpeg_available={str(bundled_ffmpeg).lower()}; "
+            f"screen_backend_default={default_backend}; "
+            f"native_screen_video_only={str(video_only).lower()}"
+        )
+        if flavor == "native_lite":
+            return "Native Lite", detail, "neutral" if rust_ok and default_backend == SCREEN_BACKEND_RUST else "warning"
+        return "Package", detail, "neutral"
 
     def _diagnostic_udp_9999_summary(self, snapshot: Dict[str, object]) -> Tuple[str, str, str]:
         main = dict(snapshot.get("main_port") or {})
@@ -6586,7 +6689,7 @@ class RUDPTransferRoot(BoxLayout):
                 return
             audio_config = self._screen_audio_for_backend(backend, self._screen_audio_config())
             if backend == SCREEN_BACKEND_RUST and bool(self._screen_audio_config().get("enabled")):
-                self._set_screen_share_status("Rust native backend currently supports video only")
+                self._set_screen_share_status(str(audio_config.get("error") or NATIVE_LITE_VIDEO_ONLY_MESSAGE))
             peer_id = str(self.current_peer_id or "")
             peer_label = self._screen_peer_label(peer_id)
             self._append_debug_line(
@@ -7189,6 +7292,7 @@ class RUDPTransferRoot(BoxLayout):
             snapshot = self._diagnostic_snapshot()
             screen_port_title = "投屏端口 55000-55999" if self._screen_backend() == SCREEN_BACKEND_RUST else "投屏端口 50020-50025"
             cards = [
+                ("Package",) + self._diagnostic_package_summary(snapshot),
                 ("接收端状态",) + self._diagnostic_receiver_summary(snapshot),
                 ("UDP 9999 状态",) + self._diagnostic_udp_9999_summary(snapshot),
                 (screen_port_title,) + self._diagnostic_screen_ports_summary(snapshot),

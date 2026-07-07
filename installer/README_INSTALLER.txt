@@ -18,10 +18,13 @@ On first run, allow Windows Firewall access for private networks.
 If manual firewall setup is needed, run allow_firewall_udp_9999_admin.bat as Administrator.
 
 Bundled media tools:
-The packaged app expects FFmpeg under:
+The full package expects FFmpeg under:
 _internal\tools\ffmpeg\bin
+Native Lite does not include ffmpeg.exe, ffplay.exe, or ffprobe.exe.
 The packaged app expects Rust native media under:
 _internal\tools\agoralink_media\agoralink_media.exe
+Native Lite screen sharing uses the Rust native video backend and is currently video-only.
+System audio screen sharing requires the full package with FFmpeg backend.
 
 Uninstall behavior:
 The uninstaller removes the installed program files and shortcuts.
