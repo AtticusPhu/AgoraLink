@@ -12,7 +12,7 @@ from typing import Dict, Optional
 
 
 APP_NAME = "AgoraLink"
-APP_VERSION = "v0.0.4"
+APP_VERSION = "v0.0.9"
 IS_WINDOWS = os.name == "nt"
 FROZEN = bool(getattr(sys, "frozen", False))
 APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
