@@ -17,6 +17,10 @@ pub struct H264RecvViewConfig {
     pub render_scale: crate::win32_gdi_viewer::RenderScaleMode,
     pub window_mode: crate::win32_gdi_viewer::WindowMode,
     pub render_backend: crate::video_renderer::RenderBackend,
+    pub repair_mode: crate::repair::RepairMode,
+    pub nack_delay_ms: u64,
+    pub nack_repeat_ms: u64,
+    pub nack_max_rounds: u8,
     pub mode: H264RecvViewMode,
     pub verbose: bool,
 }
@@ -29,7 +33,7 @@ pub enum H264RecvViewMode {
 
 #[cfg(windows)]
 mod platform {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::io::{self, Write};
     use std::net::UdpSocket;
     use std::path::PathBuf;
@@ -219,6 +223,51 @@ mod platform {
         playout: PlayoutStats,
         playout_buffer_frames: usize,
         playout_delay_ms: u64,
+        repair_mode: crate::repair::RepairMode,
+        nack_packets_sent: u64,
+        nack_items_sent: u64,
+        nack_frames_requested: u64,
+        nack_rounds_sent: u64,
+        repair_packets_received: u64,
+        repair_packets_inserted: u64,
+        repair_duplicate_packets: u64,
+        repair_frames_completed: u64,
+        repair_send_errors: u64,
+        repair_deadline_missed: u64,
+        repair_wait_ms_total: f64,
+        repair_wait_ms_max: f64,
+        nack_candidate_frames: u64,
+        nack_suppressed_progressing_frames: u64,
+        nack_suppressed_too_early: u64,
+        nack_suppressed_already_requested: u64,
+        nack_suppressed_item_limit: u64,
+        nack_items_deduped: u64,
+        nack_items_per_requested_frame_total: u64,
+        nack_items_per_requested_frame_max: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct ReceiverRepairStats {
+        nack_packets_sent: u64,
+        nack_items_sent: u64,
+        nack_frames_requested: u64,
+        nack_rounds_sent: u64,
+        repair_packets_received: u64,
+        repair_packets_inserted: u64,
+        repair_duplicate_packets: u64,
+        repair_frames_completed: u64,
+        repair_send_errors: u64,
+        repair_deadline_missed: u64,
+        repair_wait_ms_total: f64,
+        repair_wait_ms_max: f64,
+        nack_candidate_frames: u64,
+        nack_suppressed_progressing_frames: u64,
+        nack_suppressed_too_early: u64,
+        nack_suppressed_already_requested: u64,
+        nack_suppressed_item_limit: u64,
+        nack_items_deduped: u64,
+        nack_items_per_requested_frame_total: u64,
+        nack_items_per_requested_frame_max: u64,
     }
 
     #[derive(Default)]
@@ -390,6 +439,10 @@ mod platform {
             config.max_inflight_frames,
             config.max_decode_queue,
             config.drop_damaged_gop,
+            config.repair_mode,
+            config.nack_delay_ms,
+            config.nack_repeat_ms,
+            config.nack_max_rounds,
         )?;
 
         if config.verbose {
@@ -560,6 +613,10 @@ mod platform {
         max_inflight_frames: usize,
         max_decode_queue: usize,
         drop_damaged_gop: bool,
+        repair_mode: crate::repair::RepairMode,
+        nack_delay_ms: u64,
+        nack_repeat_ms: u64,
+        nack_max_rounds: u8,
     ) -> Result<thread::JoinHandle<()>, String> {
         thread::Builder::new()
             .name("agoralink-h264-recv".to_string())
@@ -575,6 +632,10 @@ mod platform {
                     max_inflight_frames,
                     max_decode_queue,
                     drop_damaged_gop,
+                    repair_mode,
+                    nack_delay_ms,
+                    nack_repeat_ms,
+                    nack_max_rounds,
                 ) {
                     if let Ok(mut shared) = state.lock() {
                         shared.error = Some(err);
@@ -596,6 +657,10 @@ mod platform {
         max_inflight_frames: usize,
         max_decode_queue: usize,
         drop_damaged_gop: bool,
+        repair_mode: crate::repair::RepairMode,
+        nack_delay_ms: u64,
+        nack_repeat_ms: u64,
+        nack_max_rounds: u8,
     ) -> Result<(), String> {
         let mut reassembler = H264Reassembler::new(ReassemblyConfig {
             frame_timeout: Duration::from_millis(frame_timeout_ms),
@@ -608,21 +673,57 @@ mod platform {
         let mut previous_expired = 0u64;
         let mut playout = PlayoutBuffer::new(playout_delay_ms)?;
         let mut udp_recv_loop_overruns = 0u64;
+        let mut peer = None;
+        let mut requested_packets: HashSet<crate::repair::PacketKey> = HashSet::new();
+        let mut requested_frames: HashSet<u64> = HashSet::new();
+        let mut repair_started: HashMap<u64, Instant> = HashMap::new();
+        let mut repair_stats = ReceiverRepairStats::default();
 
         while !stop.load(Ordering::SeqCst) {
             let mut did_work = false;
             let mut datagrams_this_tick = 0usize;
             for _ in 0..MAX_DATAGRAMS_PER_TICK {
                 match socket.recv_from(&mut datagram) {
-                    Ok((length, _peer)) => {
+                    Ok((length, source_peer)) => {
+                        peer = Some(source_peer);
                         did_work = true;
                         datagrams_this_tick += 1;
                         let received_at = Instant::now();
+                        if repair_mode == crate::repair::RepairMode::Nack {
+                            if let Some((_session, key, flags)) =
+                                crate::repair::media_packet_key(&datagram[..length])
+                            {
+                                if flags & crate::FLAG_FEC == 0 && requested_packets.remove(&key) {
+                                    repair_stats.repair_packets_received += 1;
+                                    repair_stats.repair_packets_inserted += 1;
+                                }
+                            }
+                        }
                         match reassembler.accept_datagram(&datagram[..length], received_at) {
                             Ok(frames) => {
+                                for frame in &frames {
+                                    if requested_frames.remove(&frame.frame_id) {
+                                        repair_stats.repair_frames_completed += 1;
+                                        if let Some(started) =
+                                            repair_started.remove(&frame.frame_id)
+                                        {
+                                            let wait_ms = received_at
+                                                .saturating_duration_since(started)
+                                                .as_secs_f64()
+                                                * 1000.0;
+                                            repair_stats.repair_wait_ms_total += wait_ms;
+                                            repair_stats.repair_wait_ms_max =
+                                                repair_stats.repair_wait_ms_max.max(wait_ms);
+                                        }
+                                        requested_packets
+                                            .retain(|key| key.frame_id != frame.frame_id);
+                                    }
+                                }
                                 let reassembly_stats = reassembler.stats();
                                 let current_expired = reassembly_stats.frames_incomplete_expired;
                                 if current_expired > previous_expired {
+                                    repair_stats.repair_deadline_missed +=
+                                        current_expired - previous_expired;
                                     playout.clear_for_discontinuity();
                                     begin_queue_recovery(
                                         queue,
@@ -646,10 +747,65 @@ mod platform {
             }
 
             let now = Instant::now();
+            if repair_mode == crate::repair::RepairMode::Nack {
+                if let (Some(peer), Some(session_id)) = (peer, reassembler.session_id()) {
+                    let collection = reassembler.collect_nack_items(
+                        now,
+                        Duration::from_millis(nack_delay_ms),
+                        Duration::from_millis(nack_repeat_ms),
+                        nack_max_rounds,
+                        Duration::from_millis(playout_delay_ms.max(20)),
+                        crate::h264_reassembly::DEFAULT_NACK_ITEMS_PER_FRAME,
+                    );
+                    repair_stats.nack_candidate_frames += collection.stats.candidate_frames;
+                    repair_stats.nack_suppressed_progressing_frames +=
+                        collection.stats.suppressed_progressing_frames;
+                    repair_stats.nack_suppressed_too_early += collection.stats.suppressed_too_early;
+                    repair_stats.nack_suppressed_already_requested +=
+                        collection.stats.suppressed_already_requested;
+                    repair_stats.nack_suppressed_item_limit +=
+                        collection.stats.suppressed_item_limit;
+                    repair_stats.nack_items_deduped += collection.stats.items_deduped;
+                    repair_stats.nack_items_per_requested_frame_total +=
+                        collection.stats.items_per_requested_frame_total;
+                    repair_stats.nack_items_per_requested_frame_max = repair_stats
+                        .nack_items_per_requested_frame_max
+                        .max(collection.stats.items_per_requested_frame_max);
+                    let items = collection.items;
+                    if !items.is_empty() {
+                        let unique_frames = items
+                            .iter()
+                            .map(|item| item.frame_id)
+                            .collect::<HashSet<_>>();
+                        repair_stats.nack_frames_requested += collection.stats.requested_frames;
+                        repair_stats.nack_rounds_sent += 1;
+                        requested_frames.extend(unique_frames);
+                        for frame_id in &requested_frames {
+                            repair_started.entry(*frame_id).or_insert(now);
+                        }
+                        requested_packets.extend(items.iter().copied());
+                        for chunk in items.chunks(crate::repair::MAX_NACK_ITEMS) {
+                            let nack = crate::repair::NackPacket {
+                                session_id,
+                                items: chunk.to_vec(),
+                            }
+                            .encode()?;
+                            match socket.send_to(&nack, peer) {
+                                Ok(sent) if sent == nack.len() => {
+                                    repair_stats.nack_packets_sent += 1;
+                                    repair_stats.nack_items_sent += chunk.len() as u64;
+                                }
+                                _ => repair_stats.repair_send_errors += 1,
+                            }
+                        }
+                    }
+                }
+            }
             let frames = reassembler.expire(now);
             let reassembly_stats = reassembler.stats();
             let current_expired = reassembly_stats.frames_incomplete_expired;
             if current_expired > previous_expired {
+                repair_stats.repair_deadline_missed += current_expired - previous_expired;
                 playout.clear_for_discontinuity();
                 begin_queue_recovery(
                     queue,
@@ -661,12 +817,28 @@ mod platform {
             }
             playout.push_frames(frames, now);
             enqueue_network_frames(playout.pop_due(now), queue, max_decode_queue)?;
-            update_network_snapshot(state, &reassembler, queue, &playout, udp_recv_loop_overruns)?;
+            update_network_snapshot(
+                state,
+                &reassembler,
+                queue,
+                &playout,
+                udp_recv_loop_overruns,
+                repair_mode,
+                repair_stats,
+            )?;
             if !did_work {
                 thread::sleep(Duration::from_millis(1));
             }
         }
-        update_network_snapshot(state, &reassembler, queue, &playout, udp_recv_loop_overruns)
+        update_network_snapshot(
+            state,
+            &reassembler,
+            queue,
+            &playout,
+            udp_recv_loop_overruns,
+            repair_mode,
+            repair_stats,
+        )
     }
 
     fn enqueue_network_frames(
@@ -707,6 +879,8 @@ mod platform {
         queue: &Arc<Mutex<DecodeQueue>>,
         playout: &PlayoutBuffer,
         udp_recv_loop_overruns: u64,
+        repair_mode: crate::repair::RepairMode,
+        repair_stats: ReceiverRepairStats,
     ) -> Result<(), String> {
         let queue = queue
             .lock()
@@ -737,6 +911,27 @@ mod platform {
             playout: playout.stats(),
             playout_buffer_frames: playout.len(),
             playout_delay_ms: playout.delay_ms(),
+            repair_mode,
+            nack_packets_sent: repair_stats.nack_packets_sent,
+            nack_items_sent: repair_stats.nack_items_sent,
+            nack_frames_requested: repair_stats.nack_frames_requested,
+            nack_rounds_sent: repair_stats.nack_rounds_sent,
+            repair_packets_received: repair_stats.repair_packets_received,
+            repair_packets_inserted: repair_stats.repair_packets_inserted,
+            repair_duplicate_packets: repair_stats.repair_duplicate_packets,
+            repair_frames_completed: repair_stats.repair_frames_completed,
+            repair_send_errors: repair_stats.repair_send_errors,
+            repair_deadline_missed: repair_stats.repair_deadline_missed,
+            repair_wait_ms_total: repair_stats.repair_wait_ms_total,
+            repair_wait_ms_max: repair_stats.repair_wait_ms_max,
+            nack_candidate_frames: repair_stats.nack_candidate_frames,
+            nack_suppressed_progressing_frames: repair_stats.nack_suppressed_progressing_frames,
+            nack_suppressed_too_early: repair_stats.nack_suppressed_too_early,
+            nack_suppressed_already_requested: repair_stats.nack_suppressed_already_requested,
+            nack_suppressed_item_limit: repair_stats.nack_suppressed_item_limit,
+            nack_items_deduped: repair_stats.nack_items_deduped,
+            nack_items_per_requested_frame_total: repair_stats.nack_items_per_requested_frame_total,
+            nack_items_per_requested_frame_max: repair_stats.nack_items_per_requested_frame_max,
         };
         Ok(())
     }
@@ -1229,6 +1424,12 @@ mod platform {
         if config.debug_dump_limit == 0 {
             return Err("debug-dump-limit must be greater than zero".to_string());
         }
+        if !(1..=50).contains(&config.nack_delay_ms)
+            || !(1..=50).contains(&config.nack_repeat_ms)
+            || !(1..=10).contains(&config.nack_max_rounds)
+        {
+            return Err("invalid NACK timing configuration".to_string());
+        }
         Ok(())
     }
 
@@ -1255,7 +1456,7 @@ mod platform {
             .saturating_sub(previous.packets_received) as f64
             / elapsed_sec.max(0.001);
         format!(
-            r#""udp_recv_buffer_bytes":{},"udp_recv_buffer_bytes_requested":{},"udp_recv_buffer_bytes_actual":{},"packets_per_second":{:.2},"udp_recv_packets_per_second":{:.2},"udp_recv_loop_overruns":{},"complete_frame_queue_len":{},"complete_frame_queue_peak":{},"complete_frame_queue_drops":{},"reassembly_frames_active":{},"reassembly_packets_active":{},"reassembly_fast_path_enabled":true,"reassembly_allocations_estimate":{},"reassembly_complete_scan_count":{},"playout_delay_ms":{},"playout_buffer_frames":{},"playout_buffer_peak_frames":{},"playout_late_frames":{},"playout_dropped_late_frames":{},"playout_dropped_discontinuity_frames":{},"playout_delay_actual_ms_avg":{:.3},"playout_delay_actual_ms_max":{:.3},"decoder_input_fps":{:.2},"render_output_fps":{:.2},"decode_thread_fps":{:.2},"render_thread_fps":{:.2},"decoded_frame_queue_len":{},"decoded_frame_queue_peak":{},"decoded_frame_queue_drops":{},"decoded_frames_replaced_by_latest":{},"decoder_blocked_by_render_count":0,"frames_missing_packets":{},"frames_dropped_incomplete":{},"fec_mode":"{}","fec_packets_received":{},"fec_frames_recovered":{},"fec_packets_recovered":{},"fec_recovery_failed_multi_missing":{},"fec_recovery_failed_no_parity":{},"fec_recovery_failed_invalid":{},"frames_missing_after_fec":{},"frames_dropped_after_fec":{},"keyframe_recovery_count":{},"last_keyframe_id":{},"decoder_resets":{},"drop_damaged_gop":{},"damaged_gop_count":{},"frames_discarded_damaged_gop":{},"frames_discarded_waiting_keyframe":{},"waiting_keyframe_entries":{},"waiting_keyframe_exits":{},"idr_frames_received":{},"idr_frames_used_for_recovery":{},"non_idr_frames_discarded_waiting":{},"recovery_wait_ms_avg":{:.3},"recovery_wait_ms_max":{:.3},"recovery_wait_frames_avg":{:.3},"recovery_wait_frames_max":{},"next_decode_frame_id":{},"decode_gate_stalls":{},"decode_gate_gap_events":{},"decode_gate_gap_to_damage_ms_avg":{:.3},"decode_gate_gap_to_damage_ms_max":{:.3},"frames_buffered_waiting_order":{},"frames_discarded_decode_gate":{},"reorder_wait_ms":{},{}"#,
+            r#""udp_recv_buffer_bytes":{},"udp_recv_buffer_bytes_requested":{},"udp_recv_buffer_bytes_actual":{},"packets_per_second":{:.2},"udp_recv_packets_per_second":{:.2},"udp_recv_loop_overruns":{},"complete_frame_queue_len":{},"complete_frame_queue_peak":{},"complete_frame_queue_drops":{},"reassembly_frames_active":{},"reassembly_packets_active":{},"reassembly_fast_path_enabled":true,"reassembly_allocations_estimate":{},"reassembly_complete_scan_count":{},"playout_delay_ms":{},"playout_buffer_frames":{},"playout_buffer_peak_frames":{},"playout_late_frames":{},"playout_dropped_late_frames":{},"playout_dropped_discontinuity_frames":{},"playout_delay_actual_ms_avg":{:.3},"playout_delay_actual_ms_max":{:.3},"decoder_input_fps":{:.2},"render_output_fps":{:.2},"decode_thread_fps":{:.2},"render_thread_fps":{:.2},"decoded_frame_queue_len":{},"decoded_frame_queue_peak":{},"decoded_frame_queue_drops":{},"decoded_frames_replaced_by_latest":{},"decoder_blocked_by_render_count":0,"frames_missing_packets":{},"frames_dropped_incomplete":{},"fec_mode":"{}","fec_packets_received":{},"fec_frames_recovered":{},"fec_packets_recovered":{},"fec_recovery_failed_multi_missing":{},"fec_recovery_failed_no_parity":{},"fec_recovery_failed_invalid":{},"frames_missing_after_fec":{},"frames_dropped_after_fec":{},"keyframe_recovery_count":{},"last_keyframe_id":{},"decoder_resets":{},"drop_damaged_gop":{},"damaged_gop_count":{},"frames_discarded_damaged_gop":{},"frames_discarded_waiting_keyframe":{},"waiting_keyframe_entries":{},"waiting_keyframe_exits":{},"idr_frames_received":{},"idr_frames_used_for_recovery":{},"non_idr_frames_discarded_waiting":{},"recovery_wait_ms_avg":{:.3},"recovery_wait_ms_max":{:.3},"recovery_wait_frames_avg":{:.3},"recovery_wait_frames_max":{},"next_decode_frame_id":{},"decode_gate_stalls":{},"decode_gate_gap_events":{},"decode_gate_gap_to_damage_ms_avg":{:.3},"decode_gate_gap_to_damage_ms_max":{:.3},"frames_buffered_waiting_order":{},"frames_discarded_decode_gate":{},"reorder_wait_ms":{},{},{}"#,
             snapshot.udp_recv_buffer_bytes,
             snapshot.udp_recv_buffer_bytes_requested,
             snapshot.udp_recv_buffer_bytes,
@@ -1332,7 +1533,59 @@ mod platform {
             snapshot.completed_waiting,
             snapshot.reassembly.frames_discarded_decode_gate,
             snapshot.reassembly.reorder_wait_ms,
+            receiver_repair_fragment(snapshot),
             stats.render_state.json_fragment(),
+        )
+    }
+
+    fn receiver_repair_fragment(snapshot: NetworkSnapshot) -> String {
+        let repair_overhead_packets = snapshot.repair_packets_received;
+        let repair_overhead_base = snapshot
+            .reassembly
+            .packets_received
+            .saturating_sub(snapshot.repair_packets_received);
+        let repair_overhead_ratio = if repair_overhead_base == 0 {
+            0.0
+        } else {
+            repair_overhead_packets as f64 / repair_overhead_base as f64
+        };
+        let nack_items_per_requested_frame_avg = if snapshot.nack_frames_requested == 0 {
+            0.0
+        } else {
+            snapshot.nack_items_per_requested_frame_total as f64
+                / snapshot.nack_frames_requested as f64
+        };
+        format!(
+            r#""repair_mode":"{}","nack_packets_sent":{},"nack_items_sent":{},"nack_frames_requested":{},"nack_rounds_sent":{},"nack_candidate_frames":{},"nack_suppressed_progressing_frames":{},"nack_suppressed_too_early":{},"nack_suppressed_already_requested":{},"nack_suppressed_item_limit":{},"nack_items_deduped":{},"nack_items_per_requested_frame_avg":{:.3},"nack_items_per_requested_frame_max":{},"repair_packets_received":{},"repair_packets_inserted":{},"repair_duplicate_packets":{},"repair_late_packets":0,"repair_frames_completed":{},"repair_deadline_missed":{},"frames_missing_after_repair":{},"frames_dropped_after_repair":{},"repair_wait_ms_avg":{:.3},"repair_wait_ms_max":{:.3},"repair_send_errors":{},"repair_overhead_packets":{},"repair_overhead_ratio_vs_data":{:.6}"#,
+            snapshot.repair_mode.name(),
+            snapshot.nack_packets_sent,
+            snapshot.nack_items_sent,
+            snapshot.nack_frames_requested,
+            snapshot.nack_rounds_sent,
+            snapshot.nack_candidate_frames,
+            snapshot.nack_suppressed_progressing_frames,
+            snapshot.nack_suppressed_too_early,
+            snapshot.nack_suppressed_already_requested,
+            snapshot.nack_suppressed_item_limit,
+            snapshot.nack_items_deduped,
+            nack_items_per_requested_frame_avg,
+            snapshot.nack_items_per_requested_frame_max,
+            snapshot.repair_packets_received,
+            snapshot.repair_packets_inserted,
+            snapshot.repair_duplicate_packets,
+            snapshot.repair_frames_completed,
+            snapshot.repair_deadline_missed,
+            snapshot.reassembly.frames_missing_after_fec,
+            snapshot.reassembly.frames_dropped_after_fec,
+            if snapshot.repair_frames_completed == 0 {
+                0.0
+            } else {
+                snapshot.repair_wait_ms_total / snapshot.repair_frames_completed as f64
+            },
+            snapshot.repair_wait_ms_max,
+            snapshot.repair_send_errors,
+            repair_overhead_packets,
+            repair_overhead_ratio,
         )
     }
 

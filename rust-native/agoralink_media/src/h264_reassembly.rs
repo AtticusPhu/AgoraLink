@@ -6,6 +6,9 @@ use crate::fec::FecParity;
 use crate::h264_annex_b::{summarize_nals, AnnexBParameterSets};
 use crate::{MediaPacket, FLAG_FEC, FLAG_FEC_PROTECTED, FLAG_KEYFRAME, STREAM_VIDEO};
 
+pub const DEFAULT_NACK_ITEMS_PER_FRAME: usize = 32;
+const NACK_PLAYOUT_DEADLINE_GUARD: Duration = Duration::from_millis(100);
+
 #[derive(Clone, Copy, Debug)]
 pub struct ReassemblyConfig {
     pub frame_timeout: Duration,
@@ -59,6 +62,25 @@ impl ReassemblyStats {
             self.decode_gate_gap_to_damage_ms_total / self.decode_gate_gap_events as f64
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NackCollectionStats {
+    pub candidate_frames: u64,
+    pub suppressed_progressing_frames: u64,
+    pub suppressed_too_early: u64,
+    pub suppressed_already_requested: u64,
+    pub suppressed_item_limit: u64,
+    pub items_deduped: u64,
+    pub requested_frames: u64,
+    pub items_per_requested_frame_total: u64,
+    pub items_per_requested_frame_max: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct NackCollection {
+    pub items: Vec<crate::repair::PacketKey>,
+    pub stats: NackCollectionStats,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -229,11 +251,17 @@ struct FrameAssembly {
     missing_count: u16,
     received_bytes: usize,
     first_seen: Instant,
+    last_packet_arrival_time: Instant,
+    last_progress_time: Instant,
+    highest_received_packet_index: u16,
     flags: u16,
     timestamp_ms: u64,
     fec_parity: Option<FecParity>,
     fec_expected: bool,
     fec_invalid: bool,
+    last_nack_at: Option<Instant>,
+    nack_rounds: u8,
+    nack_requested_at: Vec<Option<Instant>>,
 }
 
 impl FrameAssembly {
@@ -245,11 +273,17 @@ impl FrameAssembly {
             missing_count: packet_count,
             received_bytes: 0,
             first_seen: now,
+            last_packet_arrival_time: now,
+            last_progress_time: now,
+            highest_received_packet_index: 0,
             flags: 0,
             timestamp_ms,
             fec_parity: None,
             fec_expected,
             fec_invalid: false,
+            last_nack_at: None,
+            nack_rounds: 0,
+            nack_requested_at: (0..packet_count).map(|_| None).collect(),
         }
     }
 }
@@ -353,6 +387,89 @@ impl H264Reassembler {
         self.inflight.len()
     }
 
+    pub fn collect_nack_items(
+        &mut self,
+        now: Instant,
+        delay: Duration,
+        repeat: Duration,
+        max_rounds: u8,
+        repair_window: Duration,
+        max_items_per_frame: usize,
+    ) -> NackCollection {
+        let mut collection = NackCollection::default();
+        let highest_complete_frame = self.complete.keys().next_back().copied();
+        let max_items_per_frame = max_items_per_frame.max(1);
+        for (&frame_id, frame) in &mut self.inflight {
+            if frame.missing_count == 0 || frame.nack_rounds >= max_rounds {
+                continue;
+            }
+            collection.stats.candidate_frames += 1;
+            let age = now.saturating_duration_since(frame.first_seen);
+            let since_progress = now.saturating_duration_since(frame.last_progress_time);
+            let higher_complete_frame_seen =
+                highest_complete_frame.is_some_and(|highest| highest > frame_id);
+            let repair_window = self.config.frame_timeout.min(repair_window);
+            let deadline_guard = Duration::from_millis(10).min(repair_window / 2);
+            let repair_deadline = repair_window.saturating_sub(deadline_guard);
+            if age >= repair_deadline {
+                continue;
+            }
+            let remaining_repair_time = repair_deadline.saturating_sub(age);
+            let near_playout_deadline = remaining_repair_time <= NACK_PLAYOUT_DEADLINE_GUARD;
+            let stalled = since_progress >= delay;
+            if !stalled && !higher_complete_frame_seen && !near_playout_deadline {
+                if age < delay {
+                    collection.stats.suppressed_too_early += 1;
+                } else {
+                    collection.stats.suppressed_progressing_frames += 1;
+                }
+                continue;
+            }
+            if frame
+                .last_nack_at
+                .is_some_and(|last| now.saturating_duration_since(last) < repeat)
+            {
+                collection.stats.suppressed_already_requested += u64::from(frame.missing_count);
+                collection.stats.items_deduped += u64::from(frame.missing_count);
+                continue;
+            }
+            let mut frame_items = 0u64;
+            for (packet_index, packet) in frame.packets.iter().enumerate() {
+                if packet.is_some() {
+                    continue;
+                }
+                if frame.nack_requested_at[packet_index]
+                    .is_some_and(|last| now.saturating_duration_since(last) < repeat)
+                {
+                    collection.stats.suppressed_already_requested += 1;
+                    collection.stats.items_deduped += 1;
+                    continue;
+                }
+                if frame_items as usize >= max_items_per_frame {
+                    collection.stats.suppressed_item_limit += 1;
+                    continue;
+                }
+                frame.nack_requested_at[packet_index] = Some(now);
+                collection.items.push(crate::repair::PacketKey {
+                    frame_id,
+                    packet_index: packet_index as u16,
+                });
+                frame_items += 1;
+            }
+            if frame_items > 0 {
+                frame.last_nack_at = Some(now);
+                frame.nack_rounds += 1;
+                collection.stats.requested_frames += 1;
+                collection.stats.items_per_requested_frame_total += frame_items;
+                collection.stats.items_per_requested_frame_max = collection
+                    .stats
+                    .items_per_requested_frame_max
+                    .max(frame_items);
+            }
+        }
+        collection
+    }
+
     pub fn completed_waiting_len(&self) -> usize {
         self.complete.len()
     }
@@ -437,6 +554,7 @@ impl H264Reassembler {
             self.stats.packets_invalid += 1;
             return;
         }
+        entry.last_packet_arrival_time = now;
         entry.flags |= packet.flags;
         entry.fec_expected |= is_fec_protected;
         if entry.packets[index].is_none() {
@@ -444,6 +562,10 @@ impl H264Reassembler {
             entry.packets[index] = Some(packet.payload);
             entry.received_count += 1;
             entry.missing_count -= 1;
+            entry.last_progress_time = now;
+            entry.highest_received_packet_index =
+                entry.highest_received_packet_index.max(packet.packet_index);
+            entry.nack_requested_at[index] = None;
             self.stats.reassembly_packets_active += 1;
             self.stats.reassembly_allocations_estimate += 1;
         }
@@ -484,6 +606,7 @@ impl H264Reassembler {
             self.stats.reassembly_packets_active += 1;
             self.stats.reassembly_allocations_estimate += 1;
         }
+        entry.last_packet_arrival_time = now;
         entry.fec_parity = Some(parity);
         entry.fec_expected = true;
         self.try_complete_frame(packet.frame_id);
@@ -503,6 +626,7 @@ impl H264Reassembler {
                                 frame.packets[missing_index] = Some(payload);
                                 frame.received_count += 1;
                                 frame.missing_count = 0;
+                                frame.nack_requested_at[missing_index] = None;
                                 self.stats.reassembly_packets_active += 1;
                                 self.stats.reassembly_allocations_estimate += 1;
                                 recovered_packet = true;
@@ -917,6 +1041,191 @@ pub fn run_self_test() -> Result<(), String> {
         || cleanup_stats.reassembly_packets_active != 0
     {
         return Err("completed frame did not release active reassembly state".to_string());
+    }
+
+    let nack_config = ReassemblyConfig {
+        frame_timeout: Duration::from_millis(500),
+        reorder_wait: ReorderWait::Fixed(Duration::from_millis(10)),
+        max_inflight_frames: 8,
+    };
+    let nack_payload = vec![0x41; 70_000];
+    let nack_packets = crate::packetize_media_payload(71, 0, 1000, &nack_payload, 0)?;
+    let mut progressing_reassembler = H264Reassembler::new(nack_config)?;
+    progressing_reassembler.accept_datagram(&nack_packets[0], now)?;
+    progressing_reassembler.accept_datagram(&nack_packets[2], now + Duration::from_millis(30))?;
+    let progressing = progressing_reassembler.collect_nack_items(
+        now + Duration::from_millis(31),
+        Duration::from_millis(20),
+        Duration::from_millis(20),
+        3,
+        Duration::from_millis(500),
+        DEFAULT_NACK_ITEMS_PER_FRAME,
+    );
+    if !progressing.items.is_empty() || progressing.stats.suppressed_progressing_frames == 0 {
+        return Err(
+            "NACK was not suppressed while frame packets were still progressing".to_string(),
+        );
+    }
+
+    let mut nack_reassembler = H264Reassembler::new(nack_config)?;
+    for (index, packet) in nack_packets.iter().enumerate() {
+        if index != 1 {
+            nack_reassembler.accept_datagram(packet, now)?;
+        }
+    }
+    let nack_collection = nack_reassembler.collect_nack_items(
+        now + Duration::from_millis(60),
+        Duration::from_millis(20),
+        Duration::from_millis(20),
+        3,
+        Duration::from_millis(500),
+        DEFAULT_NACK_ITEMS_PER_FRAME,
+    );
+    if nack_collection.items.len() != 1 || nack_collection.items[0].packet_index != 1 {
+        return Err("idle missing packet did not produce the expected NACK item".to_string());
+    }
+    let repeated = nack_reassembler.collect_nack_items(
+        now + Duration::from_millis(70),
+        Duration::from_millis(20),
+        Duration::from_millis(20),
+        3,
+        Duration::from_millis(500),
+        DEFAULT_NACK_ITEMS_PER_FRAME,
+    );
+    if !repeated.items.is_empty() || repeated.stats.suppressed_already_requested == 0 {
+        return Err("NACK repeat suppression was not enforced".to_string());
+    }
+    let repaired =
+        nack_reassembler.accept_datagram(&nack_packets[1], now + Duration::from_millis(80))?;
+    if repaired.len() != 1 || repaired[0].bytes != nack_payload {
+        return Err("NACK repair packet did not complete the frame".to_string());
+    }
+
+    let mut cap_reassembler = H264Reassembler::new(nack_config)?;
+    let cap_packets = crate::packetize_media_payload(72, 0, 1000, &[0x42; 70_000], 0)?;
+    cap_reassembler.accept_datagram(&cap_packets[0], now)?;
+    let capped = cap_reassembler.collect_nack_items(
+        now + Duration::from_millis(40),
+        Duration::from_millis(20),
+        Duration::from_millis(20),
+        3,
+        Duration::from_millis(500),
+        DEFAULT_NACK_ITEMS_PER_FRAME,
+    );
+    if capped.items.len() != DEFAULT_NACK_ITEMS_PER_FRAME || capped.stats.suppressed_item_limit == 0
+    {
+        return Err("NACK per-frame item limit was not enforced".to_string());
+    }
+
+    let mut near_deadline_reassembler = H264Reassembler::new(nack_config)?;
+    let deadline_packets = crate::packetize_media_payload(73, 0, 1000, &[0x43; 3000], 0)?;
+    near_deadline_reassembler.accept_datagram(&deadline_packets[0], now)?;
+    near_deadline_reassembler
+        .accept_datagram(&deadline_packets[2], now + Duration::from_millis(25))?;
+    let near_deadline = near_deadline_reassembler.collect_nack_items(
+        now + Duration::from_millis(26),
+        Duration::from_millis(100),
+        Duration::from_millis(20),
+        3,
+        Duration::from_millis(120),
+        DEFAULT_NACK_ITEMS_PER_FRAME,
+    );
+    if near_deadline.items.is_empty() {
+        return Err("NACK was not sent near the playout repair deadline".to_string());
+    }
+
+    let mut too_late_reassembler = H264Reassembler::new(nack_config)?;
+    let late_packets = crate::packetize_media_payload(74, 0, 1000, &[0x44; 3000], 0)?;
+    too_late_reassembler.accept_datagram(&late_packets[0], now)?;
+    let too_late = too_late_reassembler.collect_nack_items(
+        now + Duration::from_millis(115),
+        Duration::from_millis(20),
+        Duration::from_millis(20),
+        3,
+        Duration::from_millis(120),
+        DEFAULT_NACK_ITEMS_PER_FRAME,
+    );
+    if !too_late.items.is_empty() {
+        return Err("NACK was sent after the repair deadline".to_string());
+    }
+
+    let mut max_round_reassembler = H264Reassembler::new(nack_config)?;
+    let max_round_packets = crate::packetize_media_payload(75, 0, 1000, &[0x45; 3000], 0)?;
+    max_round_reassembler.accept_datagram(&max_round_packets[0], now)?;
+    let first_round = max_round_reassembler.collect_nack_items(
+        now + Duration::from_millis(40),
+        Duration::from_millis(20),
+        Duration::from_millis(20),
+        1,
+        Duration::from_millis(500),
+        DEFAULT_NACK_ITEMS_PER_FRAME,
+    );
+    if first_round.items.is_empty()
+        || !max_round_reassembler
+            .collect_nack_items(
+                now + Duration::from_millis(80),
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+                1,
+                Duration::from_millis(500),
+                DEFAULT_NACK_ITEMS_PER_FRAME,
+            )
+            .items
+            .is_empty()
+    {
+        return Err("NACK max rounds was not enforced".to_string());
+    }
+
+    use crate::fec::{packetize_frame, FecMode};
+    let fec_payload = vec![0x46; 5000];
+    let fec_packets = packetize_frame(
+        76,
+        0,
+        1000,
+        &fec_payload,
+        0,
+        FecMode::SingleXor,
+        crate::LEGACY_UDP_PAYLOAD_SIZE,
+    )?;
+    let mut fec_success_reassembler = H264Reassembler::new(nack_config)?;
+    for (index, packet) in fec_packets.packets.iter().enumerate() {
+        if index != 1 {
+            fec_success_reassembler.accept_datagram(packet, now)?;
+        }
+    }
+    if !fec_success_reassembler
+        .collect_nack_items(
+            now + Duration::from_millis(40),
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            3,
+            Duration::from_millis(500),
+            DEFAULT_NACK_ITEMS_PER_FRAME,
+        )
+        .items
+        .is_empty()
+    {
+        return Err("FEC-recovered frame still generated NACK items".to_string());
+    }
+    let mut fec_failed_reassembler = H264Reassembler::new(nack_config)?;
+    for (index, packet) in fec_packets.packets.iter().enumerate() {
+        if index != 1 && index != 2 {
+            fec_failed_reassembler.accept_datagram(packet, now)?;
+        }
+    }
+    if fec_failed_reassembler
+        .collect_nack_items(
+            now + Duration::from_millis(40),
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            3,
+            Duration::from_millis(500),
+            DEFAULT_NACK_ITEMS_PER_FRAME,
+        )
+        .items
+        .is_empty()
+    {
+        return Err("FEC failure did not allow NACK fallback".to_string());
     }
 
     let incomplete = crate::packetize_media_payload(7, 1, 1267, &[0x41; 3000], 0)?;

@@ -28,6 +28,7 @@ mod h264_send_probe;
 mod nv12_synthetic;
 mod nv12_to_bgra;
 mod playout_buffer;
+mod repair;
 mod udp_socket;
 mod video_renderer;
 mod wgc_latest_capture;
@@ -801,6 +802,8 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
     let mut fec_mode = fec::FecMode::Off;
     let mut udp_payload_size = DEFAULT_REALTIME_UDP_PAYLOAD_SIZE;
     let mut keyframe_interval_sec = 1.0f64;
+    let mut repair_mode = repair::RepairMode::Off;
+    let mut repair_cache_ms = 3000u64;
     let mut i = 0;
 
     while i < args.len() {
@@ -879,6 +882,19 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
                     "--keyframe-interval-sec",
                 )?)?;
             }
+            "--repair" => {
+                i += 1;
+                repair_mode = repair::RepairMode::parse(required_value(args, i, "--repair")?)?;
+            }
+            "--repair-cache-ms" => {
+                i += 1;
+                repair_cache_ms = parse_milliseconds(
+                    required_value(args, i, "--repair-cache-ms")?,
+                    "repair-cache-ms",
+                    500,
+                    10_000,
+                )?;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unknown h264-send-probe argument: {other}")),
         }
@@ -911,6 +927,8 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
         fec_mode,
         udp_payload_size,
         keyframe_interval_sec,
+        repair_mode,
+        repair_cache_ms,
         mode: h264_send_probe::H264SendMode::Probe,
         verbose: true,
     }))
@@ -1163,6 +1181,10 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
     let mut render_scale = win32_gdi_viewer::RenderScaleMode::Exact;
     let mut window_mode = win32_gdi_viewer::WindowMode::Windowed;
     let mut render_backend = video_renderer::RenderBackend::D3d11;
+    let mut repair_mode = repair::RepairMode::Off;
+    let mut nack_delay_ms = 20u64;
+    let mut nack_repeat_ms = 20u64;
+    let mut nack_max_rounds = 3u8;
     let mut i = 0;
 
     while i < args.len() {
@@ -1276,6 +1298,37 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
                     "--render-backend",
                 )?)?;
             }
+            "--repair" => {
+                i += 1;
+                repair_mode = repair::RepairMode::parse(required_value(args, i, "--repair")?)?;
+            }
+            "--nack-delay-ms" => {
+                i += 1;
+                nack_delay_ms = parse_milliseconds(
+                    required_value(args, i, "--nack-delay-ms")?,
+                    "nack-delay-ms",
+                    1,
+                    50,
+                )?;
+            }
+            "--nack-repeat-ms" => {
+                i += 1;
+                nack_repeat_ms = parse_milliseconds(
+                    required_value(args, i, "--nack-repeat-ms")?,
+                    "nack-repeat-ms",
+                    1,
+                    50,
+                )?;
+            }
+            "--nack-max-rounds" => {
+                i += 1;
+                nack_max_rounds = parse_count(
+                    required_value(args, i, "--nack-max-rounds")?,
+                    "nack-max-rounds",
+                    1,
+                    10,
+                )? as u8;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unknown h264-recv-view argument: {other}")),
         }
@@ -1300,6 +1353,10 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
         render_scale,
         window_mode,
         render_backend,
+        repair_mode,
+        nack_delay_ms,
+        nack_repeat_ms,
+        nack_max_rounds,
         mode: h264_recv_view::H264RecvViewMode::Probe,
         verbose: true,
     }))
@@ -1321,6 +1378,8 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
     let mut fec_mode = fec::FecMode::Off;
     let mut udp_payload_size = DEFAULT_REALTIME_UDP_PAYLOAD_SIZE;
     let mut keyframe_interval_sec = 1.0f64;
+    let mut repair_mode = repair::RepairMode::Off;
+    let mut repair_cache_ms = 3000u64;
     let mut verbose = false;
     let mut i = 0;
 
@@ -1405,6 +1464,19 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
                     "--keyframe-interval-sec",
                 )?)?;
             }
+            "--repair" => {
+                i += 1;
+                repair_mode = repair::RepairMode::parse(required_value(args, i, "--repair")?)?;
+            }
+            "--repair-cache-ms" => {
+                i += 1;
+                repair_cache_ms = parse_milliseconds(
+                    required_value(args, i, "--repair-cache-ms")?,
+                    "repair-cache-ms",
+                    500,
+                    10_000,
+                )?;
+            }
             "--verbose" => {
                 verbose = true;
             }
@@ -1440,6 +1512,8 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
         fec_mode,
         udp_payload_size,
         keyframe_interval_sec,
+        repair_mode,
+        repair_cache_ms,
         mode: h264_send_probe::H264SendMode::Screen,
         verbose,
     }))
@@ -1463,6 +1537,10 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
     let mut render_scale = win32_gdi_viewer::RenderScaleMode::Exact;
     let mut window_mode = win32_gdi_viewer::WindowMode::Windowed;
     let mut render_backend = video_renderer::RenderBackend::D3d11;
+    let mut repair_mode = repair::RepairMode::Off;
+    let mut nack_delay_ms = 20u64;
+    let mut nack_repeat_ms = 20u64;
+    let mut nack_max_rounds = 3u8;
     let mut verbose = false;
     let mut i = 0;
 
@@ -1585,6 +1663,37 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
                     "--render-backend",
                 )?)?;
             }
+            "--repair" => {
+                i += 1;
+                repair_mode = repair::RepairMode::parse(required_value(args, i, "--repair")?)?;
+            }
+            "--nack-delay-ms" => {
+                i += 1;
+                nack_delay_ms = parse_milliseconds(
+                    required_value(args, i, "--nack-delay-ms")?,
+                    "nack-delay-ms",
+                    1,
+                    50,
+                )?;
+            }
+            "--nack-repeat-ms" => {
+                i += 1;
+                nack_repeat_ms = parse_milliseconds(
+                    required_value(args, i, "--nack-repeat-ms")?,
+                    "nack-repeat-ms",
+                    1,
+                    50,
+                )?;
+            }
+            "--nack-max-rounds" => {
+                i += 1;
+                nack_max_rounds = parse_count(
+                    required_value(args, i, "--nack-max-rounds")?,
+                    "nack-max-rounds",
+                    1,
+                    10,
+                )? as u8;
+            }
             "--verbose" => {
                 verbose = true;
             }
@@ -1612,6 +1721,10 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
         render_scale,
         window_mode,
         render_backend,
+        repair_mode,
+        nack_delay_ms,
+        nack_repeat_ms,
+        nack_max_rounds,
         mode: h264_recv_view::H264RecvViewMode::Screen,
         verbose,
     }))
@@ -1828,11 +1941,11 @@ Usage:\n\
   agoralink_media gpu-convert-probe --duration-sec <seconds> --target-fps <fps> --out-width <pixels> --out-height <pixels> [--debug-dump-nv12 <dir>] [--debug-dump-bgra <dir>] [--debug-dump-limit <n>]\n\
   agoralink_media encode-probe --width <pixels> --height <pixels> --fps <fps> --duration-sec <seconds> --bitrate-mbps <mbps> --output <path> [--encoder auto|hardware|software|microsoft|intel-qsv] [--color-matrix bt601|bt709]\n\
   agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> [--bitrate-mbps <mbps>] [--quality-bpf <float>] --out-width <pixels> --out-height <pixels> --output <path> [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--color-matrix bt601|bt709]\n\
-  agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> [--bitrate-mbps <mbps>] [--quality-bpf <float>] --out-width <pixels> --out-height <pixels> [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--packet-pacing auto|off|batch] [--fec off|single-xor] [--udp-payload-size <576-1472>] [--keyframe-interval-sec <seconds>] [--color-matrix bt601|bt709]\n\
+  agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> [--bitrate-mbps <mbps>] [--quality-bpf <float>] --out-width <pixels> --out-height <pixels> [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--packet-pacing auto|off|batch] [--fec off|single-xor] [--repair off|nack] [--repair-cache-ms <500-10000>] [--udp-payload-size <576-1472>] [--keyframe-interval-sec <seconds>] [--color-matrix bt601|bt709]\n\
   agoralink_media h264-recv-dump --bind <ip> --port <port> --output <path> [--idle-timeout-sec <seconds>] [--drop-damaged-gop <true|false>] [--reorder-wait-ms auto|<ms>]\n\
-  agoralink_media h264-recv-view --bind <ip> --port <port> [--frame-timeout-ms <ms>] [--reorder-wait-ms auto|<ms>] [--playout-delay-ms <0-500>] [--render-scale exact|fit|stretch] [--window-mode windowed|borderless-fullscreen] [--render-backend gdi|d3d11] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--drop-damaged-gop <true|false>] [--debug-dump-frames <dir>] [--debug-dump-limit <n>] [--json-interval-ms <ms>] [--title <text>]\n\
-  agoralink_media screen-send --host <ip> --port <port> [--width <pixels>] [--height <pixels>] [--fps <fps>] [--bitrate-mbps <mbps>] [--quality-bpf <float>] [--duration-sec <seconds>] [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--packet-pacing auto|off|batch] [--fec off|single-xor] [--udp-payload-size <576-1472>] [--keyframe-interval-sec <seconds>] [--color-matrix bt601|bt709] [--verbose]\n\
-  agoralink_media screen-recv --bind <ip> --port <port> [--duration-sec <seconds>] [--frame-timeout-ms <ms>] [--reorder-wait-ms auto|<ms>] [--playout-delay-ms <0-500>] [--render-scale exact|fit|stretch] [--window-mode windowed|borderless-fullscreen] [--render-backend gdi|d3d11] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--drop-damaged-gop <true|false>] [--json-interval-ms <ms>] [--title <text>] [--verbose]\n\
+  agoralink_media h264-recv-view --bind <ip> --port <port> [--frame-timeout-ms <ms>] [--reorder-wait-ms auto|<ms>] [--playout-delay-ms <0-500>] [--repair off|nack] [--nack-delay-ms <1-50>] [--nack-repeat-ms <1-50>] [--nack-max-rounds <1-10>] [--render-scale exact|fit|stretch] [--window-mode windowed|borderless-fullscreen] [--render-backend gdi|d3d11] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--drop-damaged-gop <true|false>] [--debug-dump-frames <dir>] [--debug-dump-limit <n>] [--json-interval-ms <ms>] [--title <text>]\n\
+  agoralink_media screen-send --host <ip> --port <port> [--width <pixels>] [--height <pixels>] [--fps <fps>] [--bitrate-mbps <mbps>] [--quality-bpf <float>] [--duration-sec <seconds>] [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--packet-pacing auto|off|batch] [--fec off|single-xor] [--repair off|nack] [--repair-cache-ms <500-10000>] [--udp-payload-size <576-1472>] [--keyframe-interval-sec <seconds>] [--color-matrix bt601|bt709] [--verbose]\n\
+  agoralink_media screen-recv --bind <ip> --port <port> [--duration-sec <seconds>] [--frame-timeout-ms <ms>] [--reorder-wait-ms auto|<ms>] [--playout-delay-ms <0-500>] [--repair off|nack] [--nack-delay-ms <1-50>] [--nack-repeat-ms <1-50>] [--nack-max-rounds <1-10>] [--render-scale exact|fit|stretch] [--window-mode windowed|borderless-fullscreen] [--render-backend gdi|d3d11] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--drop-damaged-gop <true|false>] [--json-interval-ms <ms>] [--title <text>] [--verbose]\n\
   agoralink_media h264-file-viewer --input <path> [--render-scale exact|fit|stretch] [--window-mode windowed|borderless-fullscreen] [--render-backend gdi|d3d11]\n\n\
   agoralink_media color-test-pattern --output <path> --width <pixels> --height <pixels> --duration-sec <seconds> [--fps <fps>] [--bitrate-mbps <mbps>] [--color-matrix bt601|bt709]\n\n\
 Defaults:\n\
@@ -2193,6 +2306,7 @@ fn run_self_test() -> Result<(), String> {
     h264_send_probe::run_self_test()?;
     nv12_to_bgra::run_self_test()?;
     playout_buffer::run_self_test()?;
+    repair::run_self_test()?;
     win32_gdi_viewer::run_self_test()?;
     let nv12_size = nv12_synthetic::buffer_size(16, 16)?;
     if nv12_size != 16 * 16 * 3 / 2 {

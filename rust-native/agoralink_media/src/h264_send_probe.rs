@@ -15,6 +15,8 @@ pub struct H264SendConfig {
     pub fec_mode: crate::fec::FecMode,
     pub udp_payload_size: usize,
     pub keyframe_interval_sec: f64,
+    pub repair_mode: crate::repair::RepairMode,
+    pub repair_cache_ms: u64,
     pub mode: H264SendMode,
     pub verbose: bool,
 }
@@ -57,6 +59,7 @@ pub enum H264SendMode {
 mod platform {
     use std::io::{self, Write};
     use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, SyncSender};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
@@ -103,6 +106,13 @@ mod platform {
         pacing_late_us_max: f64,
         send_errors: u64,
         error: Option<String>,
+        nack_packets_received: u64,
+        nack_items_received: u64,
+        repair_packets_resent: u64,
+        repair_cache_hits: u64,
+        repair_cache_misses: u64,
+        repair_rate_limited: u64,
+        repair_send_errors: u64,
     }
 
     struct UdpObserver {
@@ -127,6 +137,7 @@ mod platform {
         previous_packets: u64,
         previous_frames: u64,
         previous_bytes: u64,
+        previous_repair_packets: u64,
         packetize_send_ms_total: f64,
         packet_pacing: PacketPacing,
         fec_mode: FecMode,
@@ -140,6 +151,11 @@ mod platform {
         keyframe_force_failures: u64,
         udp_send_buffer_bytes: i32,
         parameter_sets: AnnexBParameterSets,
+        repair_mode: crate::repair::RepairMode,
+        repair_cache_ms: u64,
+        repair_cache: Arc<Mutex<crate::repair::RepairCache>>,
+        repair_stop: Arc<AtomicBool>,
+        repair_worker: Option<JoinHandle<()>>,
     }
 
     impl UdpObserver {
@@ -156,11 +172,26 @@ mod platform {
             )?;
             let (sender, receiver) = mpsc::sync_channel::<PacedFrame>(SEND_QUEUE_DEPTH);
             let send_counters = Arc::new(Mutex::new(SendCounters::default()));
+            let repair_cache = Arc::new(Mutex::new(crate::repair::RepairCache::new(
+                Duration::from_millis(config.repair_cache_ms),
+            )?));
+            let repair_stop = Arc::new(AtomicBool::new(false));
+            let repair_socket = if config.repair_mode == crate::repair::RepairMode::Nack {
+                Some(
+                    socket
+                        .try_clone()
+                        .map_err(|err| format!("clone UDP socket for repair failed: {err}"))?,
+                )
+            } else {
+                None
+            };
             let worker_counters = Arc::clone(&send_counters);
+            let worker_cache = Arc::clone(&repair_cache);
             let worker_target = target.clone();
             let packet_pacing = config.packet_pacing;
             let frame_interval =
                 Duration::from_nanos(1_000_000_000u64 / u64::from(config.target_fps));
+            let repair_mode = config.repair_mode;
             let worker = thread::Builder::new()
                 .name("agoralink-udp-pacer".to_string())
                 .spawn(move || {
@@ -208,12 +239,25 @@ mod platform {
                             }
                             let batch_end = (packet_index + batch_size).min(frame.packets.len());
                             let mut sent_in_batch = 0u64;
-                            for packet in &frame.packets[packet_index..batch_end] {
+                            for (offset, packet) in frame.packets[packet_index..batch_end].iter().enumerate() {
                                 match socket.send(packet) {
                                     Ok(sent) if sent == packet.len() => {
                                         packets_sent += 1;
                                         sent_in_batch += 1;
                                         bytes_sent += sent as u64;
+                                        if repair_mode == crate::repair::RepairMode::Nack
+                                            && packet_index + offset < frame.data_packet_count
+                                        {
+                                            if let Some((_session, key, flags)) =
+                                                crate::repair::media_packet_key(packet)
+                                            {
+                                                if flags & crate::FLAG_FEC == 0 {
+                                                    if let Ok(mut cache) = worker_cache.lock() {
+                                                        cache.insert(key, packet.clone(), Instant::now());
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     Ok(sent) => {
                                         failure = Some(format!(
@@ -284,6 +328,27 @@ mod platform {
                     }
                 })
                 .map_err(|err| format!("spawn UDP pacing worker failed: {err}"))?;
+            let session_id = make_session_id();
+            let repair_worker = if config.repair_mode == crate::repair::RepairMode::Nack {
+                let repair_socket =
+                    repair_socket.ok_or_else(|| "repair socket was not initialized".to_string())?;
+                repair_socket
+                    .set_read_timeout(Some(Duration::from_millis(20)))
+                    .map_err(|err| format!("set repair socket timeout failed: {err}"))?;
+                let cache = Arc::clone(&repair_cache);
+                let counters = Arc::clone(&send_counters);
+                let stop = Arc::clone(&repair_stop);
+                Some(
+                    thread::Builder::new()
+                        .name("agoralink-nack-repair".to_string())
+                        .spawn(move || {
+                            run_repair_sender(repair_socket, cache, counters, stop, session_id)
+                        })
+                        .map_err(|err| format!("spawn NACK repair thread failed: {err}"))?,
+                )
+            } else {
+                None
+            };
             Ok(Self {
                 sender: Some(sender),
                 worker: Some(worker),
@@ -291,7 +356,7 @@ mod platform {
                 target,
                 host: config.host.clone(),
                 port: config.port,
-                session_id: make_session_id(),
+                session_id,
                 mode: config.mode,
                 duration_sec: config.duration_sec,
                 next_frame_id: 0,
@@ -306,6 +371,7 @@ mod platform {
                 previous_packets: 0,
                 previous_frames: 0,
                 previous_bytes: 0,
+                previous_repair_packets: 0,
                 packetize_send_ms_total: 0.0,
                 packet_pacing: config.packet_pacing,
                 fec_mode: config.fec_mode,
@@ -328,6 +394,11 @@ mod platform {
                 keyframe_force_failures: 0,
                 udp_send_buffer_bytes,
                 parameter_sets: AnnexBParameterSets::default(),
+                repair_mode: config.repair_mode,
+                repair_cache_ms: config.repair_cache_ms,
+                repair_cache,
+                repair_stop,
+                repair_worker,
             })
         }
 
@@ -383,6 +454,12 @@ mod platform {
                 worker
                     .join()
                     .map_err(|_| "UDP pacing worker panicked".to_string())?;
+            }
+            self.repair_stop.store(true, Ordering::SeqCst);
+            if let Some(worker) = self.repair_worker.take() {
+                worker
+                    .join()
+                    .map_err(|_| "NACK repair worker panicked".to_string())?;
             }
             if let Some(error) = self.send_snapshot().error {
                 Err(error)
@@ -473,6 +550,7 @@ mod platform {
                             self,
                             &sent,
                             sent.packets_sent as f64 / done.wall_time_sec.max(0.001),
+                            sent.repair_packets_resent as f64 / done.wall_time_sec.max(0.001),
                         )
                     );
                 }
@@ -515,6 +593,7 @@ mod platform {
                             self,
                             &sent,
                             sent.packets_sent as f64 / done.wall_time_sec.max(0.001),
+                            sent.repair_packets_resent as f64 / done.wall_time_sec.max(0.001),
                         )
                     );
                 }
@@ -607,6 +686,9 @@ mod platform {
             let packets_delta = sent.packets_sent.saturating_sub(self.previous_packets);
             let frames_delta = sent.frames_sent.saturating_sub(self.previous_frames);
             let bytes_delta = sent.bytes_sent.saturating_sub(self.previous_bytes);
+            let repair_packets_delta = sent
+                .repair_packets_resent
+                .saturating_sub(self.previous_repair_packets);
             match self.mode {
                 H264SendMode::Probe => {
                     println!(
@@ -655,7 +737,12 @@ mod platform {
                         stats
                             .encoder_output_color_metadata
                             .json_fragment("encoder_output"),
-                        transport_metrics_fragment(self, &sent, packets_delta as f64)
+                        transport_metrics_fragment(
+                            self,
+                            &sent,
+                            packets_delta as f64,
+                            repair_packets_delta as f64,
+                        )
                     );
                 }
                 H264SendMode::Screen => {
@@ -702,7 +789,12 @@ mod platform {
                         stats
                             .encoder_output_color_metadata
                             .json_fragment("encoder_output"),
-                        transport_metrics_fragment(self, &sent, packets_delta as f64)
+                        transport_metrics_fragment(
+                            self,
+                            &sent,
+                            packets_delta as f64,
+                            repair_packets_delta as f64,
+                        )
                     );
                 }
             }
@@ -710,6 +802,7 @@ mod platform {
             self.previous_packets = sent.packets_sent;
             self.previous_frames = sent.frames_sent;
             self.previous_bytes = sent.bytes_sent;
+            self.previous_repair_packets = sent.repair_packets_resent;
             Ok(())
         }
     }
@@ -768,6 +861,9 @@ mod platform {
             return Err("port must be greater than zero".to_string());
         }
         crate::validate_udp_payload_size(config.udp_payload_size)?;
+        if !(500..=10_000).contains(&config.repair_cache_ms) {
+            return Err("repair-cache-ms must be between 500 and 10000".to_string());
+        }
         Ok(())
     }
 
@@ -815,13 +911,86 @@ mod platform {
         packet_count.div_ceil(ticks.min(usize::MAX as u128) as usize)
     }
 
+    fn run_repair_sender(
+        socket: UdpSocket,
+        cache: Arc<Mutex<crate::repair::RepairCache>>,
+        counters: Arc<Mutex<SendCounters>>,
+        stop: Arc<AtomicBool>,
+        session_id: u64,
+    ) {
+        let mut buffer = [0u8; 2048];
+        let mut rate_window = Instant::now();
+        let mut resent_in_window = 0u64;
+        while !stop.load(Ordering::SeqCst) {
+            let length = match socket.recv(&mut buffer) {
+                Ok(length) => length,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let Ok(nack) = crate::repair::NackPacket::decode(&buffer[..length]) else {
+                continue;
+            };
+            if nack.session_id != session_id {
+                continue;
+            }
+            if rate_window.elapsed() >= Duration::from_secs(1) {
+                rate_window = Instant::now();
+                resent_in_window = 0;
+            }
+            if let Ok(mut stats) = counters.lock() {
+                stats.nack_packets_received += 1;
+                stats.nack_items_received += nack.items.len() as u64;
+            }
+            for item in nack.items {
+                if resent_in_window >= 5000 {
+                    if let Ok(mut stats) = counters.lock() {
+                        stats.repair_rate_limited += 1;
+                    }
+                    continue;
+                }
+                let packet = cache
+                    .lock()
+                    .ok()
+                    .and_then(|mut cache| cache.get(item, Instant::now()));
+                let Some(packet) = packet else {
+                    if let Ok(mut stats) = counters.lock() {
+                        stats.repair_cache_misses += 1;
+                    }
+                    continue;
+                };
+                match socket.send(&packet) {
+                    Ok(sent) if sent == packet.len() => {
+                        resent_in_window += 1;
+                        if let Ok(mut stats) = counters.lock() {
+                            stats.repair_packets_resent += 1;
+                            stats.repair_cache_hits += 1;
+                        }
+                    }
+                    _ => {
+                        if let Ok(mut stats) = counters.lock() {
+                            stats.repair_send_errors += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn transport_metrics_fragment(
         observer: &UdpObserver,
         sent: &SendCounters,
         packets_per_second: f64,
+        repair_packets_per_second: f64,
     ) -> String {
         format!(
-            r#""udp_send_buffer_bytes":{},"udp_send_buffer_bytes_requested":{},"udp_send_buffer_bytes_actual":{},"udp_payload_size":{},"packets_per_second":{:.2},"avg_packets_per_frame":{:.3},"max_packets_per_frame":{},"packet_pacing":"{}","packet_pacing_mode":"{}","packet_pacing_tick_ms":{:.3},"packet_pacing_batch_avg":{:.3},"packet_pacing_batch_max":{},"packet_pacing_overrun_ticks":{},"packet_pacing_late_us_avg":{:.3},"packet_pacing_late_us_max":{:.3},"packet_pacing_sleep_ms_avg":{:.3},"packet_pacing_overrun_frames":{},"send_errors":{},"fec_mode":"{}","fec_packets_sent":{},"fec_overhead_packets":{},"fec_overhead_bytes":{},"fec_overhead_ratio":{:.6},"data_payload_size":{},"keyframe_interval_sec":{:.3},"keyframe_interval_applied":{},"keyframes_sent":{},{}"#,
+            r#""udp_send_buffer_bytes":{},"udp_send_buffer_bytes_requested":{},"udp_send_buffer_bytes_actual":{},"udp_payload_size":{},"packets_per_second":{:.2},"avg_packets_per_frame":{:.3},"max_packets_per_frame":{},"packet_pacing":"{}","packet_pacing_mode":"{}","packet_pacing_tick_ms":{:.3},"packet_pacing_batch_avg":{:.3},"packet_pacing_batch_max":{},"packet_pacing_overrun_ticks":{},"packet_pacing_late_us_avg":{:.3},"packet_pacing_late_us_max":{:.3},"packet_pacing_sleep_ms_avg":{:.3},"packet_pacing_overrun_frames":{},"send_errors":{},"fec_mode":"{}","fec_packets_sent":{},"fec_overhead_packets":{},"fec_overhead_bytes":{},"fec_overhead_ratio":{:.6},"data_payload_size":{},"keyframe_interval_sec":{:.3},"keyframe_interval_applied":{},"keyframes_sent":{},{},{}"#,
             observer.udp_send_buffer_bytes,
             crate::udp_socket::DEFAULT_UDP_BUFFER_BYTES,
             observer.udp_send_buffer_bytes,
@@ -869,7 +1038,52 @@ mod platform {
             observer.keyframe_interval_sec,
             observer.keyframe_interval_applied(),
             observer.keyframes,
+            repair_metrics_fragment(observer, sent, repair_packets_per_second),
             observer.keyframe_metrics_fragment(),
+        )
+    }
+
+    fn repair_metrics_fragment(
+        observer: &UdpObserver,
+        sent: &SendCounters,
+        repair_packets_per_second: f64,
+    ) -> String {
+        let (packets, bytes, evictions) = observer
+            .repair_cache
+            .lock()
+            .map(|cache| (cache.len(), cache.bytes(), cache.evictions()))
+            .unwrap_or_default();
+        let repair_overhead_ratio = if sent.data_packets_sent == 0 {
+            0.0
+        } else {
+            sent.repair_packets_resent as f64 / sent.data_packets_sent as f64
+        };
+        let cache_lookups = sent.repair_cache_hits + sent.repair_cache_misses;
+        let repair_cache_hit_rate = if cache_lookups == 0 {
+            0.0
+        } else {
+            sent.repair_cache_hits as f64 / cache_lookups as f64
+        };
+        format!(
+            r#""repair_mode":"{}","repair_cache_ms":{},"repair_cache_packets":{},"repair_cache_bytes":{},"repair_cache_evictions":{},"nack_packets_received":{},"nack_items_received":{},"repair_packets_resent":{},"repair_cache_hits":{},"repair_cache_misses":{},"repair_cache_expired":{},"repair_rate_limited":{},"repair_send_errors":{},"repair_recv_thread_running":{},"repair_overhead_packets":{},"repair_overhead_ratio_vs_data":{:.6},"repair_resend_packets_per_second":{:.2},"repair_cache_hit_rate":{:.6}"#,
+            observer.repair_mode.name(),
+            observer.repair_cache_ms,
+            packets,
+            bytes,
+            evictions,
+            sent.nack_packets_received,
+            sent.nack_items_received,
+            sent.repair_packets_resent,
+            sent.repair_cache_hits,
+            sent.repair_cache_misses,
+            evictions,
+            sent.repair_rate_limited,
+            sent.repair_send_errors,
+            observer.repair_worker.is_some(),
+            sent.repair_packets_resent,
+            repair_overhead_ratio,
+            repair_packets_per_second,
+            repair_cache_hit_rate,
         )
     }
 
