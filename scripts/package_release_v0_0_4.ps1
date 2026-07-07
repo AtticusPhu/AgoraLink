@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Python = $env:PYTHON,
     [string]$MakeNsis = $env:MAKENSIS
 )
@@ -7,7 +7,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$Version = "0.0.4"
+$Version = "0.0.8"
 $ScriptDir = Split-Path -Parent $PSCommandPath
 $RepoRoot = (Resolve-Path -LiteralPath (Join-Path $ScriptDir "..")).Path
 $SpecPath = Join-Path $RepoRoot "AgoraLink.spec"
@@ -200,3 +200,4 @@ try {
 finally {
     Pop-Location
 }
+
