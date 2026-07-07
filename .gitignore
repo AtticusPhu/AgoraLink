@@ -53,3 +53,24 @@ native_*_test_package*/
 agoralink_media_*_test*.zip
 rust-native/agoralink_media/send_stdout.txt
 rust-native/agoralink_media/send_stderr.txt
+
+# Local FFmpeg tools for full package builds
+tools/ffmpeg/bin/
+tools/ffmpeg/*.exe
+tools/ffmpeg/**/*.exe
+
+# Local Codex / AI assistant workspace
+.codex/
+
+# Local AI assistant workspace
+.codex/
+
+# Local FFmpeg tools for full package builds
+tools/ffmpeg/bin/
+tools/ffmpeg/*.exe
+tools/ffmpeg/**/*.exe
+
+# Build outputs
+dist/
+installer/*.exe
+rust-native/agoralink_media/target/
