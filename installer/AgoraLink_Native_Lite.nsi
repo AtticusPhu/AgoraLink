@@ -2,17 +2,24 @@
 
 !define ROOT ".."
 !define APP_NAME "AgoraLink"
-!define APP_DISPLAY_NAME "AgoraLink Native Lite v0.0.9"
 !define APP_PUBLISHER "AgoraLink"
 !define APP_EXE "AgoraLink.exe"
-!define APP_VERSION "0.0.9"
+!ifndef APP_VERSION
+!define APP_VERSION "0.0.10"
+!endif
+!ifndef APP_DISPLAY_NAME
+!define APP_DISPLAY_NAME "AgoraLink Native Lite v${APP_VERSION}"
+!endif
+!ifndef NATIVE_LITE_OUTFILE
+!define NATIVE_LITE_OUTFILE "..\dist\AgoraLink_Native_Lite_Setup_v${APP_VERSION}.exe"
+!endif
 !define RUST_MEDIA_EXE "${ROOT}\dist\AgoraLink\_internal\tools\agoralink_media\agoralink_media.exe"
 !define FFMPEG_EXE "${ROOT}\dist\AgoraLink\_internal\tools\ffmpeg\bin\ffmpeg.exe"
 !define FFPLAY_EXE "${ROOT}\dist\AgoraLink\_internal\tools\ffmpeg\bin\ffplay.exe"
 !define FFPROBE_EXE "${ROOT}\dist\AgoraLink\_internal\tools\ffmpeg\bin\ffprobe.exe"
 
 Name "${APP_DISPLAY_NAME}"
-OutFile "..\dist\AgoraLink_Native_Lite_Setup_v0.0.9.exe"
+OutFile "${NATIVE_LITE_OUTFILE}"
 InstallDir "$LOCALAPPDATA\Programs\${APP_NAME}"
 InstallDirRegKey HKCU "Software\${APP_NAME}" "InstallDir"
 RequestExecutionLevel user
