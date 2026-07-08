@@ -2398,7 +2398,14 @@ class RUDPTransferRoot(BoxLayout):
         top = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(46), spacing=dp(10))
         # Keep a blank flexible spacer; the old "AgoraLink 文件传输与聊天"
         # title consumed horizontal/vertical attention after login.
-        self.title_label = make_label(text="", halign="left", valign="middle")
+        self.title_label = make_label(
+            text=self._app_identity_text(),
+            halign="left",
+            valign="middle",
+            bold=True,
+            shorten=True,
+        )
+        self.title_label.bind(size=lambda inst, _val: setattr(inst, "text_size", (max(1, inst.width), None)))
         top.add_widget(self.title_label)
         self.lang_btn = self._make_modern_or_legacy_button("secondary", width=90, on_release=lambda *_: self.toggle_lang())
         top.add_widget(self.lang_btn)
@@ -2411,6 +2418,18 @@ class RUDPTransferRoot(BoxLayout):
         self.debug_btn = self._make_modern_or_legacy_button("secondary", text="诊断", width=112, on_release=lambda *_: self.open_debug_popup())
         top.add_widget(self.debug_btn)
         self.add_widget(top)
+
+        self.app_capability_label = make_label(
+            text=self._main_information_architecture_text(),
+            size_hint_y=None,
+            height=dp(24),
+            halign="left",
+            valign="middle",
+            color=THEME["muted_text"],
+            shorten=True,
+        )
+        self.app_capability_label.bind(size=lambda inst, _val: setattr(inst, "text_size", (max(1, inst.width), None)))
+        self.add_widget(self.app_capability_label)
 
         self.local_ip_label = make_label(size_hint_y=None, height=dp(26), halign="left", valign="middle", shorten=True)
         bind_label_wrap(self.local_ip_label)
@@ -2678,6 +2697,17 @@ class RUDPTransferRoot(BoxLayout):
             color=THEME["muted_text"],
         )
         bind_label_wrap(self.screen_share_status_label)
+        self.screen_capability_label = make_label(
+            text=self._screen_share_capability_text(),
+            size_hint_y=None,
+            height=dp(24),
+            halign="left",
+            valign="middle",
+            color=THEME["muted_text"],
+            shorten=True,
+        )
+        self.screen_capability_label.bind(size=lambda inst, _val: setattr(inst, "text_size", (max(1, inst.width), None)))
+        center.add_widget(self.screen_capability_label)
         center.add_widget(self.screen_share_status_label)
         if str(getattr(self, "screen_backend_notice", "") or "").strip():
             Clock.schedule_once(lambda _dt: self._set_screen_share_status(str(self.screen_backend_notice)), 0)
@@ -4171,6 +4201,72 @@ class RUDPTransferRoot(BoxLayout):
             self.screen_package_info = dict(info)
         return info
 
+    def _package_flavor_label(self, flavor: object = None) -> str:
+        value = str(flavor if flavor is not None else self._screen_package_snapshot().get("package_flavor") or "").strip().lower()
+        if value == "native_lite":
+            return "Native Lite"
+        if value == "full":
+            return "Full"
+        if value == "source":
+            return "Source"
+        return "Unknown"
+
+    def _app_identity_text(self) -> str:
+        return APP_NAME
+
+    def _about_title_text(self) -> str:
+        return f"{APP_NAME} {APP_VERSION}"
+
+    def _ffmpeg_availability_label(self) -> str:
+        package = self._screen_package_snapshot()
+        if bool(package.get("bundled_ffmpeg_available")):
+            return "bundled"
+        try:
+            deps = dict(self._screen_runtime().check_dependencies())
+            if bool(deps.get("ffmpeg_ok") or deps.get("ffplay_ok")):
+                return "external"
+        except Exception:
+            pass
+        return "unavailable"
+
+    def _about_detail_text(self) -> str:
+        package = self._screen_package_snapshot()
+        lines = [
+            f"Package: {self._package_flavor_label(package.get('package_flavor'))}",
+            f"Screen backend: {self._screen_backend_label(self._screen_backend())}",
+            f"FFmpeg: {self._ffmpeg_availability_label()}",
+        ]
+        if bool(package.get("native_screen_video_only", True)):
+            lines.append("Native screen: video-only")
+        return "\n".join(lines)
+
+    def _screen_share_capability_text(self) -> str:
+        package = self._screen_package_snapshot()
+        backend = self._screen_backend()
+        backend_label = self._screen_backend_label(backend)
+        if bool(package.get("native_lite")):
+            return "Rust native video backend · no FFmpeg · video-only screen sharing"
+        if backend == SCREEN_BACKEND_RUST:
+            ffmpeg_text = "FFmpeg bundled" if bool(package.get("bundled_ffmpeg_available")) else "FFmpeg unavailable"
+            return f"{backend_label} backend · {ffmpeg_text} · video-only screen sharing"
+        if bool(package.get("bundled_ffmpeg_available")):
+            return f"{backend_label} backend · FFmpeg available · system audio available"
+        return f"{backend_label} backend · FFmpeg unavailable · Rust native video-only fallback"
+
+    def _main_information_architecture_text(self) -> str:
+        return "File transfer · Chat · Screen sharing · Settings/Diagnostics"
+
+    def _refresh_app_identity_labels(self) -> None:
+        try:
+            if hasattr(self, "title_label"):
+                self.title_label.text = self._app_identity_text()
+            if hasattr(self, "app_capability_label"):
+                self.app_capability_label.text = self._main_information_architecture_text()
+            if hasattr(self, "screen_capability_label"):
+                self.screen_capability_label.text = self._screen_share_capability_text()
+        except Exception:
+            pass
+
     def _native_lite_package(self) -> bool:
         return bool(self._screen_package_snapshot().get("native_lite"))
 
@@ -5026,7 +5122,7 @@ class RUDPTransferRoot(BoxLayout):
         style_button(self.chat_tab_btn, "active" if self.current_page in ("chat", "agora_chat") else "secondary")
 
     def refresh_texts(self) -> None:
-        self.title_label.text = ""
+        self._refresh_app_identity_labels()
         self.lang_btn.text = self.t("toggle_lang")
         self.send_tab_btn.text = self.t("send_tab")
         self.recv_tab_btn.text = self.t("recv_tab")
@@ -5451,6 +5547,29 @@ class RUDPTransferRoot(BoxLayout):
 
     def open_settings_popup(self) -> None:
         content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
+        app_info_box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(116), spacing=dp(4))
+        app_info_title = make_label(
+            text=self._about_title_text(),
+            size_hint_y=None,
+            height=dp(24),
+            halign="left",
+            valign="middle",
+            bold=True,
+            color=THEME["text"],
+        )
+        bind_label_wrap(app_info_title)
+        app_info_detail = make_label(
+            text=self._about_detail_text(),
+            size_hint_y=None,
+            height=dp(86),
+            halign="left",
+            valign="top",
+            color=THEME["muted_text"],
+        )
+        app_info_detail.bind(size=lambda inst, _val: setattr(inst, "text_size", (max(1, inst.width), None)))
+        app_info_box.add_widget(app_info_title)
+        app_info_box.add_widget(app_info_detail)
+        content.add_widget(app_info_box)
         theme_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(8))
         theme_line.add_widget(make_label(text="主题", size_hint_x=None, width=dp(90), color=THEME["muted_text"]))
         theme_spinner = style_spinner(Spinner(text=getattr(self, "theme_mode", "跟随系统"), values=["跟随系统", "浅色", "深色"], font_name=UI_FONT))
@@ -5466,7 +5585,9 @@ class RUDPTransferRoot(BoxLayout):
         audio_label_text = "共享系统音频" if self.lang == "zh" else "Share system audio"
         audio_line.add_widget(make_label(text=audio_label_text, size_hint_x=None, width=dp(220), color=THEME["muted_text"], halign="left", valign="middle"))
         bind_label_wrap(audio_line.children[0])
-        audio_checkbox = CheckBox(active=bool(getattr(self, "share_system_audio", False)), size_hint_x=None, width=dp(42))
+        audio_available = self._screen_backend() == SCREEN_BACKEND_FFMPEG and not self._native_lite_package()
+        audio_checkbox = CheckBox(active=bool(getattr(self, "share_system_audio", False)) and audio_available, size_hint_x=None, width=dp(42))
+        audio_checkbox.disabled = not audio_available
         audio_line.add_widget(audio_checkbox)
         content.add_widget(audio_line)
         backend_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(8))
@@ -5479,7 +5600,7 @@ class RUDPTransferRoot(BoxLayout):
         content.add_widget(backend_line)
         if self._native_lite_package():
             native_lite_note = make_label(
-                text="Native Lite: Rust native video backend is the default. FFmpeg/system audio requires the Full package.",
+                text=NATIVE_LITE_VIDEO_ONLY_MESSAGE,
                 size_hint_y=None,
                 height=dp(42),
                 halign="left",
@@ -5488,6 +5609,17 @@ class RUDPTransferRoot(BoxLayout):
             )
             bind_label_wrap(native_lite_note)
             content.add_widget(native_lite_note)
+        elif not audio_available:
+            audio_note = make_label(
+                text="System audio is unavailable with the current Rust native backend. Switch to FFmpeg backend to use system audio.",
+                size_hint_y=None,
+                height=dp(42),
+                halign="left",
+                valign="middle",
+                color=THEME["muted_text"],
+            )
+            bind_label_wrap(audio_note)
+            content.add_widget(audio_note)
         note = make_label(
             text="诊断日志已移到“诊断”窗口。普通设置只保留日常选项。",
             size_hint_y=None,
@@ -5500,14 +5632,19 @@ class RUDPTransferRoot(BoxLayout):
         content.add_widget(note)
         buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
         popup = style_popup(Popup(title="设置", content=content, size_hint=(0.58, 0.42)))
+        try:
+            popup.size_hint = (0.62, 0.54)
+        except Exception:
+            pass
         def _apply_theme(*_):
             self.theme_mode = theme_spinner.text
             self.apply_theme_mode(self.theme_mode)
             old_audio = bool(getattr(self, "share_system_audio", False))
             old_backend = self._screen_backend()
             self.auto_package_multi_selection = bool(package_checkbox.active)
-            self.share_system_audio = bool(audio_checkbox.active)
             self.screen_backend = self._coerce_screen_backend_for_package(backend_spinner.text, persist=False)
+            selected_audio_available = self.screen_backend == SCREEN_BACKEND_FFMPEG and not self._native_lite_package()
+            self.share_system_audio = bool(audio_checkbox.active) and selected_audio_available
             if backend_spinner.text != self.screen_backend:
                 backend_spinner.text = self.screen_backend
             try:
@@ -5523,6 +5660,7 @@ class RUDPTransferRoot(BoxLayout):
                 self._set_screen_share_status("Screen backend setting applies to the next screen share")
             if str(getattr(self, "screen_backend_notice", "") or "").strip():
                 self._set_screen_share_status(str(self.screen_backend_notice))
+            self._refresh_app_identity_labels()
         buttons.add_widget(make_button("primary", text="应用", on_release=_apply_theme))
         export_btn = make_button("secondary", text="导出诊断包")
         export_btn.bind(on_release=lambda *_: self.export_diagnostic_logs_async(log_box=self.sender_log_box, button=export_btn))
