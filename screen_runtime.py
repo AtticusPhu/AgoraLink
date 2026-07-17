@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import shutil
@@ -35,39 +36,56 @@ DEFAULT_SCREEN_PROFILE = "720p30_h264_qsv"
 SCREEN_BACKEND_FFMPEG = "ffmpeg"
 SCREEN_BACKEND_RUST = "rust"
 SCREEN_BACKENDS = {SCREEN_BACKEND_FFMPEG, SCREEN_BACKEND_RUST}
-DEFAULT_NATIVE_SCREEN_PRESET = "stable"
+DEFAULT_NATIVE_SCREEN_PRESET = "r4_default"
 NATIVE_SCREEN_PRESETS: Dict[str, Dict[str, object]] = {
+    "r4_default": {
+        "id": "r4_default",
+        "label": "R4 Default: 1920x1080 60fps 22Mbps playout 250ms repair nack",
+        "width": 1920,
+        "height": 1080,
+        "fps": 60,
+        "bitrate_mbps": 22,
+        "playout_delay_ms": 250,
+        "repair": "nack",
+        "adaptive_quality": "off",
+    },
     "stable": {
         "id": "stable",
-        "label": "Stable: 1280x720 30fps 20Mbps",
+        "label": "Legacy stable 720p30 / 20 Mbps",
         "width": 1280,
         "height": 720,
         "fps": 30,
         "bitrate_mbps": 20,
         "playout_delay_ms": 120,
         "repair": "off",
+        "adaptive_quality": "off",
     },
     "recommended": {
         "id": "recommended",
-        "label": "Recommended: 1920x1080 60fps 50Mbps playout 250ms repair nack",
+        "label": "Legacy high-bandwidth 1080p60 / 50 Mbps",
         "width": 1920,
         "height": 1080,
         "fps": 60,
         "bitrate_mbps": 50,
         "playout_delay_ms": 250,
         "repair": "nack",
+        "adaptive_quality": "off",
     },
     "high_quality": {
         "id": "high_quality",
-        "label": "High Quality: 1920x1080 60fps 80Mbps playout 300ms repair nack",
+        "label": "Experimental 1080p60 / 80 Mbps",
         "width": 1920,
         "height": 1080,
         "fps": 60,
         "bitrate_mbps": 80,
         "playout_delay_ms": 300,
         "repair": "nack",
+        "adaptive_quality": "off",
     },
 }
+_LOGGER = logging.getLogger(__name__)
+_INVALID_NATIVE_PRESET_WARNED: set[str] = set()
+_INVALID_NATIVE_PRESET_WARNED_LOCK = threading.Lock()
 FFMPEG_INSTALL_HINT = "winget install --id Gyan.FFmpeg -e"
 FFMPEG_MISSING_MESSAGE = (
     "找不到 ffmpeg/ffplay。请安装 FFmpeg 或使用内置 tools/ffmpeg/bin。\n"
@@ -89,24 +107,50 @@ NATIVE_LITE_VIDEO_ONLY_MESSAGE = (
 )
 
 
+def resolve_native_screen_preset_id(
+    value: object = None,
+    *,
+    warn_invalid: bool = True,
+) -> tuple[str, bool]:
+    if value is None or str(value).strip() == "":
+        return DEFAULT_NATIVE_SCREEN_PRESET, False
+    if isinstance(value, Mapping):
+        raw = str(value.get("id") or "").strip()
+    else:
+        raw = str(value).strip()
+    key = raw.lower().replace("-", "_").replace(" ", "_")
+    if key in NATIVE_SCREEN_PRESETS:
+        return key, False
+    for preset_key, preset in NATIVE_SCREEN_PRESETS.items():
+        if raw == str(preset.get("label") or ""):
+            return preset_key, False
+    if warn_invalid:
+        _warn_invalid_native_screen_preset(value)
+    return DEFAULT_NATIVE_SCREEN_PRESET, True
+
+
+def _warn_invalid_native_screen_preset(value: object) -> None:
+    raw = str(value or "").strip() or "<empty>"
+    with _INVALID_NATIVE_PRESET_WARNED_LOCK:
+        if raw in _INVALID_NATIVE_PRESET_WARNED:
+            return
+        _INVALID_NATIVE_PRESET_WARNED.add(raw)
+    _LOGGER.warning(
+        "Unknown native screen preset %r; falling back to %s",
+        raw,
+        DEFAULT_NATIVE_SCREEN_PRESET,
+    )
+
+
 def native_screen_preset_info(value: object = None) -> Dict[str, object]:
     if isinstance(value, Mapping):
-        key = str(value.get("id") or "").strip().lower()
-        if key in NATIVE_SCREEN_PRESETS:
-            return dict(NATIVE_SCREEN_PRESETS[key])
-        merged = dict(NATIVE_SCREEN_PRESETS[DEFAULT_NATIVE_SCREEN_PRESET])
-        merged.update(dict(value))
-        merged["id"] = str(merged.get("id") or DEFAULT_NATIVE_SCREEN_PRESET)
-        return merged
-    raw = str(value or DEFAULT_NATIVE_SCREEN_PRESET).strip()
-    key = raw.lower().replace("-", "_").replace(" ", "_")
-    if key not in NATIVE_SCREEN_PRESETS:
-        for preset_key, preset in NATIVE_SCREEN_PRESETS.items():
-            if raw == str(preset.get("label") or ""):
-                key = preset_key
-                break
-    if key not in NATIVE_SCREEN_PRESETS:
-        key = DEFAULT_NATIVE_SCREEN_PRESET
+        raw_id = str(value.get("id") or "").strip()
+        if not raw_id:
+            merged = dict(NATIVE_SCREEN_PRESETS[DEFAULT_NATIVE_SCREEN_PRESET])
+            merged.update(dict(value))
+            merged["id"] = DEFAULT_NATIVE_SCREEN_PRESET
+            return merged
+    key, _invalid = resolve_native_screen_preset_id(value)
     return dict(NATIVE_SCREEN_PRESETS[key])
 
 
@@ -854,13 +898,17 @@ class ScreenRuntime:
             "--port",
             str(int(port)),
             "--width",
-            str(int(preset.get("width") or 1280)),
+            str(int(preset.get("width") or 1920)),
             "--height",
-            str(int(preset.get("height") or 720)),
+            str(int(preset.get("height") or 1080)),
             "--fps",
-            str(int(preset.get("fps") or 30)),
+            str(int(preset.get("fps") or 60)),
             "--bitrate-mbps",
-            str(int(preset.get("bitrate_mbps") or 20)),
+            str(int(preset.get("bitrate_mbps") or 22)),
+            "--repair",
+            str(preset.get("repair") or "nack"),
+            "--adaptive-quality",
+            str(preset.get("adaptive_quality") or "off"),
         ]
         if bool(self._normalize_audio_config(audio, enabled_default=False).get("enabled")):
             cmd.extend(["--audio", "system"])

@@ -316,6 +316,7 @@ from screen_runtime import (
     NATIVE_SCREEN_PRESETS,
     ScreenRuntime,
     native_screen_preset_info,
+    resolve_native_screen_preset_id,
 )
 from diagnostic_export import export_diagnostic_bundle
 from file_packaging import package_files_to_zip
@@ -2149,9 +2150,13 @@ class RUDPTransferRoot(BoxLayout):
             self.gui_config.get("screen_backend", self._default_screen_backend()),
             persist=True,
         )
-        self.screen_native_preset = self._normalize_native_screen_preset(
-            self.gui_config.get("screen_native_preset", DEFAULT_NATIVE_SCREEN_PRESET)
+        saved_native_preset = self.gui_config.get("screen_native_preset")
+        self.screen_native_preset, invalid_native_preset = resolve_native_screen_preset_id(
+            saved_native_preset
         )
+        if invalid_native_preset:
+            self.gui_config["screen_native_preset"] = self.screen_native_preset
+            save_gui_config(self.gui_config)
         self.current_chat_mode = "group"
         self.current_group_id = ""
         self.current_peer_id = ""
