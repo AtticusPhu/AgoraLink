@@ -143,35 +143,6 @@ impl QualityProfile {
             self.bitrate_mbps * 1_000_000.0 / pixels
         }
     }
-
-    pub fn profile_name(self) -> &'static str {
-        if self.width >= 1920 && self.height >= 1080 {
-            if self.bitrate_mbps > 42.0 {
-                "F0"
-            } else {
-                "F1"
-            }
-        } else if self.width >= 1600 && self.height >= 900 {
-            "F2"
-        } else if self.fps >= 60 {
-            "F3"
-        } else if self.fps >= 45 {
-            "F4"
-        } else {
-            "F5"
-        }
-    }
-
-    pub fn bitrate_bounds(self) -> (f64, f64) {
-        match self.profile_name() {
-            "F0" => (42.0, 50.0),
-            "F1" => (34.0, 42.0),
-            "F2" => (28.0, 36.0),
-            "F3" => (20.0, 28.0),
-            "F4" => (14.0, 22.0),
-            _ => (8.0, 14.0),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -658,6 +629,9 @@ pub struct AdaptiveTelemetry {
     pub nominal_profile_id: AdaptiveProfileId,
     pub profile_bitrate_floor_mbps: f64,
     pub profile_bitrate_ceiling_mbps: f64,
+    pub last_profile_from: Option<AdaptiveProfileId>,
+    pub last_profile_to: Option<AdaptiveProfileId>,
+    pub ladder_changes: u64,
     pub profile_generation: u64,
     pub reason: String,
     pub profile_changes: u64,
@@ -696,6 +670,7 @@ impl AdaptiveTelemetry {
                 r#""adaptive_bottleneck":"{}","adaptive_profile":"{}","#,
                 r#""adaptive_profile_id":"{}","adaptive_nominal_profile_id":"{}","#,
                 r#""adaptive_profile_emergency":{},"adaptive_ladder_index":{},"#,
+                r#""adaptive_profile_from":{},"adaptive_profile_to":{},"adaptive_ladder_changes":{},"#,
                 r#""adaptive_profile_generation":{},"adaptive_reason":"{}","#,
                 r#""adaptive_profile_changes":{},"adaptive_bitrate_changes":{},"#,
                 r#""adaptive_resolution_changes":{},"adaptive_fps_changes":{},"#,
@@ -731,6 +706,9 @@ impl AdaptiveTelemetry {
             self.nominal_profile_id.name(),
             self.profile_id.is_emergency(),
             self.profile_id.ladder_index(),
+            optional_json_string(self.last_profile_from.map(AdaptiveProfileId::name)),
+            optional_json_string(self.last_profile_to.map(AdaptiveProfileId::name)),
+            self.ladder_changes,
             self.profile_generation,
             json_escape(&self.reason),
             self.profile_changes,
@@ -802,6 +780,9 @@ pub struct AdaptiveQualityController {
     profiles: AdaptiveProfileLadder,
     current_profile_id: AdaptiveProfileId,
     nominal_profile_id: AdaptiveProfileId,
+    last_profile_from: Option<AdaptiveProfileId>,
+    last_profile_to: Option<AdaptiveProfileId>,
+    ladder_changes: u64,
     current: QualityProfile,
     nominal: QualityProfile,
     state: AdaptiveState,
@@ -852,6 +833,9 @@ impl AdaptiveQualityController {
             profiles,
             current_profile_id,
             nominal_profile_id: current_profile_id,
+            last_profile_from: None,
+            last_profile_to: None,
+            ladder_changes: 0,
             current: initial,
             nominal: initial,
             state,
@@ -1077,6 +1061,9 @@ impl AdaptiveQualityController {
                 .get(self.current_profile_id)
                 .quality
                 .bitrate_mbps,
+            last_profile_from: self.last_profile_from,
+            last_profile_to: self.last_profile_to,
+            ladder_changes: self.ladder_changes,
             profile_generation: self.profile_generation,
             reason: self.reason.clone(),
             profile_changes: self.profile_changes,
@@ -1118,205 +1105,174 @@ impl AdaptiveQualityController {
     }
 
     fn degrade(&mut self, now: Duration, severe: bool) -> Option<AdaptiveAction> {
-        if self.pressure.render != PressureSeverity::None
-            && self.pressure.network == PressureSeverity::None
-            && self.current.fps > self.config.min_fps
-        {
-            if cooldown_elapsed(
-                self.last_fps_change_at,
-                now,
-                Duration::from_secs(self.config.fps_cooldown_sec),
-            ) {
-                return self.apply_action(
-                    now,
-                    AdaptiveAction::SetFps {
-                        fps: next_lower_fps(self.current.fps, self.config.min_fps),
-                        reason: "render-pressure-fps-first".to_string(),
-                    },
-                );
-            }
-            self.state = AdaptiveState::Cooldown;
-            self.adaptation_suppressed_reason = Some("render-fps-cooldown".to_string());
-            return None;
-        }
-        if self.pressure.decoder != PressureSeverity::None
-            && self.pressure.network == PressureSeverity::None
-            && (self.current.width > self.config.min_width
-                || self.current.height > self.config.min_height)
-        {
-            if cooldown_elapsed(
-                self.last_resolution_change_at,
-                now,
-                Duration::from_secs(self.config.resolution_cooldown_sec),
-            ) {
-                let (width, height) = next_lower_resolution(
-                    self.current.width,
-                    self.current.height,
-                    self.config.min_width,
-                    self.config.min_height,
-                );
-                return self.apply_action(
-                    now,
-                    AdaptiveAction::SetResolution {
-                        width,
-                        height,
-                        reason: "decoder-pressure-resolution-first".to_string(),
-                    },
-                );
-            }
-            self.state = AdaptiveState::Cooldown;
-            self.adaptation_suppressed_reason = Some("decoder-resolution-cooldown".to_string());
-            return None;
-        }
-        let (floor, _) = self.current.bitrate_bounds();
-        if self.current.bitrate_mbps > floor + 0.05 {
-            if cooldown_elapsed(
-                self.last_bitrate_change_at,
-                now,
-                Duration::from_secs(self.config.bitrate_cooldown_sec),
-            ) {
-                let factor = if severe { 0.88 } else { 0.92 };
-                let bitrate = (self.current.bitrate_mbps * factor).max(floor);
-                return self.apply_action(
-                    now,
-                    AdaptiveAction::SetBitrate {
-                        bitrate_mbps: bitrate,
-                        reason: format!("{}-bitrate-first", self.bottleneck.name()),
-                    },
-                );
-            }
-            self.state = AdaptiveState::Cooldown;
-            self.action_blocked_cooldown = self.action_blocked_cooldown.saturating_add(1);
-            self.reason = "bitrate-cooldown-preserves-dimension-order".to_string();
-            return None;
-        }
-        if self.current.width > self.config.min_width
-            || self.current.height > self.config.min_height
-        {
-            if !cooldown_elapsed(
-                self.last_resolution_change_at,
-                now,
-                Duration::from_secs(self.config.resolution_cooldown_sec),
-            ) {
+        if let Some(target) = self.current_profile_id.next_lower_quality() {
+            let target_quality = self.profiles.get(target).quality;
+            if target_quality.width < self.config.min_width
+                || target_quality.height < self.config.min_height
+            {
                 self.state = AdaptiveState::Cooldown;
-                self.action_blocked_cooldown = self.action_blocked_cooldown.saturating_add(1);
-                self.reason = "resolution-cooldown-preserves-dimension-order".to_string();
+                self.reason = "adaptive-resolution-floor-reached".to_string();
                 return None;
             }
-            let (width, height) = next_lower_resolution(
-                self.current.width,
-                self.current.height,
-                self.config.min_width,
-                self.config.min_height,
+            return self.move_to_profile(
+                now,
+                target,
+                format!(
+                    "{}-adjacent-{}-to-{}",
+                    self.bottleneck.name(),
+                    self.current_profile_id.name(),
+                    target.name()
+                ),
             );
-            if (width, height) != (self.current.width, self.current.height) {
-                return self.apply_action(
+        }
+
+        if severe && self.severe_windows >= 5 {
+            if let Some(target) = self.current_profile_id.next_emergency() {
+                if self.profiles.get(target).quality.fps < self.config.min_fps {
+                    self.state = AdaptiveState::Cooldown;
+                    self.reason = "adaptive-fps-floor-reached".to_string();
+                    return None;
+                }
+                self.state = AdaptiveState::EmergencyFpsReduction;
+                let action = self.move_to_profile(
                     now,
-                    AdaptiveAction::SetResolution {
-                        width,
-                        height,
-                        reason: format!("{}-quality-floor-reached", self.bottleneck.name()),
-                    },
+                    target,
+                    format!(
+                        "{}-sustained-emergency-{}-to-{}",
+                        self.bottleneck.name(),
+                        self.current_profile_id.name(),
+                        target.name()
+                    ),
                 );
+                if action.is_some() {
+                    self.emergency_fps_entries = self.emergency_fps_entries.saturating_add(1);
+                }
+                return action;
             }
         }
-        if severe
-            && self.severe_windows >= 5
-            && self.current.width <= self.config.min_width
-            && self.current.height <= self.config.min_height
-            && self.current.fps > self.config.min_fps
-            && cooldown_elapsed(
-                self.last_fps_change_at,
-                now,
-                Duration::from_secs(self.config.fps_cooldown_sec),
-            )
-        {
-            let fps = next_lower_fps(self.current.fps, self.config.min_fps);
-            self.state = AdaptiveState::EmergencyFpsReduction;
-            self.emergency_fps_entries = self.emergency_fps_entries.saturating_add(1);
-            return self.apply_action(
-                now,
-                AdaptiveAction::SetFps {
-                    fps,
-                    reason: format!("{}-sustained-emergency", self.bottleneck.name()),
-                },
-            );
-        }
+
         self.state = AdaptiveState::Cooldown;
-        self.action_blocked_cooldown = self.action_blocked_cooldown.saturating_add(1);
-        self.reason = "degrade-action-blocked-by-floor-or-cooldown".to_string();
+        self.reason = if self.current_profile_id == AdaptiveProfileId::E2 {
+            "emergency-quality-floor-reached"
+        } else if self.current_profile_id == AdaptiveProfileId::Q4 {
+            "q4-waiting-for-sustained-emergency-pressure"
+        } else {
+            "degrade-action-blocked-by-profile-floor"
+        }
+        .to_string();
         None
     }
 
     fn recover(&mut self, now: Duration) -> Option<AdaptiveAction> {
         self.state = AdaptiveState::Recovering;
-        if self.current.fps < self.nominal.fps {
-            if !cooldown_elapsed(
-                self.last_fps_change_at,
-                now,
-                Duration::from_secs(self.config.fps_cooldown_sec),
-            ) {
-                self.state = AdaptiveState::Cooldown;
-                self.action_blocked_cooldown = self.action_blocked_cooldown.saturating_add(1);
-                self.reason = "fps-recovery-cooldown-preserves-priority".to_string();
-                return None;
-            }
-            return self.apply_action(
-                now,
-                AdaptiveAction::SetFps {
-                    fps: next_higher_fps(self.current.fps, self.nominal.fps),
-                    reason: "stable-recovery-fps-first".to_string(),
-                },
-            );
+        let Some(target) = self.current_profile_id.next_higher() else {
+            self.reason = "nominal-quality-restored".to_string();
+            return None;
+        };
+        if target.ladder_index() < self.nominal_profile_id.ladder_index() {
+            self.reason = "nominal-quality-restored".to_string();
+            return None;
         }
-        if self.current.width < self.nominal.width || self.current.height < self.nominal.height {
-            if !cooldown_elapsed(
-                self.last_resolution_change_at,
-                now,
-                Duration::from_secs(self.config.resolution_cooldown_sec),
-            ) {
-                self.state = AdaptiveState::Cooldown;
-                self.action_blocked_cooldown = self.action_blocked_cooldown.saturating_add(1);
-                self.reason = "resolution-recovery-cooldown-preserves-priority".to_string();
-                return None;
+        self.move_to_profile(
+            now,
+            target,
+            format!(
+                "stable-adjacent-recovery-{}-to-{}",
+                self.current_profile_id.name(),
+                target.name()
+            ),
+        )
+    }
+
+    fn move_to_profile(
+        &mut self,
+        now: Duration,
+        target_id: AdaptiveProfileId,
+        reason: String,
+    ) -> Option<AdaptiveAction> {
+        let from_id = self.current_profile_id;
+        let mut target = self.profiles.get(target_id).quality;
+        target.fps = target.fps.min(self.nominal.fps);
+        let action = if (self.current.width, self.current.height) != (target.width, target.height) {
+            AdaptiveAction::SetResolution {
+                width: target.width,
+                height: target.height,
+                reason,
             }
-            let (width, height) = next_higher_resolution(
-                self.current.width,
-                self.current.height,
-                self.nominal.width,
-                self.nominal.height,
-            );
-            return self.apply_action(
-                now,
-                AdaptiveAction::SetResolution {
-                    width,
-                    height,
-                    reason: "stable-recovery-resolution-second".to_string(),
-                },
-            );
+        } else if self.current.fps != target.fps {
+            AdaptiveAction::SetFps {
+                fps: target.fps,
+                reason,
+            }
+        } else if (self.current.bitrate_mbps - target.bitrate_mbps).abs() > 0.05 {
+            AdaptiveAction::SetBitrate {
+                bitrate_mbps: target.bitrate_mbps,
+                reason,
+            }
+        } else {
+            self.commit_profile_identity(now, from_id, target_id, reason);
+            return None;
+        };
+
+        if !self.profile_action_cooldown_elapsed(&action, now) {
+            self.state = AdaptiveState::Cooldown;
+            self.action_blocked_cooldown = self.action_blocked_cooldown.saturating_add(1);
+            self.reason = format!("{}-cooldown-preserves-adjacent-order", action.dimension());
+            return None;
         }
-        let ceiling = self
-            .config
-            .max_bitrate_mbps
-            .unwrap_or(self.nominal.bitrate_mbps)
-            .min(self.nominal.bitrate_mbps);
-        if self.current.bitrate_mbps + 0.05 < ceiling
-            && cooldown_elapsed(
+
+        let result = self.apply_action(now, action);
+        if result.is_some() {
+            self.record_profile_identity(from_id, target_id);
+        }
+        result
+    }
+
+    fn profile_action_cooldown_elapsed(&self, action: &AdaptiveAction, now: Duration) -> bool {
+        match action {
+            AdaptiveAction::SetBitrate { .. } => cooldown_elapsed(
                 self.last_bitrate_change_at,
                 now,
                 Duration::from_secs(self.config.bitrate_cooldown_sec),
-            )
-        {
-            return self.apply_action(
+            ),
+            AdaptiveAction::SetResolution { .. } => cooldown_elapsed(
+                self.last_resolution_change_at,
                 now,
-                AdaptiveAction::SetBitrate {
-                    bitrate_mbps: (self.current.bitrate_mbps * 1.06).min(ceiling),
-                    reason: "stable-recovery-bitrate-last".to_string(),
-                },
-            );
+                Duration::from_secs(self.config.resolution_cooldown_sec),
+            ),
+            AdaptiveAction::SetFps { .. } => cooldown_elapsed(
+                self.last_fps_change_at,
+                now,
+                Duration::from_secs(self.config.fps_cooldown_sec),
+            ),
         }
-        self.reason = "nominal-quality-restored".to_string();
-        None
+    }
+
+    fn commit_profile_identity(
+        &mut self,
+        now: Duration,
+        from_id: AdaptiveProfileId,
+        target_id: AdaptiveProfileId,
+        reason: String,
+    ) {
+        self.reason = reason;
+        self.last_change_at = Some(now);
+        self.valid_windows_since_reset = 0;
+        self.window_ready = false;
+        self.adaptation_suppressed_reason = Some("post-change-cooldown".to_string());
+        self.reset_pressure_windows();
+        self.record_profile_identity(from_id, target_id);
+    }
+
+    fn record_profile_identity(
+        &mut self,
+        from_id: AdaptiveProfileId,
+        target_id: AdaptiveProfileId,
+    ) {
+        self.current_profile_id = target_id;
+        self.last_profile_from = Some(from_id);
+        self.last_profile_to = Some(target_id);
+        self.ladder_changes = self.ladder_changes.saturating_add(1);
     }
 
     fn apply_action(&mut self, now: Duration, action: AdaptiveAction) -> Option<AdaptiveAction> {
@@ -1513,46 +1469,6 @@ pub fn classify_pressure(snapshot: AdaptiveSnapshot) -> PressureBreakdown {
     }
 }
 
-fn next_lower_resolution(width: u32, height: u32, min_width: u32, min_height: u32) -> (u32, u32) {
-    let candidate = if width > 1600 || height > 900 {
-        (1600, 900)
-    } else {
-        (1280, 720)
-    };
-    (candidate.0.max(min_width), candidate.1.max(min_height))
-}
-
-fn next_higher_resolution(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
-    let candidate = if width < 1600 || height < 900 {
-        (1600, 900)
-    } else {
-        (1920, 1080)
-    };
-    (candidate.0.min(max_width), candidate.1.min(max_height))
-}
-
-fn next_lower_fps(fps: u32, min_fps: u32) -> u32 {
-    if fps > 45 {
-        45.max(min_fps)
-    } else {
-        30.max(min_fps)
-    }
-}
-
-fn next_higher_fps(fps: u32, nominal: u32) -> u32 {
-    if fps < 45 {
-        45.min(nominal)
-    } else if fps < 60 {
-        60.min(nominal)
-    } else if fps < 75 {
-        75.min(nominal)
-    } else if fps < 90 {
-        90.min(nominal)
-    } else {
-        120.min(nominal)
-    }
-}
-
 fn ratio(actual: f64, target: u32) -> f64 {
     if target == 0 || !actual.is_finite() {
         0.0
@@ -1661,23 +1577,8 @@ mod tests {
         snapshot
     }
 
-    fn next_stable_action(
-        controller: &mut AdaptiveQualityController,
-        first_second: u64,
-        last_second: u64,
-    ) -> AdaptiveAction {
-        (first_second..=last_second)
-            .find_map(|second| {
-                let snapshot = stable_for_current(controller);
-                controller.observe(Duration::from_secs(second), snapshot)
-            })
-            .unwrap_or_else(|| {
-                panic!("no recovery action between {first_second}s and {last_second}s")
-            })
-    }
-
     #[test]
-    fn fps_priority_and_hysteresis() {
+    fn resolution_priority_and_hysteresis() {
         let initial = QualityProfile {
             width: 1920,
             height: 1080,
@@ -1694,11 +1595,18 @@ mod tests {
                 .is_none());
         }
         let action = controller.observe(Duration::from_secs(9), mild).unwrap();
-        assert!(matches!(action, AdaptiveAction::SetBitrate { .. }));
+        assert!(matches!(
+            action,
+            AdaptiveAction::SetResolution {
+                width: 1600,
+                height: 900,
+                ..
+            }
+        ));
         assert_eq!(controller.current().fps, 60);
         assert_eq!(
             (controller.current().width, controller.current().height),
-            (1920, 1080)
+            (1600, 900)
         );
     }
 
@@ -1725,11 +1633,13 @@ mod tests {
     #[test]
     fn emergency_fps_reduction_requires_sustained_severe_pressure_at_floor() {
         let mut controller = controller(QualityProfile {
-            width: 1280,
-            height: 720,
+            width: 1920,
+            height: 1080,
             fps: 60,
-            bitrate_mbps: 20.0,
+            bitrate_mbps: 22.0,
         });
+        controller.current = controller.profiles.get(AdaptiveProfileId::Q4).quality;
+        controller.current_profile_id = AdaptiveProfileId::Q4;
         let mut severe = stable_snapshot();
         severe.damaged_gop_delta = 1;
         for second in 1..9 {
@@ -1751,58 +1661,43 @@ mod tests {
     }
 
     #[test]
-    fn recovery_order_is_fps_resolution_bitrate() {
-        let mut controller = controller(QualityProfile {
-            width: 1280,
-            height: 720,
-            fps: 30,
-            bitrate_mbps: 10.0,
-        });
-        controller.nominal = QualityProfile {
+    fn recovery_order_is_exact_reverse_r4_ladder() {
+        let nominal = QualityProfile {
             width: 1920,
             height: 1080,
             fps: 60,
-            bitrate_mbps: 50.0,
+            bitrate_mbps: 22.0,
         };
-        let first = next_stable_action(&mut controller, 1, 19);
-        assert!(matches!(first, AdaptiveAction::SetFps { fps: 45, .. }));
+        let mut controller = controller(nominal);
+        controller.current = controller.profiles.get(AdaptiveProfileId::E2).quality;
+        controller.current_profile_id = AdaptiveProfileId::E2;
 
-        let second = next_stable_action(&mut controller, 20, 39);
-        assert!(matches!(second, AdaptiveAction::SetFps { fps: 60, .. }));
+        let expected = [
+            (AdaptiveProfileId::E1, "fps"),
+            (AdaptiveProfileId::Q4, "fps"),
+            (AdaptiveProfileId::Q3, "bitrate"),
+            (AdaptiveProfileId::Q2, "bitrate"),
+            (AdaptiveProfileId::Q1, "resolution"),
+            (AdaptiveProfileId::Q0, "resolution"),
+        ];
+        for (index, (profile_id, dimension)) in expected.into_iter().enumerate() {
+            let action = force_stable_recovery(&mut controller, (index as u64 + 1) * 40)
+                .expect("reverse R4 recovery should produce an adjacent action");
+            assert_eq!(action.dimension(), dimension);
+            assert_eq!(controller.current_profile_id(), profile_id);
+        }
 
-        let third = next_stable_action(&mut controller, 40, 58);
-        assert!(matches!(
-            third,
-            AdaptiveAction::SetResolution {
-                width: 1600,
-                height: 900,
-                ..
-            }
-        ));
-
-        let fourth = next_stable_action(&mut controller, 59, 88);
-        assert!(matches!(
-            fourth,
-            AdaptiveAction::SetResolution {
-                width: 1920,
-                height: 1080,
-                ..
-            }
-        ));
-
-        let fifth = next_stable_action(&mut controller, 89, 107);
-        assert!(matches!(fifth, AdaptiveAction::SetBitrate { .. }));
         assert_eq!(
             controller
-                .telemetry(Duration::from_secs(107))
+                .telemetry(Duration::from_secs(240))
                 .profile_changes,
             4
         );
         assert_eq!(
             controller
-                .telemetry(Duration::from_secs(107))
+                .telemetry(Duration::from_secs(240))
                 .bitrate_changes,
-            1
+            2
         );
     }
 
@@ -1957,7 +1852,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_decoder_warmup_then_sixty_fps_stays_at_f0_for_sixty_seconds() {
+    fn initial_decoder_warmup_then_sixty_fps_stays_at_q0_for_sixty_seconds() {
         let initial = QualityProfile {
             width: 1920,
             height: 1080,
@@ -1978,14 +1873,14 @@ mod tests {
         }
         let telemetry = controller.telemetry(Duration::from_secs(60));
         assert_eq!(controller.current(), initial);
-        assert_eq!(telemetry.current.profile_name(), "F0");
+        assert_eq!(telemetry.profile_id, AdaptiveProfileId::Q0);
         assert_eq!(telemetry.profile_changes, 0);
         assert_eq!(telemetry.bitrate_changes, 0);
         assert_eq!(telemetry.fps_changes, 0);
     }
 
     #[test]
-    fn stable_network_at_fifty_eight_to_sixty_fps_keeps_f0() {
+    fn stable_network_at_fifty_eight_to_sixty_fps_keeps_q0() {
         let initial = QualityProfile {
             width: 1920,
             height: 1080,
@@ -2008,7 +1903,7 @@ mod tests {
         }
         let telemetry = controller.telemetry(Duration::from_secs(60));
         assert_eq!(telemetry.current, initial);
-        assert_eq!(telemetry.current.profile_name(), "F0");
+        assert_eq!(telemetry.profile_id, AdaptiveProfileId::Q0);
         assert_eq!(telemetry.profile_changes, 0);
         assert_eq!(telemetry.bitrate_changes, 0);
         assert_eq!(telemetry.resolution_changes, 0);
@@ -2018,8 +1913,8 @@ mod tests {
     #[test]
     fn bitrate_only_action_does_not_increment_profile_generation() {
         let mut controller = controller(QualityProfile {
-            width: 1920,
-            height: 1080,
+            width: 1280,
+            height: 720,
             fps: 60,
             bitrate_mbps: 50.0,
         });
@@ -2043,7 +1938,7 @@ mod tests {
         assert_eq!(telemetry.fps_changes, 0);
         assert_eq!(
             (telemetry.current.width, telemetry.current.height),
-            (1920, 1080)
+            (1280, 720)
         );
         assert_eq!(telemetry.current.fps, 60);
     }
@@ -2138,14 +2033,15 @@ mod tests {
             bitrate_mbps: 22.0,
         });
 
-        for (second, expected) in [
-            (40, (1600, 900, 60, 22.0)),
-            (80, (1280, 720, 60, 22.0)),
-            (120, (1280, 720, 60, 18.0)),
-            (160, (1280, 720, 60, 15.0)),
+        for (second, profile_id, expected) in [
+            (40, AdaptiveProfileId::Q1, (1600, 900, 60, 22.0)),
+            (80, AdaptiveProfileId::Q2, (1280, 720, 60, 22.0)),
+            (120, AdaptiveProfileId::Q3, (1280, 720, 60, 18.0)),
+            (160, AdaptiveProfileId::Q4, (1280, 720, 60, 15.0)),
         ] {
             force_network_degrade(&mut controller, second, 3)
                 .expect("each adjacent R4 quality step should produce an action");
+            assert_eq!(controller.current_profile_id(), profile_id);
             assert_profile(
                 controller.current(),
                 expected.0,
@@ -2173,12 +2069,19 @@ mod tests {
             assert_profile(controller.current(), 1920, 1080, 60, expected_bitrates[0]);
 
             for (index, second) in [40, 80, 120, 160].into_iter().enumerate() {
-                force_network_degrade(&mut controller, second, 3)
-                    .expect("each adjacent R4 quality step should produce an action");
+                let previous = controller.current();
+                let action = force_network_degrade(&mut controller, second, 3);
                 let (width, height) = match index {
                     0 => (1600, 900),
                     _ => (1280, 720),
                 };
+                let expected_id = [
+                    AdaptiveProfileId::Q1,
+                    AdaptiveProfileId::Q2,
+                    AdaptiveProfileId::Q3,
+                    AdaptiveProfileId::Q4,
+                ][index];
+                assert_eq!(controller.current_profile_id(), expected_id);
                 assert_profile(
                     controller.current(),
                     width,
@@ -2186,6 +2089,17 @@ mod tests {
                     60,
                     expected_bitrates[index + 1],
                 );
+                if previous == controller.current() {
+                    assert!(
+                        action.is_none(),
+                        "no-op profile step should not touch runtime"
+                    );
+                } else {
+                    assert!(
+                        action.is_some(),
+                        "physical profile step should emit an action"
+                    );
+                }
             }
         }
     }
@@ -2205,15 +2119,17 @@ mod tests {
             fps: 60,
             bitrate_mbps: 15.0,
         };
+        controller.current_profile_id = AdaptiveProfileId::Q4;
 
-        for (second, expected) in [
-            (40, (1280, 720, 60, 18.0)),
-            (80, (1280, 720, 60, 22.0)),
-            (120, (1600, 900, 60, 22.0)),
-            (160, (1920, 1080, 60, 22.0)),
+        for (second, profile_id, expected) in [
+            (40, AdaptiveProfileId::Q3, (1280, 720, 60, 18.0)),
+            (80, AdaptiveProfileId::Q2, (1280, 720, 60, 22.0)),
+            (120, AdaptiveProfileId::Q1, (1600, 900, 60, 22.0)),
+            (160, AdaptiveProfileId::Q0, (1920, 1080, 60, 22.0)),
         ] {
             force_stable_recovery(&mut controller, second)
                 .expect("each reverse R4 quality step should produce an action");
+            assert_eq!(controller.current_profile_id(), profile_id);
             assert_profile(
                 controller.current(),
                 expected.0,
@@ -2239,6 +2155,7 @@ mod tests {
             fps: 60,
             bitrate_mbps: 15.0,
         };
+        controller.current_profile_id = AdaptiveProfileId::Q4;
 
         assert!(force_network_degrade(&mut controller, 40, 4).is_none());
         force_network_degrade(&mut controller, 80, 5)
@@ -2252,6 +2169,31 @@ mod tests {
         assert_profile(controller.current(), 1280, 720, 45, 15.0);
         force_stable_recovery(&mut controller, 200).expect("E1 should recover to Q4");
         assert_profile(controller.current(), 1280, 720, 60, 15.0);
+    }
+
+    #[test]
+    fn r4_profile_table_is_the_single_source_for_quality_values() {
+        let ladder = AdaptiveProfileLadder::new(22.0);
+        for (id, expected) in [
+            (AdaptiveProfileId::Q0, (1920, 1080, 60, 22.0, false)),
+            (AdaptiveProfileId::Q1, (1600, 900, 60, 22.0, false)),
+            (AdaptiveProfileId::Q2, (1280, 720, 60, 22.0, false)),
+            (AdaptiveProfileId::Q3, (1280, 720, 60, 18.0, false)),
+            (AdaptiveProfileId::Q4, (1280, 720, 60, 15.0, false)),
+            (AdaptiveProfileId::E1, (1280, 720, 45, 15.0, true)),
+            (AdaptiveProfileId::E2, (1280, 720, 30, 15.0, true)),
+        ] {
+            let profile = ladder.get(id);
+            assert_eq!(profile.id, id);
+            assert_eq!(profile.emergency, expected.4);
+            assert_profile(
+                profile.quality,
+                expected.0,
+                expected.1,
+                expected.2,
+                expected.3,
+            );
+        }
     }
 
     #[test]
@@ -2462,10 +2404,19 @@ pub fn run_self_test() -> Result<(), String> {
         }
     }
     let Some(action) = controller.observe(Duration::from_secs(9), mild) else {
-        return Err("sustained mild pressure did not reduce bitrate".to_string());
+        return Err("sustained mild pressure did not move to Q1".to_string());
     };
-    if !matches!(action, AdaptiveAction::SetBitrate { .. }) || controller.current().fps != 60 {
-        return Err("frame-rate-first degradation order failed".to_string());
+    if !matches!(
+        action,
+        AdaptiveAction::SetResolution {
+            width: 1600,
+            height: 900,
+            ..
+        }
+    ) || controller.current().fps != 60
+        || controller.current_profile_id() != AdaptiveProfileId::Q1
+    {
+        return Err("R4 adjacent resolution-first degradation failed".to_string());
     }
     Ok(())
 }
