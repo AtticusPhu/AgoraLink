@@ -174,6 +174,144 @@ impl QualityProfile {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveProfileId {
+    Q0,
+    Q1,
+    Q2,
+    Q3,
+    Q4,
+    E1,
+    E2,
+}
+
+impl AdaptiveProfileId {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Q0 => "Q0",
+            Self::Q1 => "Q1",
+            Self::Q2 => "Q2",
+            Self::Q3 => "Q3",
+            Self::Q4 => "Q4",
+            Self::E1 => "E1",
+            Self::E2 => "E2",
+        }
+    }
+
+    pub const fn ladder_index(self) -> u8 {
+        match self {
+            Self::Q0 => 0,
+            Self::Q1 => 1,
+            Self::Q2 => 2,
+            Self::Q3 => 3,
+            Self::Q4 => 4,
+            Self::E1 => 5,
+            Self::E2 => 6,
+        }
+    }
+
+    pub const fn is_emergency(self) -> bool {
+        matches!(self, Self::E1 | Self::E2)
+    }
+
+    pub const fn next_lower_quality(self) -> Option<Self> {
+        match self {
+            Self::Q0 => Some(Self::Q1),
+            Self::Q1 => Some(Self::Q2),
+            Self::Q2 => Some(Self::Q3),
+            Self::Q3 => Some(Self::Q4),
+            Self::Q4 | Self::E1 | Self::E2 => None,
+        }
+    }
+
+    pub const fn next_emergency(self) -> Option<Self> {
+        match self {
+            Self::Q4 => Some(Self::E1),
+            Self::E1 => Some(Self::E2),
+            Self::Q0 | Self::Q1 | Self::Q2 | Self::Q3 | Self::E2 => None,
+        }
+    }
+
+    pub const fn next_higher(self) -> Option<Self> {
+        match self {
+            Self::E2 => Some(Self::E1),
+            Self::E1 => Some(Self::Q4),
+            Self::Q4 => Some(Self::Q3),
+            Self::Q3 => Some(Self::Q2),
+            Self::Q2 => Some(Self::Q1),
+            Self::Q1 => Some(Self::Q0),
+            Self::Q0 => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AdaptiveProfile {
+    pub id: AdaptiveProfileId,
+    pub quality: QualityProfile,
+    pub emergency: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AdaptiveProfileLadder {
+    profiles: [AdaptiveProfile; 7],
+}
+
+impl AdaptiveProfileLadder {
+    pub fn new(base_bitrate_mbps: f64) -> Self {
+        let q3_bitrate = base_bitrate_mbps.min(18.0);
+        let q4_bitrate = base_bitrate_mbps.min(15.0);
+        Self {
+            profiles: [
+                profile(AdaptiveProfileId::Q0, 1920, 1080, 60, base_bitrate_mbps),
+                profile(AdaptiveProfileId::Q1, 1600, 900, 60, base_bitrate_mbps),
+                profile(AdaptiveProfileId::Q2, 1280, 720, 60, base_bitrate_mbps),
+                profile(AdaptiveProfileId::Q3, 1280, 720, 60, q3_bitrate),
+                profile(AdaptiveProfileId::Q4, 1280, 720, 60, q4_bitrate),
+                profile(AdaptiveProfileId::E1, 1280, 720, 45, q4_bitrate),
+                profile(AdaptiveProfileId::E2, 1280, 720, 30, q4_bitrate),
+            ],
+        }
+    }
+
+    pub fn get(&self, id: AdaptiveProfileId) -> AdaptiveProfile {
+        self.profiles[usize::from(id.ladder_index())]
+    }
+
+    fn initial_id(&self, quality: QualityProfile) -> AdaptiveProfileId {
+        if quality.fps <= 30 && quality.width <= 1280 && quality.height <= 720 {
+            AdaptiveProfileId::E2
+        } else if quality.fps <= 45 && quality.width <= 1280 && quality.height <= 720 {
+            AdaptiveProfileId::E1
+        } else if quality.width >= 1920 || quality.height >= 1080 {
+            AdaptiveProfileId::Q0
+        } else if quality.width >= 1600 || quality.height >= 900 {
+            AdaptiveProfileId::Q1
+        } else {
+            AdaptiveProfileId::Q2
+        }
+    }
+}
+
+fn profile(
+    id: AdaptiveProfileId,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_mbps: f64,
+) -> AdaptiveProfile {
+    AdaptiveProfile {
+        id,
+        quality: QualityProfile {
+            width,
+            height,
+            fps,
+            bitrate_mbps,
+        },
+        emergency: id.is_emergency(),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum AdaptiveAction {
     SetBitrate {
@@ -516,6 +654,10 @@ pub struct AdaptiveTelemetry {
     pub bottleneck: Bottleneck,
     pub current: QualityProfile,
     pub nominal: QualityProfile,
+    pub profile_id: AdaptiveProfileId,
+    pub nominal_profile_id: AdaptiveProfileId,
+    pub profile_bitrate_floor_mbps: f64,
+    pub profile_bitrate_ceiling_mbps: f64,
     pub profile_generation: u64,
     pub reason: String,
     pub profile_changes: u64,
@@ -548,11 +690,12 @@ pub struct AdaptiveTelemetry {
 
 impl AdaptiveTelemetry {
     pub fn json_fragment(&self) -> String {
-        let (floor, ceiling) = self.current.bitrate_bounds();
         format!(
             concat!(
                 r#""adaptive_enabled":{},"adaptive_mode":"{}","adaptive_state":"{}","#,
                 r#""adaptive_bottleneck":"{}","adaptive_profile":"{}","#,
+                r#""adaptive_profile_id":"{}","adaptive_nominal_profile_id":"{}","#,
+                r#""adaptive_profile_emergency":{},"adaptive_ladder_index":{},"#,
                 r#""adaptive_profile_generation":{},"adaptive_reason":"{}","#,
                 r#""adaptive_profile_changes":{},"adaptive_bitrate_changes":{},"#,
                 r#""adaptive_resolution_changes":{},"adaptive_fps_changes":{},"#,
@@ -583,7 +726,11 @@ impl AdaptiveTelemetry {
             self.mode.name(),
             self.state.name(),
             self.bottleneck.name(),
-            self.current.profile_name(),
+            self.profile_id.name(),
+            self.profile_id.name(),
+            self.nominal_profile_id.name(),
+            self.profile_id.is_emergency(),
+            self.profile_id.ladder_index(),
             self.profile_generation,
             json_escape(&self.reason),
             self.profile_changes,
@@ -604,20 +751,20 @@ impl AdaptiveTelemetry {
             self.nominal.height,
             self.nominal.fps,
             self.nominal.bitrate_mbps,
-            floor,
-            ceiling,
+            self.profile_bitrate_floor_mbps,
+            self.profile_bitrate_ceiling_mbps,
             self.current.bpf(),
             bpf_for(
                 self.current.width,
                 self.current.height,
                 self.current.fps,
-                floor
+                self.profile_bitrate_floor_mbps
             ),
             bpf_for(
                 self.current.width,
                 self.current.height,
                 self.current.fps,
-                ceiling
+                self.profile_bitrate_ceiling_mbps
             ),
             self.interactive_lag_guard_active,
             self.interactive_lag_guard_entries,
@@ -652,6 +799,9 @@ impl AdaptiveTelemetry {
 
 pub struct AdaptiveQualityController {
     config: AdaptiveConfig,
+    profiles: AdaptiveProfileLadder,
+    current_profile_id: AdaptiveProfileId,
+    nominal_profile_id: AdaptiveProfileId,
     current: QualityProfile,
     nominal: QualityProfile,
     state: AdaptiveState,
@@ -695,8 +845,13 @@ impl AdaptiveQualityController {
         } else {
             AdaptiveState::Startup
         };
+        let profiles = AdaptiveProfileLadder::new(initial.bitrate_mbps);
+        let current_profile_id = profiles.initial_id(initial);
         Self {
             config,
+            profiles,
+            current_profile_id,
+            nominal_profile_id: current_profile_id,
             current: initial,
             nominal: initial,
             state,
@@ -736,6 +891,10 @@ impl AdaptiveQualityController {
 
     pub fn current(&self) -> QualityProfile {
         self.current
+    }
+
+    pub fn current_profile_id(&self) -> AdaptiveProfileId {
+        self.current_profile_id
     }
 
     pub fn set_nominal_fps(&mut self, fps: u32) {
@@ -906,6 +1065,18 @@ impl AdaptiveQualityController {
             bottleneck: self.bottleneck,
             current: self.current,
             nominal: self.nominal,
+            profile_id: self.current_profile_id,
+            nominal_profile_id: self.nominal_profile_id,
+            profile_bitrate_floor_mbps: self
+                .profiles
+                .get(self.current_profile_id)
+                .quality
+                .bitrate_mbps,
+            profile_bitrate_ceiling_mbps: self
+                .profiles
+                .get(self.current_profile_id)
+                .quality
+                .bitrate_mbps,
             profile_generation: self.profile_generation,
             reason: self.reason.clone(),
             profile_changes: self.profile_changes,

@@ -2197,7 +2197,7 @@ mod platform {
                 sent.frames_sent,
                 sent.bytes_sent,
                 sent.repair_send_bytes,
-                self.adaptive_controller.current().profile_name(),
+                self.adaptive_controller.current_profile_id().name(),
                 self.session_id,
                 crate::media_clock::optional_u64_json(pending_session_id),
                 optional_json_string(last_error),
