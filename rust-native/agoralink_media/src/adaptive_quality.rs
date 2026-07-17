@@ -1918,6 +1918,205 @@ mod tests {
         );
     }
 
+    fn force_network_degrade(
+        controller: &mut AdaptiveQualityController,
+        second: u64,
+        severe_windows: u64,
+    ) -> Option<AdaptiveAction> {
+        controller.pressure = PressureBreakdown {
+            network: PressureSeverity::Severe,
+            network_reason: "r4-deterministic-network-pressure",
+            ..PressureBreakdown::default()
+        };
+        controller.bottleneck = Bottleneck::NetworkPressure;
+        controller.severe_windows = severe_windows;
+        controller.degrade(Duration::from_secs(second), true)
+    }
+
+    fn force_stable_recovery(
+        controller: &mut AdaptiveQualityController,
+        second: u64,
+    ) -> Option<AdaptiveAction> {
+        controller.pressure = PressureBreakdown::default();
+        controller.bottleneck = Bottleneck::Stable;
+        controller.recover(Duration::from_secs(second))
+    }
+
+    fn assert_profile(
+        actual: QualityProfile,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_mbps: f64,
+    ) {
+        assert_eq!((actual.width, actual.height), (width, height));
+        assert_eq!(actual.fps, fps);
+        assert!(
+            (actual.bitrate_mbps - bitrate_mbps).abs() < 0.001,
+            "expected {bitrate_mbps} Mbps, got {} Mbps",
+            actual.bitrate_mbps
+        );
+    }
+
+    #[test]
+    fn r4_standard_ladder_degrades_adjacent_q0_through_q4() {
+        let mut controller = controller(QualityProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 22.0,
+        });
+
+        for (second, expected) in [
+            (40, (1600, 900, 60, 22.0)),
+            (80, (1280, 720, 60, 22.0)),
+            (120, (1280, 720, 60, 18.0)),
+            (160, (1280, 720, 60, 15.0)),
+        ] {
+            force_network_degrade(&mut controller, second, 3)
+                .expect("each adjacent R4 quality step should produce an action");
+            assert_profile(
+                controller.current(),
+                expected.0,
+                expected.1,
+                expected.2,
+                expected.3,
+            );
+        }
+    }
+
+    #[test]
+    fn r4_explicit_bitrate_ladder_obeys_minimum_caps() {
+        for (base, expected_bitrates) in [
+            (30.0, [30.0, 30.0, 30.0, 18.0, 15.0]),
+            (20.0, [20.0, 20.0, 20.0, 18.0, 15.0]),
+            (16.0, [16.0, 16.0, 16.0, 16.0, 15.0]),
+            (10.0, [10.0, 10.0, 10.0, 10.0, 10.0]),
+        ] {
+            let mut controller = controller(QualityProfile {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                bitrate_mbps: base,
+            });
+            assert_profile(controller.current(), 1920, 1080, 60, expected_bitrates[0]);
+
+            for (index, second) in [40, 80, 120, 160].into_iter().enumerate() {
+                force_network_degrade(&mut controller, second, 3)
+                    .expect("each adjacent R4 quality step should produce an action");
+                let (width, height) = match index {
+                    0 => (1600, 900),
+                    _ => (1280, 720),
+                };
+                assert_profile(
+                    controller.current(),
+                    width,
+                    height,
+                    60,
+                    expected_bitrates[index + 1],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r4_recovery_is_exact_reverse_adjacent_path() {
+        let nominal = QualityProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 22.0,
+        };
+        let mut controller = controller(nominal);
+        controller.current = QualityProfile {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate_mbps: 15.0,
+        };
+
+        for (second, expected) in [
+            (40, (1280, 720, 60, 18.0)),
+            (80, (1280, 720, 60, 22.0)),
+            (120, (1600, 900, 60, 22.0)),
+            (160, (1920, 1080, 60, 22.0)),
+        ] {
+            force_stable_recovery(&mut controller, second)
+                .expect("each reverse R4 quality step should produce an action");
+            assert_profile(
+                controller.current(),
+                expected.0,
+                expected.1,
+                expected.2,
+                expected.3,
+            );
+        }
+    }
+
+    #[test]
+    fn r4_emergency_fps_steps_are_only_reachable_below_q4() {
+        let nominal = QualityProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 22.0,
+        };
+        let mut controller = controller(nominal);
+        controller.current = QualityProfile {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate_mbps: 15.0,
+        };
+
+        assert!(force_network_degrade(&mut controller, 40, 4).is_none());
+        force_network_degrade(&mut controller, 80, 5)
+            .expect("Q4 sustained pressure should enter E1");
+        assert_profile(controller.current(), 1280, 720, 45, 15.0);
+        force_network_degrade(&mut controller, 120, 5)
+            .expect("E1 sustained pressure should enter E2");
+        assert_profile(controller.current(), 1280, 720, 30, 15.0);
+
+        force_stable_recovery(&mut controller, 160).expect("E2 should recover to E1");
+        assert_profile(controller.current(), 1280, 720, 45, 15.0);
+        force_stable_recovery(&mut controller, 200).expect("E1 should recover to Q4");
+        assert_profile(controller.current(), 1280, 720, 60, 15.0);
+    }
+
+    #[test]
+    fn r4_transition_suppresses_pressure_and_profile_generation() {
+        let initial = QualityProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 22.0,
+        };
+        let mut controller = controller(initial);
+        controller.begin_profile_transition();
+
+        for second in 1..=20 {
+            let mut snapshot = stable_snapshot();
+            snapshot.profile_transition_active = true;
+            snapshot.feedback_sample_eligible = false;
+            snapshot.damaged_gop_delta = 10;
+            snapshot.packets_lost_delta = 100;
+            assert!(controller
+                .observe(Duration::from_secs(second), snapshot)
+                .is_none());
+        }
+
+        let telemetry = controller.telemetry(Duration::from_secs(20));
+        assert_eq!(controller.current(), initial);
+        assert_eq!(telemetry.profile_generation, 0);
+        assert_eq!(telemetry.profile_changes, 0);
+        assert_eq!(telemetry.bitrate_changes, 0);
+        assert_eq!(telemetry.resolution_changes, 0);
+        assert_eq!(telemetry.fps_changes, 0);
+        assert_eq!(telemetry.mild_window_count, 0);
+        assert_eq!(telemetry.severe_window_count, 0);
+        assert_eq!(telemetry.stable_window_count, 0);
+    }
+
     #[test]
     fn deterministic_ten_minute_soak_has_no_self_excited_degradation() {
         let initial = QualityProfile {

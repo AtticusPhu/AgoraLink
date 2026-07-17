@@ -2916,3 +2916,60 @@ fn run_self_test() -> Result<(), String> {
 fn json_escape(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
 }
+
+#[cfg(test)]
+mod r4_cli_policy_tests {
+    use super::*;
+
+    fn screen_send_config(extra: &[&str]) -> h264_send_probe::H264SendConfig {
+        let mut args = vec![
+            "screen-send".to_string(),
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            "55134".to_string(),
+        ];
+        args.extend(extra.iter().map(|value| (*value).to_string()));
+        match parse_args(args).expect("screen-send arguments should parse") {
+            Command::ScreenSend(config) => config,
+            other => panic!("expected screen-send command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn r4_screen_send_default_is_complete_product_tuple() {
+        let config = screen_send_config(&[]);
+
+        assert_eq!((config.out_width, config.out_height), (1920, 1080));
+        assert_eq!(config.target_fps, 60);
+        assert!((config.bitrate_mbps - 22.0).abs() < f64::EPSILON);
+        assert_eq!(config.bitrate_selection.source.name(), "default");
+        assert_eq!(
+            config.adaptive.quality.mode,
+            adaptive_quality::AdaptiveMode::Off
+        );
+        assert_eq!(config.repair_mode.name(), "nack");
+        assert_eq!(config.encoder.name(), "auto");
+        assert_eq!(config.convert_backend.name(), "auto");
+    }
+
+    #[test]
+    fn r4_explicit_bitrate_overrides_quality_bpf() {
+        let config = screen_send_config(&["--bitrate-mbps", "30", "--quality-bpf", "1.0"]);
+
+        assert!((config.bitrate_mbps - 30.0).abs() < f64::EPSILON);
+        assert_eq!(config.bitrate_selection.source.name(), "explicit-bitrate");
+        assert_eq!(config.bitrate_selection.quality_bpf_requested, Some(1.0));
+    }
+
+    #[test]
+    fn r4_explicit_bitrate_is_preserved_with_adaptive_quality_off() {
+        let config = screen_send_config(&["--bitrate-mbps", "30", "--adaptive-quality", "off"]);
+
+        assert!((config.bitrate_mbps - 30.0).abs() < f64::EPSILON);
+        assert_eq!(
+            config.adaptive.quality.mode,
+            adaptive_quality::AdaptiveMode::Off
+        );
+    }
+}
