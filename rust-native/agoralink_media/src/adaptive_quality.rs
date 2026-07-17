@@ -2197,6 +2197,78 @@ mod tests {
     }
 
     #[test]
+    fn r4_q4_and_e2_do_not_cross_their_defined_boundaries() {
+        let mut controller = controller(QualityProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 22.0,
+        });
+        controller.current = controller.profiles.get(AdaptiveProfileId::Q4).quality;
+        controller.current_profile_id = AdaptiveProfileId::Q4;
+
+        assert!(force_network_degrade(&mut controller, 40, 4).is_none());
+        assert_eq!(controller.current_profile_id(), AdaptiveProfileId::Q4);
+        force_network_degrade(&mut controller, 80, 5).expect("Q4 should enter E1");
+        force_network_degrade(&mut controller, 120, 5).expect("E1 should enter E2");
+        assert!(force_network_degrade(&mut controller, 160, 20).is_none());
+        assert_eq!(controller.current_profile_id(), AdaptiveProfileId::E2);
+    }
+
+    #[test]
+    fn r4_configured_resolution_and_fps_floors_remain_enforced() {
+        let initial = QualityProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 22.0,
+        };
+        let mut resolution_floor = AdaptiveQualityController::new(
+            AdaptiveConfig {
+                mode: AdaptiveMode::Smoothness,
+                min_width: 1600,
+                min_height: 900,
+                ..AdaptiveConfig::default()
+            },
+            initial,
+            Duration::ZERO,
+        );
+        force_network_degrade(&mut resolution_floor, 40, 3)
+            .expect("Q0 should reach the configured Q1 floor");
+        assert!(force_network_degrade(&mut resolution_floor, 80, 3).is_none());
+        assert_eq!(resolution_floor.current_profile_id(), AdaptiveProfileId::Q1);
+
+        let mut fps_floor = controller(initial);
+        fps_floor.config.min_fps = 45;
+        fps_floor.current = fps_floor.profiles.get(AdaptiveProfileId::Q4).quality;
+        fps_floor.current_profile_id = AdaptiveProfileId::Q4;
+        force_network_degrade(&mut fps_floor, 40, 5).expect("Q4 should reach E1");
+        assert!(force_network_degrade(&mut fps_floor, 80, 5).is_none());
+        assert_eq!(fps_floor.current_profile_id(), AdaptiveProfileId::E1);
+    }
+
+    #[test]
+    fn r4_telemetry_reports_profile_identity_and_adjacent_edge() {
+        let mut controller = controller(QualityProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 22.0,
+        });
+        force_network_degrade(&mut controller, 40, 3).expect("Q0 should move to Q1");
+
+        let telemetry = controller.telemetry(Duration::from_secs(40));
+        assert_eq!(telemetry.profile_id, AdaptiveProfileId::Q1);
+        assert_eq!(telemetry.last_profile_from, Some(AdaptiveProfileId::Q0));
+        assert_eq!(telemetry.last_profile_to, Some(AdaptiveProfileId::Q1));
+        assert_eq!(telemetry.ladder_changes, 1);
+        let json = telemetry.json_fragment();
+        assert!(json.contains(r#""adaptive_profile_id":"Q1""#));
+        assert!(json.contains(r#""adaptive_profile_from":"Q0""#));
+        assert!(json.contains(r#""adaptive_profile_to":"Q1""#));
+    }
+
+    #[test]
     fn r4_transition_suppresses_pressure_and_profile_generation() {
         let initial = QualityProfile {
             width: 1920,

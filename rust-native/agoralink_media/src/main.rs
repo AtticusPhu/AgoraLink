@@ -2975,4 +2975,13 @@ mod r4_cli_policy_tests {
             adaptive_quality::AdaptiveMode::Off
         );
     }
+
+    #[test]
+    fn r4_quality_bpf_is_used_when_explicit_bitrate_is_absent() {
+        let config = screen_send_config(&["--quality-bpf", "0.5"]);
+        let expected = 1920.0 * 1080.0 * 60.0 * 0.5 / 1_000_000.0;
+
+        assert!((config.bitrate_mbps - expected).abs() < 0.001);
+        assert_eq!(config.bitrate_selection.source.name(), "quality-bpf");
+    }
 }
