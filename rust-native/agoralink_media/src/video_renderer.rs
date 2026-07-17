@@ -54,7 +54,7 @@ impl VideoRenderStats {
         let fallback_reason = self
             .fallback_reason
             .as_deref()
-            .map(|value| format!(r#"\"{}\""#, json_escape(value)))
+            .map(|value| format!(r#""{}""#, json_escape(value)))
             .unwrap_or_else(|| "null".to_string());
         format!(
             r#""render_backend":"{}","render_backend_requested":"{}","render_backend_selected":"{}","render_backend_fallback":{},"render_backend_fallback_reason":{},{},{}"#,
@@ -85,7 +85,28 @@ impl VideoRenderer {
         window_mode: WindowMode,
         requested: RenderBackend,
     ) -> Result<Self, String> {
-        let window = GdiViewerWindow::create(title, scale_mode, window_mode)?;
+        Self::create_with_display_detection(
+            title,
+            scale_mode,
+            window_mode,
+            requested,
+            crate::display_capability::DisplayRefreshDetect::Auto,
+        )
+    }
+
+    pub fn create_with_display_detection(
+        title: &str,
+        scale_mode: RenderScaleMode,
+        window_mode: WindowMode,
+        requested: RenderBackend,
+        display_refresh_detect: crate::display_capability::DisplayRefreshDetect,
+    ) -> Result<Self, String> {
+        let window = GdiViewerWindow::create_with_display_detection(
+            title,
+            scale_mode,
+            window_mode,
+            display_refresh_detect,
+        )?;
         let (selected, fallback_reason, d3d11) = match requested {
             RenderBackend::Gdi => (RenderBackend::Gdi, None, None),
             RenderBackend::D3d11 => match D3d11Nv12Renderer::new(window.hwnd(), 960, 600) {

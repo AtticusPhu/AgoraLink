@@ -311,9 +311,11 @@ from screen_profile import (
     profile_info,
 )
 from screen_runtime import (
+    DEFAULT_NATIVE_SCREEN_PRESET,
     NATIVE_LITE_FFMPEG_UNAVAILABLE_MESSAGE,
-    NATIVE_LITE_VIDEO_ONLY_MESSAGE,
+    NATIVE_SCREEN_PRESETS,
     ScreenRuntime,
+    native_screen_preset_info,
 )
 from diagnostic_export import export_diagnostic_bundle
 from file_packaging import package_files_to_zip
@@ -2136,12 +2138,19 @@ class RUDPTransferRoot(BoxLayout):
         self.chat_nickname = os.environ.get("USERNAME") or "AgoraLinkUser"
         self.gui_config = load_gui_config()
         self.auto_package_multi_selection = bool(self.gui_config.get("auto_package_multi_selection", True))
-        self.share_system_audio = bool(self.gui_config.get("screen_share_system_audio", False))
+        saved_audio_enabled = bool(self.gui_config.get("screen_share_system_audio", False))
+        self.screen_audio_mode = self._normalize_screen_audio_mode(
+            self.gui_config.get("screen_share_audio_mode", "system" if saved_audio_enabled else "off")
+        )
+        self.share_system_audio = bool(saved_audio_enabled and self.screen_audio_mode == "system")
         self.screen_package_info = self._screen_package_capabilities()
         self.screen_backend_notice = ""
         self.screen_backend = self._coerce_screen_backend_for_package(
             self.gui_config.get("screen_backend", self._default_screen_backend()),
             persist=True,
+        )
+        self.screen_native_preset = self._normalize_native_screen_preset(
+            self.gui_config.get("screen_native_preset", DEFAULT_NATIVE_SCREEN_PRESET)
         )
         self.current_chat_mode = "group"
         self.current_group_id = ""
@@ -4178,17 +4187,21 @@ class RUDPTransferRoot(BoxLayout):
         self._add_runtime_chat_card(card, peer_id=peer_id or self.screen_share_peer_id or self.current_peer_id)
 
     def _screen_audio_enabled(self) -> bool:
-        return bool(getattr(self, "share_system_audio", False))
+        return bool(getattr(self, "share_system_audio", False)) and self._screen_audio_mode() == "system"
 
     def _screen_package_capabilities(self) -> Dict[str, object]:
         try:
-            runtime = getattr(self.app, "screen_runtime", None) or ScreenRuntime()
+            runtime = self._screen_runtime()
             return dict(runtime.screen_package_info())
         except Exception:
             return {
                 "package_flavor": "unknown",
                 "native_lite": False,
                 "rust_native_available": False,
+                "rust_audio_capture_available": False,
+                "rust_audio_playback_available": False,
+                "native_screen_av_sync_supported": False,
+                "rust_audio_capability_error": "",
                 "bundled_ffmpeg_available": False,
                 "screen_backend_default": SCREEN_BACKEND_FFMPEG,
                 "native_screen_video_only": True,
@@ -4231,24 +4244,46 @@ class RUDPTransferRoot(BoxLayout):
 
     def _about_detail_text(self) -> str:
         package = self._screen_package_snapshot()
+        runtime_exe = Path(sys.executable).name if str(sys.executable or "").strip() else "python"
+        bundled_ffmpeg = bool(package.get("bundled_ffmpeg_available"))
+        rust_native = bool(package.get("rust_native_available"))
+        rust_audio_capture = bool(package.get("rust_audio_capture_available"))
+        rust_audio_playback = bool(package.get("rust_audio_playback_available"))
+        native_av_sync = bool(package.get("native_screen_av_sync_supported"))
         lines = [
             f"Package: {self._package_flavor_label(package.get('package_flavor'))}",
+            f"Python runtime: {runtime_exe} {sys.version.split()[0]}",
+            f"Rust native backend available: {str(rust_native).lower()}",
+            f"Rust audio capture available: {str(rust_audio_capture).lower()}",
+            f"Rust audio playback available: {str(rust_audio_playback).lower()}",
+            f"Native screen A/V sync supported: {str(native_av_sync).lower()}",
+            f"Bundled FFmpeg available: {str(bundled_ffmpeg).lower()}",
             f"Screen backend: {self._screen_backend_label(self._screen_backend())}",
             f"FFmpeg: {self._ffmpeg_availability_label()}",
+            f"Native preset: {self._native_screen_preset_label()}",
+            f"App data dir: {user_data_dir()}",
+            f"Log dir: {debug_log_dir()}",
         ]
         if bool(package.get("native_screen_video_only", True)):
             lines.append("Native screen: video-only")
+        elif native_av_sync:
+            lines.append("Native screen: system audio with audio-master A/V sync")
         return "\n".join(lines)
 
     def _screen_share_capability_text(self) -> str:
         package = self._screen_package_snapshot()
         backend = self._screen_backend()
         backend_label = self._screen_backend_label(backend)
-        if bool(package.get("native_lite")):
-            return "Rust native video backend · no FFmpeg · video-only screen sharing"
+        preset_label = self._native_screen_preset_label()
         if backend == SCREEN_BACKEND_RUST:
+            audio_text = (
+                "system audio available"
+                if bool(package.get("rust_audio_capture_available"))
+                else "system audio unavailable"
+            )
+            sync_text = "A/V sync" if bool(package.get("native_screen_av_sync_supported")) else "video-only fallback"
             ffmpeg_text = "FFmpeg bundled" if bool(package.get("bundled_ffmpeg_available")) else "FFmpeg unavailable"
-            return f"{backend_label} backend · {ffmpeg_text} · video-only screen sharing"
+            return f"{backend_label} backend · {ffmpeg_text} · {audio_text} · {sync_text} · {preset_label}"
         if bool(package.get("bundled_ffmpeg_available")):
             return f"{backend_label} backend · FFmpeg available · system audio available"
         return f"{backend_label} backend · FFmpeg unavailable · Rust native video-only fallback"
@@ -4283,6 +4318,43 @@ class RUDPTransferRoot(BoxLayout):
             return fallback
         return value
 
+    @staticmethod
+    def _normalize_screen_audio_mode(value: object = None) -> str:
+        return "system" if str(value or "off").strip().lower() == "system" else "off"
+
+    def _screen_audio_mode(self) -> str:
+        value = self._normalize_screen_audio_mode(getattr(self, "screen_audio_mode", "off"))
+        self.screen_audio_mode = value
+        return value
+
+    def _rust_audio_available_for_role(self, role: str) -> bool:
+        package = self._screen_package_snapshot()
+        key = "rust_audio_capture_available" if role == "capture" else "rust_audio_playback_available"
+        return bool(package.get(key))
+
+    def _screen_audio_available_for_backend(self, backend: object, role: str = "capture") -> bool:
+        backend_name = self._normalize_screen_backend(backend)
+        if backend_name == SCREEN_BACKEND_RUST:
+            return self._rust_audio_available_for_role(role)
+        return not self._native_lite_package()
+
+    def _screen_audio_status_text(self, backend: object = None, role: str = "capture") -> str:
+        backend_name = self._normalize_screen_backend(backend or self._screen_backend())
+        try:
+            runtime_state = dict(self._screen_runtime().get_state())
+        except Exception:
+            runtime_state = {}
+        audio_state = str(runtime_state.get("audio_state") or "").strip().lower()
+        if audio_state == "capturing":
+            return "Capturing"
+        if audio_state == "playing":
+            return "Playing"
+        if audio_state in ("fallback_video_only", "audio_failed", "audio_failed_video_only", "unavailable"):
+            return "Unavailable · Video only"
+        if self._screen_audio_available_for_backend(backend_name, role):
+            return "Available"
+        return "Unavailable"
+
     def _coerce_screen_backend_for_package(self, backend: object, *, persist: bool = False) -> str:
         value = self._normalize_screen_backend(backend)
         package = self._screen_package_snapshot()
@@ -4306,20 +4378,56 @@ class RUDPTransferRoot(BoxLayout):
         value = self._normalize_screen_backend(self._screen_backend() if backend is None else backend)
         return "Rust Native" if value == SCREEN_BACKEND_RUST else "FFmpeg"
 
+    def _normalize_native_screen_preset(self, value: object = None) -> str:
+        return str(native_screen_preset_info(value).get("id") or DEFAULT_NATIVE_SCREEN_PRESET)
+
+    def _native_screen_preset(self) -> str:
+        value = self._normalize_native_screen_preset(getattr(self, "screen_native_preset", DEFAULT_NATIVE_SCREEN_PRESET))
+        self.screen_native_preset = value
+        return value
+
+    def _native_screen_preset_label(self, value: object = None) -> str:
+        preset = native_screen_preset_info(self._native_screen_preset() if value is None else value)
+        return str(preset.get("label") or NATIVE_SCREEN_PRESETS[DEFAULT_NATIVE_SCREEN_PRESET]["label"])
+
+    def _native_screen_preset_from_label(self, label: object) -> str:
+        text = str(label or "").strip()
+        for key, preset in NATIVE_SCREEN_PRESETS.items():
+            if text == str(preset.get("label") or ""):
+                return str(key)
+        return self._normalize_native_screen_preset(text)
+
     def _screen_backend_from_control(self, control: Dict[str, object], payload: Optional[Dict[str, object]] = None, default: object = SCREEN_BACKEND_FFMPEG) -> str:
         payload = dict(payload or control.get("payload") or {})
         return self._normalize_screen_backend(payload.get("backend") or control.get("backend") or default)
 
-    def _screen_audio_for_backend(self, backend: object, audio: Dict[str, object]) -> Dict[str, object]:
+    def _screen_audio_for_backend(
+        self,
+        backend: object,
+        audio: Dict[str, object],
+        *,
+        role: str = "capture",
+    ) -> Dict[str, object]:
         backend_name = self._normalize_screen_backend(backend)
         if backend_name == SCREEN_BACKEND_RUST and bool((audio or {}).get("enabled")):
-            message = NATIVE_LITE_VIDEO_ONLY_MESSAGE if self._native_lite_package() else "Rust native backend currently supports video only"
-            return {
-                "enabled": False,
-                "mode": "none",
-                "state": "video_only",
-                "error": message,
-            }
+            if not self._screen_audio_available_for_backend(backend_name, role):
+                detail = str(self._screen_package_snapshot().get("rust_audio_capability_error") or "").strip()
+                action = "capture" if role == "capture" else "playback"
+                message = f"Rust native system audio {action} is unavailable; continuing video-only."
+                if detail:
+                    message = f"{message} {detail}"
+                return {
+                    "enabled": False,
+                    "mode": "none",
+                    "backend": "rust",
+                    "role": role,
+                    "requested": True,
+                    "state": "fallback_video_only",
+                    "error": message,
+                }
+            result = dict(audio or {})
+            result.update({"backend": "rust", "role": role, "requested": True, "state": "available"})
+            return result
         return dict(audio or {"enabled": False, "mode": "none"})
 
     def _screen_audio_config(self, enabled: Optional[bool] = None) -> Dict[str, object]:
@@ -5547,7 +5655,7 @@ class RUDPTransferRoot(BoxLayout):
 
     def open_settings_popup(self) -> None:
         content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
-        app_info_box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(116), spacing=dp(4))
+        app_info_box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(254), spacing=dp(4))
         app_info_title = make_label(
             text=self._about_title_text(),
             size_hint_y=None,
@@ -5561,7 +5669,7 @@ class RUDPTransferRoot(BoxLayout):
         app_info_detail = make_label(
             text=self._about_detail_text(),
             size_hint_y=None,
-            height=dp(86),
+            height=dp(224),
             halign="left",
             valign="top",
             color=THEME["muted_text"],
@@ -5585,11 +5693,35 @@ class RUDPTransferRoot(BoxLayout):
         audio_label_text = "共享系统音频" if self.lang == "zh" else "Share system audio"
         audio_line.add_widget(make_label(text=audio_label_text, size_hint_x=None, width=dp(220), color=THEME["muted_text"], halign="left", valign="middle"))
         bind_label_wrap(audio_line.children[0])
-        audio_available = self._screen_backend() == SCREEN_BACKEND_FFMPEG and not self._native_lite_package()
-        audio_checkbox = CheckBox(active=bool(getattr(self, "share_system_audio", False)) and audio_available, size_hint_x=None, width=dp(42))
+        audio_available = self._screen_audio_available_for_backend(self._screen_backend(), "capture")
+        audio_checkbox = CheckBox(
+            active=bool(getattr(self, "share_system_audio", False)) and self._screen_audio_mode() == "system" and audio_available,
+            size_hint_x=None,
+            width=dp(42),
+        )
         audio_checkbox.disabled = not audio_available
         audio_line.add_widget(audio_checkbox)
         content.add_widget(audio_line)
+        audio_mode_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(8))
+        audio_mode_line.add_widget(make_label(text="Audio mode", size_hint_x=None, width=dp(220), color=THEME["muted_text"], halign="left", valign="middle"))
+        audio_mode_spinner = style_spinner(
+            Spinner(text=self._screen_audio_mode(), values=["off", "system"], font_name=UI_FONT)
+        )
+        audio_mode_spinner.disabled = not audio_available
+        audio_mode_line.add_widget(audio_mode_spinner)
+        content.add_widget(audio_mode_line)
+        audio_status_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(8))
+        audio_status_line.add_widget(make_label(text="Audio status", size_hint_x=None, width=dp(220), color=THEME["muted_text"], halign="left", valign="middle"))
+        audio_status_label = make_label(
+            text=self._screen_audio_status_text(self._screen_backend(), "capture"),
+            halign="left",
+            valign="middle",
+            color=THEME["muted_text"],
+            shorten=True,
+        )
+        bind_label_wrap(audio_status_label)
+        audio_status_line.add_widget(audio_status_label)
+        content.add_widget(audio_status_line)
         backend_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(8))
         backend_line.add_widget(make_label(text="Screen backend", size_hint_x=None, width=dp(220), color=THEME["muted_text"], halign="left", valign="middle"))
         bind_label_wrap(backend_line.children[0])
@@ -5598,20 +5730,29 @@ class RUDPTransferRoot(BoxLayout):
         )
         backend_line.add_widget(backend_spinner)
         content.add_widget(backend_line)
-        if self._native_lite_package():
-            native_lite_note = make_label(
-                text=NATIVE_LITE_VIDEO_ONLY_MESSAGE,
+        preset_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(8))
+        preset_line.add_widget(make_label(text="Native screen preset", size_hint_x=None, width=dp(220), color=THEME["muted_text"], halign="left", valign="middle"))
+        bind_label_wrap(preset_line.children[0])
+        preset_values = [str(item.get("label") or key) for key, item in NATIVE_SCREEN_PRESETS.items()]
+        preset_spinner = style_spinner(
+            Spinner(text=self._native_screen_preset_label(), values=preset_values, font_name=UI_FONT)
+        )
+        preset_line.add_widget(preset_spinner)
+        content.add_widget(preset_line)
+        if not audio_available:
+            audio_note = make_label(
+                text="System audio is unavailable with the selected backend. Video-only screen sharing remains available.",
                 size_hint_y=None,
                 height=dp(42),
                 halign="left",
                 valign="middle",
                 color=THEME["muted_text"],
             )
-            bind_label_wrap(native_lite_note)
-            content.add_widget(native_lite_note)
-        elif not audio_available:
+            bind_label_wrap(audio_note)
+            content.add_widget(audio_note)
+        elif self._screen_backend() == SCREEN_BACKEND_RUST:
             audio_note = make_label(
-                text="System audio is unavailable with the current Rust native backend. Switch to FFmpeg backend to use system audio.",
+                text="Rust native system audio uses WASAPI loopback and audio-master A/V sync. The setting applies to the next screen share.",
                 size_hint_y=None,
                 height=dp(42),
                 halign="left",
@@ -5633,9 +5774,33 @@ class RUDPTransferRoot(BoxLayout):
         buttons = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(42), spacing=dp(8))
         popup = style_popup(Popup(title="设置", content=content, size_hint=(0.58, 0.42)))
         try:
-            popup.size_hint = (0.62, 0.54)
+            popup.size_hint = (0.72, 0.78)
         except Exception:
             pass
+        def _sync_audio_controls(*_args) -> None:
+            selected_backend = self._normalize_screen_backend(backend_spinner.text)
+            available = self._screen_audio_available_for_backend(selected_backend, "capture")
+            audio_checkbox.disabled = not available
+            audio_mode_spinner.disabled = not available
+            if not available:
+                audio_checkbox.active = False
+                audio_mode_spinner.text = "off"
+            elif audio_checkbox.active and audio_mode_spinner.text != "system":
+                audio_mode_spinner.text = "system"
+            audio_status_label.text = self._screen_audio_status_text(selected_backend, "capture")
+
+        def _sync_audio_checkbox(_instance, active) -> None:
+            if not audio_checkbox.disabled:
+                audio_mode_spinner.text = "system" if active else "off"
+
+        def _sync_audio_mode(_instance, value) -> None:
+            if not audio_checkbox.disabled:
+                audio_checkbox.active = self._normalize_screen_audio_mode(value) == "system"
+
+        backend_spinner.bind(text=_sync_audio_controls)
+        audio_checkbox.bind(active=_sync_audio_checkbox)
+        audio_mode_spinner.bind(text=_sync_audio_mode)
+
         def _apply_theme(*_):
             self.theme_mode = theme_spinner.text
             self.apply_theme_mode(self.theme_mode)
@@ -5643,14 +5808,22 @@ class RUDPTransferRoot(BoxLayout):
             old_backend = self._screen_backend()
             self.auto_package_multi_selection = bool(package_checkbox.active)
             self.screen_backend = self._coerce_screen_backend_for_package(backend_spinner.text, persist=False)
-            selected_audio_available = self.screen_backend == SCREEN_BACKEND_FFMPEG and not self._native_lite_package()
-            self.share_system_audio = bool(audio_checkbox.active) and selected_audio_available
+            self.screen_native_preset = self._native_screen_preset_from_label(preset_spinner.text)
+            selected_audio_available = self._screen_audio_available_for_backend(self.screen_backend, "capture")
+            self.screen_audio_mode = self._normalize_screen_audio_mode(audio_mode_spinner.text)
+            self.share_system_audio = bool(audio_checkbox.active) and self.screen_audio_mode == "system" and selected_audio_available
+            if not self.share_system_audio:
+                self.screen_audio_mode = "off"
             if backend_spinner.text != self.screen_backend:
                 backend_spinner.text = self.screen_backend
+            if preset_spinner.text != self._native_screen_preset_label():
+                preset_spinner.text = self._native_screen_preset_label()
             try:
                 self.gui_config["auto_package_multi_selection"] = bool(self.auto_package_multi_selection)
                 self.gui_config["screen_share_system_audio"] = bool(self.share_system_audio)
+                self.gui_config["screen_share_audio_mode"] = str(self.screen_audio_mode)
                 self.gui_config["screen_backend"] = str(self.screen_backend)
+                self.gui_config["screen_native_preset"] = str(self.screen_native_preset)
                 save_gui_config(self.gui_config)
             except Exception:
                 pass
@@ -5681,10 +5854,18 @@ class RUDPTransferRoot(BoxLayout):
             "app_dir": str(APP_DIR),
             "package_flavor": str(self._screen_package_snapshot().get("package_flavor") or ""),
             "rust_native_available": bool(self._screen_package_snapshot().get("rust_native_available")),
+            "rust_audio_capture_available": bool(self._screen_package_snapshot().get("rust_audio_capture_available")),
+            "rust_audio_playback_available": bool(self._screen_package_snapshot().get("rust_audio_playback_available")),
+            "native_screen_av_sync_supported": bool(self._screen_package_snapshot().get("native_screen_av_sync_supported")),
             "bundled_ffmpeg_available": bool(self._screen_package_snapshot().get("bundled_ffmpeg_available")),
             "screen_backend_default": str(self._screen_package_snapshot().get("screen_backend_default") or ""),
+            "screen_backend": self._screen_backend(),
+            "screen_native_preset": self._native_screen_preset(),
+            "screen_native_preset_label": self._native_screen_preset_label(),
+            "screen_capability": self._screen_share_capability_text(),
             "native_screen_video_only": bool(self._screen_package_snapshot().get("native_screen_video_only", True)),
             "user_data_dir": str(user_data_dir()),
+            "debug_log_dir": str(debug_log_dir()),
             "chat_unlocked": bool(getattr(self, "chat_unlocked", False)),
             "local_peer_id": str(getattr(self, "chat_local_peer_id", "") or ""),
             "nickname": str(getattr(self, "chat_nickname", "") or ""),
@@ -5732,15 +5913,28 @@ class RUDPTransferRoot(BoxLayout):
             summary["file_transfers_error"] = str(exc)
         return summary
 
+    def _safe_gui_config_snapshot(self) -> Dict[str, object]:
+        return {
+            "theme_mode": str(getattr(self, "theme_mode", "") or ""),
+            "auto_package_multi_selection": bool(getattr(self, "auto_package_multi_selection", True)),
+            "screen_backend": self._screen_backend(),
+            "screen_native_preset": self._native_screen_preset(),
+            "screen_share_system_audio": bool(getattr(self, "share_system_audio", False)),
+            "screen_share_audio_mode": self._screen_audio_mode(),
+            "native_lite": self._native_lite_package(),
+            "native_screen_video_only": bool(self._screen_package_snapshot().get("native_screen_video_only", True)),
+        }
+
     def _export_diagnostic_logs_payload(self) -> str:
         return export_diagnostic_bundle(
             screen_runtime=self._screen_runtime(),
             extra_json={
                 "chat_state_summary.json": self._chat_diagnostic_summary(),
+                "config_snapshot.json": self._safe_gui_config_snapshot(),
+                "screen_capability_snapshot.json": self._diagnostic_snapshot(),
             },
             extra_text={
                 "gui_runtime_recent.log": "\n".join(getattr(self, "debug_runtime_lines", [])[-1000:]),
-                "gui_protocol_recent.log": "\n".join(getattr(self, "debug_protocol_lines", [])[-1000:]),
             },
         )
 
@@ -6178,10 +6372,17 @@ class RUDPTransferRoot(BoxLayout):
             "dependencies": deps,
             "package_flavor": str(package_info.get("package_flavor") or ""),
             "rust_native_available": bool(package_info.get("rust_native_available") or package_info.get("rust_native_ok") or package_info.get("native_media_ok")),
+            "rust_audio_capture_available": bool(package_info.get("rust_audio_capture_available")),
+            "rust_audio_playback_available": bool(package_info.get("rust_audio_playback_available")),
+            "native_screen_av_sync_supported": bool(package_info.get("native_screen_av_sync_supported")),
+            "rust_audio_capability_error": str(package_info.get("rust_audio_capability_error") or ""),
             "bundled_ffmpeg_available": bool(package_info.get("bundled_ffmpeg_available")),
             "screen_backend_default": str(package_info.get("screen_backend_default") or self._default_screen_backend()),
             "native_screen_video_only": bool(package_info.get("native_screen_video_only", True)),
             "screen_backend": self._screen_backend(),
+            "screen_native_preset": self._native_screen_preset(),
+            "screen_native_preset_label": self._native_screen_preset_label(),
+            "screen_capability": self._screen_share_capability_text(),
             "receiver_running": receiver_running,
             "main_port": main_port,
             "screen_ports": screen_ports,
@@ -6191,13 +6392,20 @@ class RUDPTransferRoot(BoxLayout):
     def _diagnostic_package_summary(self, snapshot: Dict[str, object]) -> Tuple[str, str, str]:
         flavor = str(snapshot.get("package_flavor") or "unknown")
         rust_ok = bool(snapshot.get("rust_native_available"))
+        rust_audio_capture = bool(snapshot.get("rust_audio_capture_available"))
+        rust_audio_playback = bool(snapshot.get("rust_audio_playback_available"))
+        native_av_sync = bool(snapshot.get("native_screen_av_sync_supported"))
         bundled_ffmpeg = bool(snapshot.get("bundled_ffmpeg_available"))
         default_backend = self._normalize_screen_backend(snapshot.get("screen_backend_default") or self._default_screen_backend())
         video_only = bool(snapshot.get("native_screen_video_only"))
         detail = (
             f"package_flavor={flavor}; rust_native_available={str(rust_ok).lower()}; "
+            f"rust_audio_capture_available={str(rust_audio_capture).lower()}; "
+            f"rust_audio_playback_available={str(rust_audio_playback).lower()}; "
+            f"native_screen_av_sync_supported={str(native_av_sync).lower()}; "
             f"bundled_ffmpeg_available={str(bundled_ffmpeg).lower()}; "
             f"screen_backend_default={default_backend}; "
+            f"native_preset={self._native_screen_preset_label()}; "
             f"native_screen_video_only={str(video_only).lower()}"
         )
         if flavor == "native_lite":
@@ -6376,7 +6584,11 @@ class RUDPTransferRoot(BoxLayout):
                 return
             selected_profile = self._screen_preferred_profile()
             peer_label = "Debug"
-            audio_config = self._screen_audio_config(False)
+            audio_config = self._screen_audio_for_backend(
+                backend,
+                self._screen_audio_config(),
+                role="playback",
+            )
             state = self._screen_runtime().start_receiver(
                 port=screen_port,
                 profile=selected_profile,
@@ -6385,6 +6597,7 @@ class RUDPTransferRoot(BoxLayout):
                 screen_port=screen_port,
                 audio=audio_config,
                 backend=backend,
+                native_preset=self._native_screen_preset(),
             )
             if str(state.get("state") or "") == "receiving":
                 self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=screen_port, audio=audio_config, backend=backend)
@@ -6422,6 +6635,7 @@ class RUDPTransferRoot(BoxLayout):
                 system_audio=bool(audio_config.get("enabled")),
                 audio=audio_config,
                 backend=backend,
+                native_preset=self._native_screen_preset(),
             )
             if str(state.get("state") or "") == "sending":
                 self._set_current_screen_context(peer_label=peer_label, profile=selected_profile, port=debug_port, audio=self._screen_audio_from_runtime_state(state, audio_config), backend=backend)
@@ -6473,6 +6687,8 @@ class RUDPTransferRoot(BoxLayout):
         profile: str,
         port: object,
         offered_audio: Dict[str, object],
+        screen_state: str = "sending",
+        direction: str = "outgoing",
     ) -> None:
         if not bool((offered_audio or {}).get("enabled")):
             return
@@ -6485,7 +6701,7 @@ class RUDPTransferRoot(BoxLayout):
                     return
                 audio_detail = self._screen_audio_from_runtime_state(state, offered_audio)
                 audio_text = self._screen_audio_text(audio_detail)
-                status_text = self._screen_share_status_text("sending", peer_label=peer_label, profile=profile, port=port)
+                status_text = self._screen_share_status_text(screen_state, peer_label=peer_label, profile=profile, port=port)
                 if peer_id:
                     self._add_screen_chat_card(
                         CARD_SCREEN_STATE,
@@ -6498,7 +6714,7 @@ class RUDPTransferRoot(BoxLayout):
                         profile=profile,
                         port=port,
                         actions=[{"label": "Stop", "action": "stop_screen", "style": "danger"}],
-                        direction="outgoing",
+                        direction=direction,
                     )
                 self._set_current_screen_context(peer_label=peer_label, profile=profile, port=int(port), audio=audio_detail)
                 self._set_screen_share_status(f"{status_text} · {audio_text}")
@@ -6826,8 +7042,8 @@ class RUDPTransferRoot(BoxLayout):
                 self._set_screen_share_ui_state("idle")
                 return
             audio_config = self._screen_audio_for_backend(backend, self._screen_audio_config())
-            if backend == SCREEN_BACKEND_RUST and bool(self._screen_audio_config().get("enabled")):
-                self._set_screen_share_status(str(audio_config.get("error") or NATIVE_LITE_VIDEO_ONLY_MESSAGE))
+            if bool(self._screen_audio_config().get("enabled")) and not bool(audio_config.get("enabled")):
+                self._set_screen_share_status(str(audio_config.get("error") or "System audio unavailable, continued video-only."))
             peer_id = str(self.current_peer_id or "")
             peer_label = self._screen_peer_label(peer_id)
             self._append_debug_line(
@@ -7058,7 +7274,11 @@ class RUDPTransferRoot(BoxLayout):
         sender_host = str(payload.get("host") or "").strip()
         peer_label = self._screen_peer_label(sender, sender_host)
         backend = self._screen_backend_from_control(control, payload, SCREEN_BACKEND_FFMPEG)
-        audio_config = self._screen_audio_for_backend(backend, self._screen_audio_from_control(control, payload))
+        audio_config = self._screen_audio_for_backend(
+            backend,
+            self._screen_audio_from_control(control, payload),
+            role="playback",
+        )
         try:
             if session_id:
                 self.pending_screen_offers.pop(session_id, None)
@@ -7141,6 +7361,7 @@ class RUDPTransferRoot(BoxLayout):
                 screen_port=screen_port,
                 audio=audio_config,
                 backend=backend,
+                native_preset=self._native_screen_preset(),
             )
             if str(state.get("state") or "") != "receiving":
                 reason = self._screen_runtime_error_detail(self._screen_runtime().get_state())
@@ -7190,6 +7411,16 @@ class RUDPTransferRoot(BoxLayout):
             )
             self._send_screen_control_to_peer(sender, accept)
             self._append_debug_line(f"receiver actually used port/profile: {screen_port}/{selected_profile_name}", protocol=False)
+            self._schedule_screen_audio_fallback_ui_update(
+                session_id=session_id,
+                peer_id=sender,
+                peer_label=peer_label,
+                profile=selected_profile_name,
+                port=screen_port,
+                offered_audio=audio_config,
+                screen_state="receiving",
+                direction="incoming",
+            )
             self._set_screen_share_status(status_text)
         except Exception as exc:
             self._clear_current_screen_context()
@@ -7248,7 +7479,7 @@ class RUDPTransferRoot(BoxLayout):
         if not audio_field_present and not bool(audio_config.get("enabled")):
             audio_config = dict(getattr(self, "screen_share_current_audio", {}) or self._screen_audio_config())
         backend = self._screen_backend_from_control(control, payload, getattr(self, "screen_share_current_backend", SCREEN_BACKEND_FFMPEG))
-        audio_config = self._screen_audio_for_backend(backend, audio_config)
+        audio_config = self._screen_audio_for_backend(backend, audio_config, role="capture")
         try:
             host = str(payload.get("host") or "").strip()
             if not host or is_unspecified_ip(host):
@@ -7299,6 +7530,7 @@ class RUDPTransferRoot(BoxLayout):
                 system_audio=bool(audio_config.get("enabled")),
                 audio=audio_config,
                 backend=backend,
+                native_preset=self._native_screen_preset(),
             )
             if str(state.get("state") or "") != "sending":
                 reason = self._screen_runtime_error_detail(self._screen_runtime().get_state())

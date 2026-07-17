@@ -97,6 +97,10 @@ mod platform {
         let mut bytes_written = 0u64;
         let mut first_packet_at: Option<Instant> = None;
         let mut last_packet_at: Option<Instant> = None;
+        let mut profile_change_sequence = 0u64;
+        let mut profile_changes_received = 0u64;
+        let mut stale_profile_packets_dropped = 0u64;
+        let mut waiting_profile_idr = false;
 
         eprintln!(
             "h264-recv-dump bind={}:{} output={} idle_timeout_sec={} drop_damaged_gop={}",
@@ -112,6 +116,35 @@ mod platform {
                     let received_at = Instant::now();
                     first_packet_at.get_or_insert(received_at);
                     last_packet_at = Some(received_at);
+                    if crate::media_control::is_profile_change(&buffer[..length]) {
+                        if let Ok(change) =
+                            crate::media_control::ProfileChange::decode(&buffer[..length])
+                        {
+                            if change.change_sequence > profile_change_sequence
+                                && reassembler.session_id() == Some(change.old_session_id)
+                            {
+                                reassembler.switch_session(change.new_session_id)?;
+                                damaged_gop.reset_for_profile_change();
+                                previous_expired = reassembler.stats().frames_incomplete_expired;
+                                waiting_profile_idr = true;
+                                profile_change_sequence = change.change_sequence;
+                                profile_changes_received =
+                                    profile_changes_received.saturating_add(1);
+                            }
+                        }
+                        continue;
+                    }
+                    if crate::repair::media_packet_key(&buffer[..length]).is_some_and(
+                        |(packet_session, _, _)| {
+                            reassembler
+                                .session_id()
+                                .is_some_and(|session_id| session_id != packet_session)
+                        },
+                    ) {
+                        stale_profile_packets_dropped =
+                            stale_profile_packets_dropped.saturating_add(1);
+                        continue;
+                    }
                     match reassembler.accept_datagram(&buffer[..length], received_at) {
                         Ok(frames) => {
                             detect_damage(
@@ -127,6 +160,7 @@ mod platform {
                                 received_at,
                                 &mut frames_written,
                                 &mut bytes_written,
+                                &mut waiting_profile_idr,
                             )?
                         }
                         Err(_) => {}
@@ -148,6 +182,7 @@ mod platform {
                 now,
                 &mut frames_written,
                 &mut bytes_written,
+                &mut waiting_profile_idr,
             )?;
 
             if now.duration_since(report_at) >= Duration::from_secs(1) {
@@ -157,7 +192,7 @@ mod platform {
                 let frame_delta = frames_written.saturating_sub(previous_frames);
                 let byte_delta = stats.bytes_received.saturating_sub(previous_bytes);
                 println!(
-                    r#"{{"type":"H264_RECV_STATS","mode":"h264_recv_dump","session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_incomplete_expired":{},"frames_written":{},"bytes_received":{},"bytes_written":{},"packets_per_sec":{:.2},"fps":{:.2},"mbps":{:.3},"last_frame_id":{},"inflight_frames":{},"completed_waiting":{},"udp_recv_buffer_bytes":{},{} }}"#,
+                    r#"{{"type":"H264_RECV_STATS","mode":"h264_recv_dump","session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_incomplete_expired":{},"frames_written":{},"bytes_received":{},"bytes_written":{},"packets_per_sec":{:.2},"fps":{:.2},"mbps":{:.3},"last_frame_id":{},"inflight_frames":{},"completed_waiting":{},"udp_recv_buffer_bytes":{},"profile_changes_received":{},"profile_change_sequence":{},"stale_profile_packets_dropped":{},"waiting_profile_idr":{},{} }}"#,
                     optional_u64_json(reassembler.session_id()),
                     stats.packets_received,
                     stats.packets_invalid,
@@ -174,6 +209,10 @@ mod platform {
                     reassembler.inflight_len(),
                     reassembler.completed_waiting_len(),
                     udp_recv_buffer_bytes,
+                    profile_changes_received,
+                    profile_change_sequence,
+                    stale_profile_packets_dropped,
+                    waiting_profile_idr,
                     recovery_fragment(&damaged_gop, &reassembler)
                 );
                 io::stdout().flush().ok();
@@ -207,6 +246,7 @@ mod platform {
             finished_at,
             &mut frames_written,
             &mut bytes_written,
+            &mut waiting_profile_idr,
         )?;
         output
             .flush()
@@ -218,7 +258,7 @@ mod platform {
             _ => 0.0,
         };
         println!(
-            r#"{{"type":"H264_RECV_DONE","mode":"h264_recv_dump","session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_incomplete_expired":{},"frames_written":{},"bytes_received":{},"bytes_written":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{:.2},"mbps":{:.3},"last_frame_id":{},"output":"{}","udp_recv_buffer_bytes":{},{} }}"#,
+            r#"{{"type":"H264_RECV_DONE","mode":"h264_recv_dump","session_id":{},"packets_received":{},"packets_invalid":{},"packets_lost_estimate":{},"frames_complete":{},"frames_incomplete_expired":{},"frames_written":{},"bytes_received":{},"bytes_written":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{:.2},"mbps":{:.3},"last_frame_id":{},"output":"{}","udp_recv_buffer_bytes":{},"profile_changes_received":{},"profile_change_sequence":{},"stale_profile_packets_dropped":{},"waiting_profile_idr":{},{} }}"#,
             optional_u64_json(reassembler.session_id()),
             stats.packets_received,
             stats.packets_invalid,
@@ -235,6 +275,10 @@ mod platform {
             optional_u64_json(stats.last_frame_id),
             json_escape(&config.output),
             udp_recv_buffer_bytes,
+            profile_changes_received,
+            profile_change_sequence,
+            stale_profile_packets_dropped,
+            waiting_profile_idr,
             recovery_fragment(&damaged_gop, &reassembler)
         );
         io::stdout().flush().ok();
@@ -256,11 +300,19 @@ mod platform {
         now: Instant,
         frames_written: &mut u64,
         bytes_written: &mut u64,
+        waiting_profile_idr: &mut bool,
     ) -> Result<(), String> {
         for frame in frames {
             let Some(frame) = damaged_gop.prepare_frame(frame, now) else {
                 continue;
             };
+            if *waiting_profile_idr {
+                let summary = crate::h264_annex_b::summarize_nals(&frame.bytes);
+                if !summary.has_idr_slice || !summary.has_sps || !summary.has_pps {
+                    continue;
+                }
+                *waiting_profile_idr = false;
+            }
             output
                 .write_all(&frame.bytes)
                 .map_err(|err| format!("write H.264 dump failed: {err}"))?;

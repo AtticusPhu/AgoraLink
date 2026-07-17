@@ -35,6 +35,39 @@ DEFAULT_SCREEN_PROFILE = "720p30_h264_qsv"
 SCREEN_BACKEND_FFMPEG = "ffmpeg"
 SCREEN_BACKEND_RUST = "rust"
 SCREEN_BACKENDS = {SCREEN_BACKEND_FFMPEG, SCREEN_BACKEND_RUST}
+DEFAULT_NATIVE_SCREEN_PRESET = "stable"
+NATIVE_SCREEN_PRESETS: Dict[str, Dict[str, object]] = {
+    "stable": {
+        "id": "stable",
+        "label": "Stable: 1280x720 30fps 20Mbps",
+        "width": 1280,
+        "height": 720,
+        "fps": 30,
+        "bitrate_mbps": 20,
+        "playout_delay_ms": 120,
+        "repair": "off",
+    },
+    "recommended": {
+        "id": "recommended",
+        "label": "Recommended: 1920x1080 60fps 50Mbps playout 250ms repair nack",
+        "width": 1920,
+        "height": 1080,
+        "fps": 60,
+        "bitrate_mbps": 50,
+        "playout_delay_ms": 250,
+        "repair": "nack",
+    },
+    "high_quality": {
+        "id": "high_quality",
+        "label": "High Quality: 1920x1080 60fps 80Mbps playout 300ms repair nack",
+        "width": 1920,
+        "height": 1080,
+        "fps": 60,
+        "bitrate_mbps": 80,
+        "playout_delay_ms": 300,
+        "repair": "nack",
+    },
+}
 FFMPEG_INSTALL_HINT = "winget install --id Gyan.FFmpeg -e"
 FFMPEG_MISSING_MESSAGE = (
     "找不到 ffmpeg/ffplay。请安装 FFmpeg 或使用内置 tools/ffmpeg/bin。\n"
@@ -42,6 +75,7 @@ FFMPEG_MISSING_MESSAGE = (
 )
 RUST_NATIVE_MISSING_MESSAGE = "Rust native media executable not found"
 RUST_NATIVE_VIDEO_ONLY_MESSAGE = "Rust native backend currently supports video only"
+RUST_NATIVE_AUDIO_UNAVAILABLE_MESSAGE = "Rust native system audio is unavailable; continuing video-only."
 NATIVE_LITE_FLAVOR = "native_lite"
 FULL_PACKAGE_FLAVOR = "full"
 SOURCE_PACKAGE_FLAVOR = "source"
@@ -53,6 +87,28 @@ NATIVE_LITE_VIDEO_ONLY_MESSAGE = (
     "Native Lite currently supports video-only screen sharing. "
     "System audio requires the Full package with FFmpeg backend."
 )
+
+
+def native_screen_preset_info(value: object = None) -> Dict[str, object]:
+    if isinstance(value, Mapping):
+        key = str(value.get("id") or "").strip().lower()
+        if key in NATIVE_SCREEN_PRESETS:
+            return dict(NATIVE_SCREEN_PRESETS[key])
+        merged = dict(NATIVE_SCREEN_PRESETS[DEFAULT_NATIVE_SCREEN_PRESET])
+        merged.update(dict(value))
+        merged["id"] = str(merged.get("id") or DEFAULT_NATIVE_SCREEN_PRESET)
+        return merged
+    raw = str(value or DEFAULT_NATIVE_SCREEN_PRESET).strip()
+    key = raw.lower().replace("-", "_").replace(" ", "_")
+    if key not in NATIVE_SCREEN_PRESETS:
+        for preset_key, preset in NATIVE_SCREEN_PRESETS.items():
+            if raw == str(preset.get("label") or ""):
+                key = preset_key
+                break
+    if key not in NATIVE_SCREEN_PRESETS:
+        key = DEFAULT_NATIVE_SCREEN_PRESET
+    return dict(NATIVE_SCREEN_PRESETS[key])
+
 
 class ScreenRuntime:
     def __init__(
@@ -87,11 +143,13 @@ class ScreenRuntime:
         self.current_audio_config: Dict[str, object] = {"enabled": False, "mode": "none"}
         self.current_audio_error = ""
         self.current_audio_input = ""
+        self.current_native_preset = DEFAULT_NATIVE_SCREEN_PRESET
         self.native_stats: Dict[str, object] = {}
         self.native_last_event: Dict[str, object] = {}
         self._process_log_path: Optional[Path] = None
         self._wasapi_support_cache: Dict[str, bool] = {}
         self._dshow_audio_devices_cache: Dict[str, List[Dict[str, str]]] = {}
+        self._native_audio_capabilities_cache: Dict[str, Dict[str, object]] = {}
 
     def start_receiver(
         self,
@@ -103,6 +161,7 @@ class ScreenRuntime:
         screen_port: Optional[int] = None,
         audio: object = None,
         backend: object = SCREEN_BACKEND_FFMPEG,
+        native_preset: object = None,
     ) -> Dict[str, object]:
         if self._has_running_process():
             return self._already_running_result()
@@ -117,6 +176,8 @@ class ScreenRuntime:
             profile_name = self._validate_profile(profile) if profile else ""
             peer_label_text = self._validate_peer_label(peer_label)
             audio_config = self._normalize_audio_config(audio, enabled_default=False)
+            audio_requested = bool(audio_config.get("enabled"))
+            audio_notice = ""
             self.last_command = []
             self.native_stats = {}
             self.native_last_event = {}
@@ -124,8 +185,22 @@ class ScreenRuntime:
                 native_exe = self._find_native_media_exe()
                 if not native_exe:
                     return self._set_error(RUST_NATIVE_MISSING_MESSAGE)
-                cmd = self._build_native_receiver_command(port, native_exe=native_exe)
+                if audio_requested:
+                    capabilities = self.native_audio_capabilities(native_exe)
+                    if not bool(capabilities.get("rust_audio_playback_available")):
+                        audio_notice = self._native_audio_unavailable_message(capabilities, "playback")
+                        audio_config = self._native_audio_fallback_config("playback", audio_notice)
+                    else:
+                        audio_config = self._native_audio_session_config(audio_config, "playback")
+                preset = native_screen_preset_info(native_preset)
+                cmd = self._build_native_receiver_command(
+                    port,
+                    native_exe=native_exe,
+                    native_preset=preset,
+                    audio=audio_config,
+                )
                 self.last_command = list(cmd)
+                self.current_native_preset = str(preset.get("id") or DEFAULT_NATIVE_SCREEN_PRESET)
                 self._process = self._start_native_process(cmd, "agoralink_media")
             else:
                 deps = self.check_dependencies()
@@ -139,7 +214,7 @@ class ScreenRuntime:
             return self._set_error(str(exc))
 
         self._state = STATE_RECEIVING
-        self.last_error = ""
+        self.last_error = audio_notice
         self.last_returncode = None
         self.current_backend = backend_name
         self.current_mode = STATE_RECEIVING
@@ -163,6 +238,7 @@ class ScreenRuntime:
         system_audio: bool = False,
         audio: object = None,
         backend: object = SCREEN_BACKEND_FFMPEG,
+        native_preset: object = None,
     ) -> Dict[str, object]:
         if self._has_running_process():
             return self._already_running_result()
@@ -190,15 +266,22 @@ class ScreenRuntime:
                 if not native_exe:
                     return self._set_error(RUST_NATIVE_MISSING_MESSAGE)
                 if audio_requested:
-                    audio_notice = self.native_video_only_message()
-                    audio_config = {
-                        "enabled": False,
-                        "mode": "none",
-                        "state": "video_only",
-                        "error": audio_notice,
-                    }
-                cmd = self._build_native_sender_command(host=host, port=port, native_exe=native_exe)
+                    capabilities = self.native_audio_capabilities(native_exe)
+                    if not bool(capabilities.get("rust_audio_capture_available")):
+                        audio_notice = self._native_audio_unavailable_message(capabilities, "capture")
+                        audio_config = self._native_audio_fallback_config("capture", audio_notice)
+                    else:
+                        audio_config = self._native_audio_session_config(audio_config, "capture")
+                preset = native_screen_preset_info(native_preset)
+                cmd = self._build_native_sender_command(
+                    host=host,
+                    port=port,
+                    native_exe=native_exe,
+                    native_preset=preset,
+                    audio=audio_config,
+                )
                 self.last_command = list(cmd)
+                self.current_native_preset = str(preset.get("id") or DEFAULT_NATIVE_SCREEN_PRESET)
                 self._process = self._start_native_process(cmd, "agoralink_media")
             else:
                 deps = self.check_dependencies()
@@ -411,13 +494,16 @@ class ScreenRuntime:
         self.native_last_event = dict(event)
         if event_type == "NATIVE_SCREEN_STATS":
             self.native_stats = dict(event)
+            self._update_native_audio_state(event)
             return
         if event_type == "NATIVE_SCREEN_STARTED":
+            self._update_native_audio_state(event)
             if not self.last_error:
                 self.last_error = ""
             return
         if event_type == "NATIVE_SCREEN_STOPPED":
             self.native_stats = dict(event)
+            self._update_native_audio_state(event)
             if proc is None or proc is self._process:
                 self.last_error = ""
             return
@@ -554,6 +640,7 @@ class ScreenRuntime:
             "returncode": self.last_returncode,
             "last_error": self.last_error,
             "command": list(self.last_command),
+            "native_preset": self.current_native_preset,
             "native_stats": dict(self.native_stats),
             "native_last_event": dict(self.native_last_event),
         }
@@ -581,6 +668,62 @@ class ScreenRuntime:
         self.current_audio_config = {"enabled": False, "mode": "none"}
         self.current_audio_error = ""
         self.current_audio_input = ""
+        self.current_native_preset = DEFAULT_NATIVE_SCREEN_PRESET
+
+    def native_audio_capabilities(self, native_exe: Optional[str] = None) -> Dict[str, object]:
+        """Report support compiled into the bundled Rust native media executable.
+
+        This is a lightweight CLI feature probe, not a device capture probe. Actual
+        WASAPI device failures continue as video-only and are reported through the
+        native process JSON stats.
+        """
+        exe = str(native_exe or self._find_native_media_exe() or "").strip()
+        unavailable = {
+            "rust_audio_capture_available": False,
+            "rust_audio_playback_available": False,
+            "native_screen_av_sync_supported": False,
+            "rust_audio_capability_checked": False,
+            "rust_audio_capability_error": "",
+        }
+        if not exe:
+            unavailable["rust_audio_capability_error"] = RUST_NATIVE_MISSING_MESSAGE
+            return unavailable
+        if os.name != "nt":
+            unavailable["rust_audio_capability_error"] = "Rust native system audio is only supported on Windows"
+            return unavailable
+        cached = self._native_audio_capabilities_cache.get(exe)
+        if cached is not None:
+            return dict(cached)
+
+        result = dict(unavailable)
+        result["rust_audio_capability_checked"] = True
+        try:
+            completed = run_no_console(
+                [exe, "--help"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=2.0,
+                shell=False,
+            )
+            output = "\n".join((str(completed.stdout or ""), str(completed.stderr or "")))
+            capture = completed.returncode == 0 and "--audio off|system" in output
+            playback = completed.returncode == 0 and "--audio off|on" in output
+            result.update(
+                {
+                    "rust_audio_capture_available": capture,
+                    "rust_audio_playback_available": playback,
+                    "native_screen_av_sync_supported": bool(capture and playback),
+                }
+            )
+            if not capture or not playback:
+                result["rust_audio_capability_error"] = "Bundled Rust native media does not advertise system audio support"
+        except Exception as exc:
+            result["rust_audio_capability_error"] = f"Rust native audio capability probe failed: {exc}"
+        self._native_audio_capabilities_cache[exe] = dict(result)
+        return result
 
     def check_dependencies(self) -> Dict[str, object]:
         ffmpeg = self._find_media_tool("ffmpeg")
@@ -610,6 +753,10 @@ class ScreenRuntime:
             "bundled_ffmpeg_available": package_info["bundled_ffmpeg_available"],
             "screen_backend_default": package_info["screen_backend_default"],
             "native_screen_video_only": package_info["native_screen_video_only"],
+            "rust_audio_capture_available": package_info["rust_audio_capture_available"],
+            "rust_audio_playback_available": package_info["rust_audio_playback_available"],
+            "native_screen_av_sync_supported": package_info["native_screen_av_sync_supported"],
+            "rust_audio_capability_error": package_info["rust_audio_capability_error"],
             "error": "" if not missing else self._missing_tool_error(missing),
             "rust_error": "" if native_ok else RUST_NATIVE_MISSING_MESSAGE,
             "install_hint": FFMPEG_INSTALL_HINT,
@@ -617,6 +764,7 @@ class ScreenRuntime:
 
     def screen_package_info(self) -> Dict[str, object]:
         native = self._find_native_media_exe()
+        native_audio = self.native_audio_capabilities(native)
         bundled_ffmpeg = self._find_bundled_media_tool("ffmpeg")
         bundled_ffplay = self._find_bundled_media_tool("ffplay")
         bundled_ffmpeg_available = bool(bundled_ffmpeg and bundled_ffplay)
@@ -630,14 +778,22 @@ class ScreenRuntime:
             "rust_native_available": bool(native),
             "native_media_ok": bool(native),
             "rust_native_path": str(native or ""),
+            "rust_audio_capture_available": bool(native_audio.get("rust_audio_capture_available")),
+            "rust_audio_playback_available": bool(native_audio.get("rust_audio_playback_available")),
+            "native_screen_av_sync_supported": bool(native_audio.get("native_screen_av_sync_supported")),
+            "rust_audio_capability_checked": bool(native_audio.get("rust_audio_capability_checked")),
+            "rust_audio_capability_error": str(native_audio.get("rust_audio_capability_error") or ""),
             "bundled_ffmpeg_available": bundled_ffmpeg_available,
             "bundled_ffmpeg_path": str(bundled_ffmpeg or ""),
             "bundled_ffplay_path": str(bundled_ffplay or ""),
             "screen_backend_default": SCREEN_BACKEND_RUST if package_flavor == NATIVE_LITE_FLAVOR else SCREEN_BACKEND_FFMPEG,
-            "native_screen_video_only": True,
+            "native_screen_video_only": not bool(native_audio.get("native_screen_av_sync_supported")),
         }
 
     def native_video_only_message(self) -> str:
+        capabilities = self.native_audio_capabilities()
+        if bool(capabilities.get("rust_audio_capture_available")):
+            return "Rust native system audio is available when enabled in Screen sharing settings"
         if bool(self.screen_package_info().get("native_lite")):
             return NATIVE_LITE_VIDEO_ONLY_MESSAGE
         return RUST_NATIVE_VIDEO_ONLY_MESSAGE
@@ -648,11 +804,18 @@ class ScreenRuntime:
             return f"{FFMPEG_MISSING_MESSAGE}\n缺少：{names}"
         return FFMPEG_MISSING_MESSAGE
 
-    def _build_native_receiver_command(self, port: int, native_exe: Optional[str] = None) -> List[str]:
+    def _build_native_receiver_command(
+        self,
+        port: int,
+        native_exe: Optional[str] = None,
+        native_preset: object = None,
+        audio: object = None,
+    ) -> List[str]:
         exe = str(native_exe or self._find_native_media_exe() or "")
         if not exe:
             raise FileNotFoundError(RUST_NATIVE_MISSING_MESSAGE)
-        return [
+        preset = native_screen_preset_info(native_preset)
+        cmd = [
             exe,
             "screen-recv",
             "--bind",
@@ -661,13 +824,29 @@ class ScreenRuntime:
             str(int(port)),
             "--title",
             "AgoraLink Native Viewer",
+            "--playout-delay-ms",
+            str(int(preset.get("playout_delay_ms") or 120)),
+            "--repair",
+            str(preset.get("repair") or "off"),
         ]
+        if bool(self._normalize_audio_config(audio, enabled_default=False).get("enabled")):
+            cmd.extend(["--audio", "on"])
+        return cmd
 
-    def _build_native_sender_command(self, *, host: str, port: int, native_exe: Optional[str] = None) -> List[str]:
+    def _build_native_sender_command(
+        self,
+        *,
+        host: str,
+        port: int,
+        native_exe: Optional[str] = None,
+        native_preset: object = None,
+        audio: object = None,
+    ) -> List[str]:
         exe = str(native_exe or self._find_native_media_exe() or "")
         if not exe:
             raise FileNotFoundError(RUST_NATIVE_MISSING_MESSAGE)
-        return [
+        preset = native_screen_preset_info(native_preset)
+        cmd = [
             exe,
             "screen-send",
             "--host",
@@ -675,14 +854,17 @@ class ScreenRuntime:
             "--port",
             str(int(port)),
             "--width",
-            "1280",
+            str(int(preset.get("width") or 1280)),
             "--height",
-            "720",
+            str(int(preset.get("height") or 720)),
             "--fps",
-            "30",
+            str(int(preset.get("fps") or 30)),
             "--bitrate-mbps",
-            "4",
+            str(int(preset.get("bitrate_mbps") or 20)),
         ]
+        if bool(self._normalize_audio_config(audio, enabled_default=False).get("enabled")):
+            cmd.extend(["--audio", "system"])
+        return cmd
 
     def _build_receiver_command(self, port: int, ffplay_path: Optional[str] = None, peer_label: str = "") -> List[str]:
         ffplay = str(ffplay_path or self._find_media_tool("ffplay") or "")
@@ -838,11 +1020,63 @@ class ScreenRuntime:
             "bitrate": max(32000, int(bitrate or 128000)),
         }
         if isinstance(audio, Mapping):
-            for key in ("backend", "input_name", "device_name", "alternative_name", "state"):
+            for key in ("backend", "input_name", "device_name", "alternative_name", "state", "role"):
                 value = str(audio.get(key) or "").strip()
                 if value:
                     result[key] = value
+            if "requested" in audio:
+                result["requested"] = bool(audio.get("requested"))
         return result
+
+    def _native_audio_session_config(self, audio_config: Mapping[str, Any], role: str) -> Dict[str, object]:
+        result = dict(audio_config or {})
+        result.update(
+            {
+                "enabled": True,
+                "mode": "system",
+                "backend": "rust",
+                "role": role,
+                "requested": True,
+                "state": "capturing" if role == "capture" else "playing",
+                "input_name": "WASAPI loopback" if role == "capture" else "WASAPI render",
+            }
+        )
+        return result
+
+    def _native_audio_fallback_config(self, role: str, reason: str) -> Dict[str, object]:
+        return {
+            "enabled": False,
+            "mode": "none",
+            "backend": "rust",
+            "role": role,
+            "requested": True,
+            "state": "fallback_video_only",
+            "error": str(reason or RUST_NATIVE_AUDIO_UNAVAILABLE_MESSAGE),
+        }
+
+    @staticmethod
+    def _native_audio_unavailable_message(capabilities: Mapping[str, object], role: str) -> str:
+        detail = str((capabilities or {}).get("rust_audio_capability_error") or "").strip()
+        action = "capture" if role == "capture" else "playback"
+        message = f"Rust native system audio {action} is unavailable; continuing video-only."
+        return f"{message} {detail}".strip()
+
+    def _update_native_audio_state(self, event: Mapping[str, object]) -> None:
+        if self.current_backend != SCREEN_BACKEND_RUST:
+            return
+        current = dict(self.current_audio_config or {})
+        if not bool(current.get("requested") or current.get("enabled")):
+            return
+        unavailable_reason = str((event or {}).get("audio_unavailable_reason") or "").strip()
+        if unavailable_reason:
+            role = str(current.get("role") or ("capture" if self.current_mode == STATE_SENDING else "playback"))
+            message = f"System audio unavailable, continued video-only: {unavailable_reason}"
+            self._set_audio_session(self._native_audio_fallback_config(role, message))
+            self.last_error = message
+            return
+        if bool((event or {}).get("audio_enabled")):
+            role = str(current.get("role") or ("capture" if self.current_mode == STATE_SENDING else "playback"))
+            self._set_audio_session(self._native_audio_session_config(current, role))
 
     def _set_audio_session(self, audio_config: Mapping[str, Any]) -> None:
         enabled = bool((audio_config or {}).get("enabled"))
@@ -1097,9 +1331,12 @@ class ScreenRuntime:
         meipass = str(getattr(sys, "_MEIPASS", "") or "").strip()
         if meipass:
             dirs.append(Path(meipass) / "tools" / "agoralink_media")
+        # Source runs should exercise the current Rust release build. Frozen
+        # packages continue to prefer their intentionally bundled executable.
+        if not bool(getattr(sys, "frozen", False)):
+            dirs.append(self.script_dir / "rust-native" / "agoralink_media" / "target" / "release")
         dirs.append(exe_dir / "tools" / "agoralink_media")
         dirs.append(self.script_dir / "tools" / "agoralink_media")
-        dirs.append(self.script_dir / "rust-native" / "agoralink_media" / "target" / "release")
         return dirs
 
     @staticmethod

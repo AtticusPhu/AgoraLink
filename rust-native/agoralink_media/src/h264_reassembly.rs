@@ -8,6 +8,54 @@ use crate::{MediaPacket, FLAG_FEC, FLAG_FEC_PROTECTED, FLAG_KEYFRAME, STREAM_VID
 
 pub const DEFAULT_NACK_ITEMS_PER_FRAME: usize = 32;
 const NACK_PLAYOUT_DEADLINE_GUARD: Duration = Duration::from_millis(100);
+const NACK_CONFIRMED_GAP_DEBOUNCE: Duration = Duration::from_millis(12);
+const REPAIR_DEADLINE_GUARD: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimingMetric {
+    pub samples: u64,
+    pub total_ms: f64,
+    pub min_ms: f64,
+    pub max_ms: f64,
+}
+
+impl TimingMetric {
+    pub fn observe(&mut self, duration: Duration) {
+        let value = duration.as_secs_f64() * 1000.0;
+        if self.samples == 0 {
+            self.min_ms = value;
+            self.max_ms = value;
+        } else {
+            self.min_ms = self.min_ms.min(value);
+            self.max_ms = self.max_ms.max(value);
+        }
+        self.samples += 1;
+        self.total_ms += value;
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        if other.samples == 0 {
+            return;
+        }
+        if self.samples == 0 {
+            self.min_ms = other.min_ms;
+            self.max_ms = other.max_ms;
+        } else {
+            self.min_ms = self.min_ms.min(other.min_ms);
+            self.max_ms = self.max_ms.max(other.max_ms);
+        }
+        self.samples += other.samples;
+        self.total_ms += other.total_ms;
+    }
+
+    pub fn avg_ms(self) -> f64 {
+        if self.samples == 0 {
+            0.0
+        } else {
+            self.total_ms / self.samples as f64
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ReassemblyConfig {
@@ -52,6 +100,7 @@ pub struct ReassemblyStats {
     pub reassembly_packets_active: u64,
     pub reassembly_allocations_estimate: u64,
     pub reassembly_complete_scan_count: u64,
+    pub nack_requests_cancelled_by_progress: u64,
 }
 
 impl ReassemblyStats {
@@ -75,6 +124,14 @@ pub struct NackCollectionStats {
     pub requested_frames: u64,
     pub items_per_requested_frame_total: u64,
     pub items_per_requested_frame_max: u64,
+    pub candidates_first_round: u64,
+    pub candidates_late_discovery: u64,
+    pub missing_first_detected_age: TimingMetric,
+    pub missing_first_detected_to_deadline: TimingMetric,
+    pub first_nack_to_deadline: TimingMetric,
+    pub first_nack_age: TimingMetric,
+    pub first_round_budget: TimingMetric,
+    pub second_round_budget: TimingMetric,
 }
 
 #[derive(Debug, Default)]
@@ -242,6 +299,13 @@ impl DamagedGopTracker {
     pub fn stats(&self) -> DamagedGopStats {
         self.stats
     }
+
+    pub fn reset_for_profile_change(&mut self) {
+        self.waiting_keyframe = false;
+        self.recovery_started_at = None;
+        self.recovery_started_frame_id = None;
+        self.parameter_sets = AnnexBParameterSets::default();
+    }
 }
 
 struct FrameAssembly {
@@ -262,6 +326,9 @@ struct FrameAssembly {
     last_nack_at: Option<Instant>,
     nack_rounds: u8,
     nack_requested_at: Vec<Option<Instant>>,
+    missing_first_detected_at: Option<Instant>,
+    missing_detection_reported: bool,
+    first_nack_at: Option<Instant>,
 }
 
 impl FrameAssembly {
@@ -284,7 +351,18 @@ impl FrameAssembly {
             last_nack_at: None,
             nack_rounds: 0,
             nack_requested_at: (0..packet_count).map(|_| None).collect(),
+            missing_first_detected_at: None,
+            missing_detection_reported: false,
+            first_nack_at: None,
         }
+    }
+
+    fn confirmed_missing_count(&self) -> u16 {
+        if self.received_count == 0 {
+            return 0;
+        }
+        let covered_packets = self.highest_received_packet_index.saturating_add(1);
+        covered_packets.saturating_sub(self.received_count)
     }
 }
 
@@ -299,6 +377,7 @@ pub struct H264Reassembler {
     blocked_since: Option<Instant>,
     last_timing_frame: Option<(u64, u64)>,
     observed_frame_interval_ms: Option<f64>,
+    repair_window: Option<Duration>,
     stats: ReassemblyStats,
 }
 
@@ -328,6 +407,7 @@ impl H264Reassembler {
             blocked_since: None,
             last_timing_frame: None,
             observed_frame_interval_ms: None,
+            repair_window: None,
             stats: ReassemblyStats {
                 reorder_wait_ms: initial_reorder_wait_ms,
                 ..ReassemblyStats::default()
@@ -383,8 +463,43 @@ impl H264Reassembler {
         self.session_id
     }
 
+    pub fn switch_session(&mut self, session_id: u64) -> Result<(), String> {
+        if session_id == 0 {
+            return Err("reassembly session_id must be non-zero".to_string());
+        }
+        self.session_id = Some(session_id);
+        self.inflight.clear();
+        self.complete.clear();
+        self.skipped.clear();
+        self.next_frame = None;
+        self.highest_seen_frame = None;
+        self.blocked_since = None;
+        self.last_timing_frame = None;
+        self.observed_frame_interval_ms = None;
+        self.stats.next_decode_frame_id = None;
+        self.stats.reassembly_frames_active = 0;
+        self.stats.reassembly_packets_active = 0;
+        Ok(())
+    }
+
     pub fn inflight_len(&self) -> usize {
         self.inflight.len()
+    }
+
+    pub fn has_inflight_frame(&self, frame_id: u64) -> bool {
+        self.inflight.contains_key(&frame_id)
+    }
+
+    pub fn set_repair_window(&mut self, repair_window: Option<Duration>) {
+        self.repair_window = repair_window.filter(|window| !window.is_zero());
+    }
+
+    pub fn repair_deadline_remaining(&self, frame_id: u64, now: Instant) -> Option<Duration> {
+        let frame = self.inflight.get(&frame_id)?;
+        Some(
+            self.frame_repair_deadline(frame)
+                .saturating_duration_since(now),
+        )
     }
 
     pub fn collect_nack_items(
@@ -398,6 +513,7 @@ impl H264Reassembler {
     ) -> NackCollection {
         let mut collection = NackCollection::default();
         let highest_complete_frame = self.complete.keys().next_back().copied();
+        let highest_seen_frame = self.highest_seen_frame;
         let max_items_per_frame = max_items_per_frame.max(1);
         for (&frame_id, frame) in &mut self.inflight {
             if frame.missing_count == 0 || frame.nack_rounds >= max_rounds {
@@ -408,8 +524,10 @@ impl H264Reassembler {
             let since_progress = now.saturating_duration_since(frame.last_progress_time);
             let higher_complete_frame_seen =
                 highest_complete_frame.is_some_and(|highest| highest > frame_id);
+            let higher_frame_progress_seen =
+                highest_seen_frame.is_some_and(|highest| highest > frame_id);
             let repair_window = self.config.frame_timeout.min(repair_window);
-            let deadline_guard = Duration::from_millis(10).min(repair_window / 2);
+            let deadline_guard = REPAIR_DEADLINE_GUARD.min(repair_window / 2);
             let repair_deadline = repair_window.saturating_sub(deadline_guard);
             if age >= repair_deadline {
                 continue;
@@ -417,13 +535,46 @@ impl H264Reassembler {
             let remaining_repair_time = repair_deadline.saturating_sub(age);
             let near_playout_deadline = remaining_repair_time <= NACK_PLAYOUT_DEADLINE_GUARD;
             let stalled = since_progress >= delay;
-            if !stalled && !higher_complete_frame_seen && !near_playout_deadline {
+            let confirmed_gap = frame.confirmed_missing_count() > 0
+                || frame.highest_received_packet_index.saturating_add(1) == frame.packet_count;
+            let gap_evidence =
+                confirmed_gap || higher_frame_progress_seen || higher_complete_frame_seen;
+            let gap_debounce = delay.min(NACK_CONFIRMED_GAP_DEBOUNCE);
+            let confirmed_gap_ready = gap_evidence && since_progress >= gap_debounce;
+            if !stalled && !confirmed_gap_ready && !near_playout_deadline {
                 if age < delay {
                     collection.stats.suppressed_too_early += 1;
                 } else {
                     collection.stats.suppressed_progressing_frames += 1;
                 }
                 continue;
+            }
+            if frame.missing_first_detected_at.is_none()
+                && (confirmed_gap || stalled || higher_frame_progress_seen || near_playout_deadline)
+            {
+                frame.missing_first_detected_at = Some(now);
+                frame.missing_detection_reported = false;
+            }
+            if let Some(detected_at) = frame.missing_first_detected_at {
+                if !frame.missing_detection_reported {
+                    let detected_age = detected_at.saturating_duration_since(frame.first_seen);
+                    let detected_budget = repair_deadline.saturating_sub(detected_age);
+                    collection
+                        .stats
+                        .missing_first_detected_age
+                        .observe(detected_age);
+                    collection
+                        .stats
+                        .missing_first_detected_to_deadline
+                        .observe(detected_budget);
+                    if detected_budget <= NACK_PLAYOUT_DEADLINE_GUARD {
+                        collection.stats.candidates_late_discovery += 1;
+                    }
+                    frame.missing_detection_reported = true;
+                }
+            }
+            if frame.nack_rounds == 0 {
+                collection.stats.candidates_first_round += 1;
             }
             if frame
                 .last_nack_at
@@ -458,6 +609,23 @@ impl H264Reassembler {
             }
             if frame_items > 0 {
                 frame.last_nack_at = Some(now);
+                if frame.first_nack_at.is_none() {
+                    frame.first_nack_at = Some(now);
+                    collection
+                        .stats
+                        .first_nack_to_deadline
+                        .observe(remaining_repair_time);
+                    collection.stats.first_nack_age.observe(age);
+                    collection
+                        .stats
+                        .first_round_budget
+                        .observe(remaining_repair_time);
+                } else if frame.nack_rounds == 1 {
+                    collection
+                        .stats
+                        .second_round_budget
+                        .observe(remaining_repair_time);
+                }
                 frame.nack_rounds += 1;
                 collection.stats.requested_frames += 1;
                 collection.stats.items_per_requested_frame_total += frame_items;
@@ -468,6 +636,18 @@ impl H264Reassembler {
             }
         }
         collection
+    }
+
+    fn frame_repair_deadline(&self, frame: &FrameAssembly) -> Instant {
+        let repair_window = self
+            .repair_window
+            .unwrap_or(self.config.frame_timeout)
+            .min(self.config.frame_timeout);
+        let guard = REPAIR_DEADLINE_GUARD.min(repair_window / 2);
+        frame
+            .first_seen
+            .checked_add(repair_window.saturating_sub(guard))
+            .unwrap_or(frame.first_seen)
     }
 
     pub fn completed_waiting_len(&self) -> usize {
@@ -557,6 +737,8 @@ impl H264Reassembler {
         entry.last_packet_arrival_time = now;
         entry.flags |= packet.flags;
         entry.fec_expected |= is_fec_protected;
+        let had_unrequested_gap =
+            entry.missing_first_detected_at.is_some() && entry.first_nack_at.is_none();
         if entry.packets[index].is_none() {
             entry.received_bytes += packet.payload.len();
             entry.packets[index] = Some(packet.payload);
@@ -568,6 +750,14 @@ impl H264Reassembler {
             entry.nack_requested_at[index] = None;
             self.stats.reassembly_packets_active += 1;
             self.stats.reassembly_allocations_estimate += 1;
+        }
+        let confirmed_missing = entry.confirmed_missing_count();
+        if confirmed_missing > 0 {
+            entry.missing_first_detected_at.get_or_insert(now);
+        } else if had_unrequested_gap {
+            entry.missing_first_detected_at = None;
+            entry.missing_detection_reported = false;
+            self.stats.nack_requests_cancelled_by_progress += 1;
         }
 
         self.try_complete_frame(packet.frame_id);
@@ -784,6 +974,16 @@ impl H264Reassembler {
             self.stats.reorder_wait_ms = duration_ms_rounded(reorder_wait);
             if !force && now.duration_since(blocked_since) < reorder_wait {
                 break;
+            }
+            if !force {
+                if let Some(frame) = self.inflight.get(&next) {
+                    if self.repair_window.is_some() && now < self.frame_repair_deadline(frame) {
+                        // Reordering has been ruled out, but NACK repair still owns the
+                        // remaining playout budget. Do not poison the GOP while a repair
+                        // can still arrive before presentation.
+                        break;
+                    }
+                }
             }
             let gap_to_damage_ms = now.duration_since(blocked_since).as_secs_f64() * 1000.0;
             self.stats.decode_gate_gap_events += 1;
@@ -1101,6 +1301,109 @@ pub fn run_self_test() -> Result<(), String> {
         return Err("NACK repair packet did not complete the frame".to_string());
     }
 
+    progressing_reassembler.accept_datagram(&nack_packets[1], now + Duration::from_millis(32))?;
+    if progressing_reassembler
+        .stats()
+        .nack_requests_cancelled_by_progress
+        != 1
+    {
+        return Err("progress did not cancel an unrequested packet-gap candidate".to_string());
+    }
+
+    // At 60 FPS, a later frame is useful evidence that an interior packet gap
+    // is real. The first NACK must still retain most of the 250 ms playout
+    // budget, and strict decode order must not declare damage at reorder_wait.
+    let timing_payload_size = (crate::LEGACY_UDP_PAYLOAD_SIZE - crate::HEADER_LEN) * 100 - 1;
+    let timing_packets =
+        crate::packetize_media_payload(77, 80, 80 * 17, &vec![0x47; timing_payload_size], 0)?;
+    if timing_packets.len() != 100 {
+        return Err(format!(
+            "repair timing fixture expected 100 packets, got {}",
+            timing_packets.len()
+        ));
+    }
+    let later_packets = crate::packetize_media_payload(77, 81, 81 * 17, &[0x48; 100], 0)?;
+    let missing_index = 47usize;
+    let mut timing_reassembler = H264Reassembler::new(nack_config)?;
+    timing_reassembler.set_repair_window(Some(Duration::from_millis(250)));
+    for (index, packet) in timing_packets.iter().enumerate() {
+        if index != missing_index {
+            timing_reassembler.accept_datagram(packet, now)?;
+        }
+    }
+    timing_reassembler.accept_datagram(&later_packets[0], now + Duration::from_millis(17))?;
+    let timing_nack = timing_reassembler.collect_nack_items(
+        now + Duration::from_millis(25),
+        Duration::from_millis(20),
+        Duration::from_millis(20),
+        3,
+        Duration::from_millis(250),
+        DEFAULT_NACK_ITEMS_PER_FRAME,
+    );
+    if timing_nack.items.len() != 1
+        || timing_nack.items[0].packet_index != missing_index as u16
+        || timing_nack.stats.first_round_budget.min_ms < 150.0
+        || timing_nack.stats.missing_first_detected_to_deadline.min_ms < 200.0
+    {
+        return Err(format!(
+            "first NACK did not retain the repair budget: items={} first_round_min_ms={:.3} detected_budget_min_ms={:.3}",
+            timing_nack.items.len(),
+            timing_nack.stats.first_round_budget.min_ms,
+            timing_nack
+                .stats
+                .missing_first_detected_to_deadline
+                .min_ms,
+        ));
+    }
+    if !timing_reassembler
+        .expire(now + Duration::from_millis(80))
+        .is_empty()
+        || timing_reassembler.stats().frames_incomplete_expired != 0
+    {
+        return Err("strict decode gate damaged a repairable frame at reorder_wait".to_string());
+    }
+    let repaired_in_order = timing_reassembler.accept_datagram(
+        &timing_packets[missing_index],
+        now + Duration::from_millis(100),
+    )?;
+    if repaired_in_order.len() != 2
+        || repaired_in_order[0].frame_id != 80
+        || repaired_in_order[1].frame_id != 81
+        || timing_reassembler.stats().frames_incomplete_expired != 0
+    {
+        return Err("repair did not release buffered frames in strict order".to_string());
+    }
+
+    let mut deadline_reassembler = H264Reassembler::new(nack_config)?;
+    deadline_reassembler.set_repair_window(Some(Duration::from_millis(250)));
+    for (index, packet) in timing_packets.iter().enumerate() {
+        if index != missing_index {
+            deadline_reassembler.accept_datagram(packet, now)?;
+        }
+    }
+    deadline_reassembler.accept_datagram(&later_packets[0], now + Duration::from_millis(17))?;
+    if !deadline_reassembler
+        .expire(now + Duration::from_millis(80))
+        .is_empty()
+        || deadline_reassembler.stats().frames_incomplete_expired != 0
+    {
+        return Err("repair deadline regression expired a frame near 40 ms".to_string());
+    }
+    let after_repair_deadline = deadline_reassembler.expire(now + Duration::from_millis(245));
+    let deadline_stats = deadline_reassembler.stats();
+    if after_repair_deadline.len() != 1
+        || after_repair_deadline[0].frame_id != 81
+        || deadline_stats.frames_incomplete_expired != 1
+        || deadline_stats.decode_gate_gap_to_damage_ms_avg() < 200.0
+    {
+        return Err(format!(
+            "strict gate did not defer damage to the repair deadline: ready={} expired={} gap_ms={:.3}",
+            after_repair_deadline.len(),
+            deadline_stats.frames_incomplete_expired,
+            deadline_stats.decode_gate_gap_to_damage_ms_avg(),
+        ));
+    }
+
     let mut cap_reassembler = H264Reassembler::new(nack_config)?;
     let cap_packets = crate::packetize_media_payload(72, 0, 1000, &[0x42; 70_000], 0)?;
     cap_reassembler.accept_datagram(&cap_packets[0], now)?;
@@ -1356,5 +1659,50 @@ pub fn run_self_test() -> Result<(), String> {
     {
         return Err("damaged GOP tracker stats mismatch".to_string());
     }
+
+    let mut profile_reassembler = H264Reassembler::new(config)?;
+    let old_frame = crate::packetize_media_payload(100, 0, 1000, &[0x41; 3000], 0)?;
+    profile_reassembler.accept_datagram(&old_frame[0], now)?;
+    if profile_reassembler.session_id() != Some(100) || profile_reassembler.inflight_len() != 1 {
+        return Err("profile switch setup did not retain the old partial frame".to_string());
+    }
+    profile_reassembler.switch_session(101)?;
+    if profile_reassembler.session_id() != Some(101)
+        || profile_reassembler.inflight_len() != 0
+        || profile_reassembler.completed_waiting_len() != 0
+        || profile_reassembler.stats().next_decode_frame_id.is_some()
+    {
+        return Err("profile switch did not atomically clear old reassembly state".to_string());
+    }
+    let invalid_before = profile_reassembler.stats().packets_invalid;
+    if !profile_reassembler
+        .accept_datagram(&old_frame[1], now + Duration::from_millis(1))?
+        .is_empty()
+        || profile_reassembler.stats().packets_invalid != invalid_before + 1
+    {
+        return Err("late packet from the old profile session was not rejected".to_string());
+    }
+    let new_frame = crate::packetize_media_payload(
+        101,
+        0,
+        1033,
+        &[
+            0, 0, 0, 1, 7, 0x64, 0, 0, 0, 1, 8, 0xee, 0, 0, 0, 1, 5, 0x80,
+        ],
+        FLAG_KEYFRAME | crate::FLAG_CONFIG,
+    )?;
+    let ready =
+        profile_reassembler.accept_datagram(&new_frame[0], now + Duration::from_millis(2))?;
+    if ready.len() != 1 || ready[0].frame_id != 0 || !ready[0].is_idr() {
+        return Err("new profile session did not restart cleanly from frame zero IDR".to_string());
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn deterministic_reassembly_and_recovery_regressions() {
+        super::run_self_test().expect("H.264 reassembly self-test");
+    }
 }

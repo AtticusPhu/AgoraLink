@@ -1,0 +1,634 @@
+{
+  "schema_version": 1,
+  "audit_date": "2026-07-17",
+  "audit_mode": "read-only",
+  "repository": {
+    "path": "C:\\Users\\Attic\\Desktop\\U'W\\6.0\\UDP_Project\\app_RUDP\\AgoraLink",
+    "is_git_repository": true,
+    "branch": "main",
+    "head": "5315a094e7dd14404eb3fa29a13ba9625f8726ba",
+    "crate_path": "rust-native/agoralink_media",
+    "cargo_package": "agoralink_media",
+    "cargo_version": "0.1.0"
+  },
+  "working_tree": {
+    "changed_before_audit": true,
+    "tracked_paths_changed_before_audit": 23,
+    "recorded_diff_insertions": 8834,
+    "recorded_diff_deletions": 988,
+    "preexisting_tracked_changes": [
+      ".gitignore",
+      "app_paths.py",
+      "diagnostic_export.py",
+      "docs/RUST_NATIVE_AV_CODE_AUDIT.md",
+      "main_kivy.py",
+      "rust-native/agoralink_media/Cargo.toml",
+      "rust-native/agoralink_media/src/capture_encode_probe.rs",
+      "rust-native/agoralink_media/src/capture_probe.rs",
+      "rust-native/agoralink_media/src/d3d11_nv12_renderer.rs",
+      "rust-native/agoralink_media/src/gpu_nv12_capture.rs",
+      "rust-native/agoralink_media/src/h264_reassembly.rs",
+      "rust-native/agoralink_media/src/h264_recv_dump.rs",
+      "rust-native/agoralink_media/src/h264_recv_view.rs",
+      "rust-native/agoralink_media/src/h264_send_probe.rs",
+      "rust-native/agoralink_media/src/main.rs",
+      "rust-native/agoralink_media/src/repair.rs",
+      "rust-native/agoralink_media/src/video_renderer.rs",
+      "rust-native/agoralink_media/src/wgc_latest_capture.rs",
+      "rust-native/agoralink_media/src/win32_gdi_viewer.rs",
+      "rust-native/agoralink_media/src/wmf_h264_decoder.rs",
+      "rust-native/agoralink_media/src/wmf_h264_encoder.rs",
+      "screen_runtime.py",
+      "screen_share_presenter.py"
+    ],
+    "audit_files": [
+      "docs/R4_CODEBASE_AUDIT_20260717.md",
+      "docs/R4_CODEBASE_AUDIT_20260717.json"
+    ],
+    "product_files_modified_by_audit": false,
+    "note": "All pre-existing tracked and untracked worktree content was preserved. Cargo commands only used ignored target outputs."
+  },
+  "build_baseline": {
+    "source_state": "dirty current worktree; audited as source of truth",
+    "worktree_release_build": {
+      "status": "PASS",
+      "path": "rust-native/agoralink_media/target/release/agoralink_media.exe",
+      "size_bytes": 2143232,
+      "sha256": "55AA6B837D1CA2DFCF6362D8BEE3CFA5A9998DC8F769FD76A415DBE02DB44B05",
+      "self_test_status": "PASS",
+      "self_test_event": {
+        "type": "SELF_TEST",
+        "ok": true,
+        "packet_format": "AGM1"
+      }
+    },
+    "frozen_r3_delivery": {
+      "sha256": "55AA6B837D1CA2DFCF6362D8BEE3CFA5A9998DC8F769FD76A415DBE02DB44B05",
+      "separate_executable_found_under_local_artifacts": false,
+      "hash_matches_current_worktree_build": true,
+      "phase6_evidence": "_local_artifacts/phase6_r3_20260717_123415/phase6_final_assessment.json",
+      "phase6_status": "ACCEPTED_PARTIAL_PASS",
+      "phase8_sender_evidence": "_local_artifacts/phase8_22m/R3_PHASE8_22M_20260717_R1/sender/P8_01_1080P60_22M_600S.jsonl",
+      "phase8_terminal_metrics": {
+        "duration_sec": 600.805,
+        "frames_sent": 35986,
+        "fps": 59.90,
+        "mbps": 22.525,
+        "repair_packets_resent": 30311,
+        "repair_overhead_ratio_vs_data": 0.025579,
+        "encode_ms_avg": 2.742,
+        "gpu_convert_ms_avg": 0.567,
+        "encoder_selected": "Intel Quick Sync Video H.264 Encoder MFT",
+        "convert_backend_selected": "d3d11-video-processor",
+        "adaptive_mode": "off",
+        "stop_reason": "duration"
+      }
+    },
+    "verification": {
+      "fmt_check": {
+        "command": "cargo fmt --check",
+        "status": "PASS"
+      },
+      "clippy": {
+        "command": "cargo clippy --release --all-targets -- -D warnings",
+        "status": "FAIL",
+        "normal_binary_diagnostics": 68,
+        "test_target_diagnostics": 70,
+        "classification": "pre-existing strict-lint debt; not an R4 functional test failure"
+      },
+      "tests": {
+        "command": "cargo test --release",
+        "status": "PASS",
+        "passed": 108,
+        "failed": 0,
+        "ignored": 0
+      },
+      "release_build": {
+        "command": "cargo build --release",
+        "status": "PASS"
+      }
+    }
+  },
+  "rust_source_line_counts": {
+    "adaptive_quality.rs": 2139,
+    "async_mft_wait.rs": 260,
+    "audio_capture_probe.rs": 466,
+    "audio_timeline.rs": 134,
+    "audio_udp.rs": 2601,
+    "av_sync.rs": 501,
+    "bench_reassembly.rs": 133,
+    "bgra_to_nv12.rs": 379,
+    "bitrate.rs": 171,
+    "callback_lifecycle.rs": 378,
+    "capture_encode_probe.rs": 1233,
+    "capture_probe.rs": 451,
+    "color_spec.rs": 273,
+    "color_test_pattern.rs": 367,
+    "d3d11_nv12_renderer.rs": 600,
+    "decoded_frame_renderer.rs": 117,
+    "display_capability.rs": 465,
+    "encode_probe.rs": 240,
+    "fec.rs": 215,
+    "frame_rate_policy.rs": 373,
+    "gpu_convert_probe.rs": 355,
+    "gpu_nv12_capture.rs": 1061,
+    "h264_annex_b.rs": 445,
+    "h264_file_viewer.rs": 299,
+    "h264_reassembly.rs": 1708,
+    "h264_recv_dump.rs": 413,
+    "h264_recv_view.rs": 4141,
+    "h264_send_probe.rs": 4114,
+    "main.rs": 2918,
+    "media_clock.rs": 193,
+    "media_control.rs": 1073,
+    "nv12_synthetic.rs": 76,
+    "nv12_to_bgra.rs": 160,
+    "playout_buffer.rs": 174,
+    "profile_transition.rs": 1246,
+    "repair.rs": 364,
+    "sender_scheduling.rs": 281,
+    "shutdown.rs": 793,
+    "udp_socket.rs": 96,
+    "video_renderer.rs": 195,
+    "wgc_latest_capture.rs": 710,
+    "win32_gdi_viewer.rs": 954,
+    "wmf_h264_decoder.rs": 736,
+    "wmf_h264_encoder.rs": 1661,
+    "wmf_probe.rs": 308
+  },
+  "main_rs": {
+    "path": "rust-native/agoralink_media/src/main.rs",
+    "lines": 2918,
+    "module_count": 44,
+    "top_level_function_count": 52,
+    "top_level_struct_count": 4,
+    "top_level_enum_count": 1,
+    "long_functions": [
+      {"name": "main", "start_line": 311, "approx_end_line": 451, "approx_lines": 141},
+      {"name": "parse_capture_encode_probe_args", "start_line": 725, "approx_end_line": 825, "approx_lines": 101},
+      {"name": "parse_h264_send_probe_args", "start_line": 826, "approx_end_line": 977, "approx_lines": 152},
+      {"name": "parse_h264_recv_view_args", "start_line": 1324, "approx_end_line": 1549, "approx_lines": 226},
+      {"name": "parse_screen_send_args", "start_line": 1550, "approx_end_line": 1716, "approx_lines": 167},
+      {"name": "parse_screen_recv_args", "start_line": 1717, "approx_end_line": 1989, "approx_lines": 273},
+      {"name": "run_self_test", "start_line": 2574, "approx_end_line": 2915, "approx_lines": 342}
+    ],
+    "responsibilities": [
+      {"name": "module wiring", "symbol": "mod declarations", "lines": "10-53", "dependencies": "44 src modules", "r4_related": false, "move_in_r4": false},
+      {"name": "CLI command model", "symbol": "Command", "lines": "174-207", "dependencies": "all subcommand config types", "r4_related": true, "move_in_r4": false},
+      {"name": "entry and dispatch", "symbol": "main", "lines": "311-450", "dependencies": "sender/receiver/probe run functions", "r4_related": false, "move_in_r4": false},
+      {"name": "screen-send defaults and parsing", "symbol": "parse_screen_send_args", "lines": "1550-1714", "dependencies": "bitrate, adaptive, encoder, converter, repair", "r4_related": true, "move_in_r4": false},
+      {"name": "screen-recv defaults and parsing", "symbol": "parse_screen_recv_args", "lines": "1717-1988", "dependencies": "receiver, renderer, repair, audio", "r4_related": false, "move_in_r4": false},
+      {"name": "adaptive option parsing", "symbol": "parse_adaptive_sender_option", "lines": "1990-2079", "dependencies": "AdaptiveRuntimeConfig", "r4_related": true, "move_in_r4": false},
+      {"name": "screen sender runtime", "symbol": "main dispatch", "lines": "392-396", "dependencies": "h264_send_probe::run", "r4_related": true, "move_in_r4": false},
+      {"name": "screen receiver runtime", "symbol": "main dispatch", "lines": "398-402", "dependencies": "h264_recv_view::run", "r4_related": false, "move_in_r4": false},
+      {"name": "legacy AGM1 UDP prototype", "symbol": "MediaPacket/Reassembler/run_sender/run_receiver", "lines": "74-308,2345-2556", "dependencies": "std UDP", "r4_related": false, "move_in_r4": false},
+      {"name": "aggregate self-test", "symbol": "run_self_test", "lines": "2574-2914", "dependencies": "module self-tests", "r4_related": true, "move_in_r4": false}
+    ],
+    "delegated_runtime": {
+      "wgc": ["wgc_latest_capture.rs", "gpu_nv12_capture.rs", "capture_encode_probe.rs"],
+      "qsv_wmf_encoder": ["wmf_h264_encoder.rs", "capture_encode_probe.rs"],
+      "d3d11_conversion": ["gpu_nv12_capture.rs", "capture_encode_probe.rs"],
+      "wmf_decoder": ["wmf_h264_decoder.rs", "h264_recv_view.rs"],
+      "nack_repair": ["repair.rs", "h264_reassembly.rs", "h264_send_probe.rs", "h264_recv_view.rs"],
+      "profile_transition": ["profile_transition.rs", "media_control.rs", "h264_send_probe.rs"],
+      "shutdown_worker_join": ["shutdown.rs", "h264_send_probe.rs", "h264_recv_view.rs"]
+    },
+    "split_recommendation": "C: do not split main.rs during R4; complete R4 and refactor separately"
+  },
+  "default_sources": [
+    {
+      "setting": "width",
+      "rust_cli": {"value": 1280, "path": "rust-native/agoralink_media/src/main.rs", "symbol": "parse_screen_send_args", "line": 1557, "product_default": true},
+      "python_gui": {"value": 1280, "path": "screen_runtime.py", "symbol": "NATIVE_SCREEN_PRESETS.stable", "line": 43, "product_default": true},
+      "config": {"value": "screen_native_preset id", "path": "main_kivy.py", "symbol": "GUI config load/save", "lines": "2152-2154,5825", "product_default": true},
+      "help": {"value": "screen-send default omitted; probe example 1280", "path": "rust-native/agoralink_media/src/main.rs", "lines": "2320-2338", "product_default": false}
+    },
+    {
+      "setting": "height",
+      "rust_cli": {"value": 720, "path": "rust-native/agoralink_media/src/main.rs", "symbol": "parse_screen_send_args", "line": 1558, "product_default": true},
+      "python_gui": {"value": 720, "path": "screen_runtime.py", "symbol": "NATIVE_SCREEN_PRESETS.stable", "line": 44, "product_default": true},
+      "config": {"value": "screen_native_preset id", "path": "main_kivy.py", "lines": "2152-2154,5825", "product_default": true}
+    },
+    {
+      "setting": "fps",
+      "rust_cli": {"value": 30, "path": "rust-native/agoralink_media/src/main.rs", "symbol": "parse_screen_send_args", "line": 1554, "product_default": true},
+      "python_gui": {"value": 30, "path": "screen_runtime.py", "symbol": "NATIVE_SCREEN_PRESETS.stable", "line": 45, "product_default": true},
+      "test_scripts": {"values": [30, 60], "classification": "validation fixtures", "product_default": false}
+    },
+    {
+      "setting": "bitrate_mbps",
+      "rust_cli": {"value": 4.0, "path": "rust-native/agoralink_media/src/main.rs", "symbol": "BitrateSelection::resolve fallback", "lines": "1682-1689", "product_default": true},
+      "python_gui": {"value": 20, "path": "screen_runtime.py", "symbol": "NATIVE_SCREEN_PRESETS.stable", "line": 46, "product_default": true},
+      "other_gui_presets": {"recommended": 50, "high_quality": 80, "path": "screen_runtime.py", "lines": "50-69", "product_default": false},
+      "precedence": {"rule": "explicit-bitrate > quality-bpf > fallback-default", "path": "rust-native/agoralink_media/src/bitrate.rs", "symbol": "BitrateSelection::resolve", "lines": "27-58"}
+    },
+    {
+      "setting": "adaptive_quality",
+      "rust_cli": {"value": "off", "path": "rust-native/agoralink_media/src/adaptive_quality.rs", "symbol": "AdaptiveConfig::default", "lines": "230-247", "product_default": true},
+      "python_gui": {"value": "not passed; Rust default applies", "path": "screen_runtime.py", "symbol": "_build_native_sender_command", "lines": "836-867", "product_default": true}
+    },
+    {
+      "setting": "encoder",
+      "rust_cli": {"value": "auto", "path": "rust-native/agoralink_media/src/main.rs", "symbol": "parse_screen_send_args", "line": 1560, "product_default": true},
+      "selection_behavior": {"value": "hardware candidates, Intel QSV first, Microsoft fallback", "path": "rust-native/agoralink_media/src/wmf_h264_encoder.rs", "lines": "60-82,401-430,938-1008"},
+      "python_gui": {"value": "omitted; Rust auto applies", "path": "screen_runtime.py", "lines": "849-867", "product_default": true}
+    },
+    {
+      "setting": "convert_backend",
+      "rust_cli": {"value": "auto", "path": "rust-native/agoralink_media/src/main.rs", "symbol": "parse_screen_send_args", "line": 1561, "product_default": true},
+      "selection_behavior": {"value": "D3D11 first, CPU fallback", "path": "rust-native/agoralink_media/src/capture_encode_probe.rs", "lines": "2-15,366-410"},
+      "python_gui": {"value": "omitted; Rust auto applies", "path": "screen_runtime.py", "lines": "849-867", "product_default": true}
+    },
+    {
+      "setting": "repair",
+      "rust_cli": {"value": "off", "path": "rust-native/agoralink_media/src/main.rs", "symbol": "parse_screen_send_args", "line": 1566, "product_default": true},
+      "python_gui": {"value": "off", "path": "screen_runtime.py", "symbol": "NATIVE_SCREEN_PRESETS.stable", "line": 48, "product_default": true},
+      "other_gui_presets": {"recommended": "nack", "high_quality": "nack", "path": "screen_runtime.py", "lines": "58,68", "product_default": false}
+    },
+    {
+      "setting": "playout_delay_ms",
+      "rust_cli": {"value": 120, "path": "rust-native/agoralink_media/src/main.rs", "symbol": "parse_screen_recv_args", "line": 1728, "product_default": true},
+      "audio_on_implicit": {"value": 250, "path": "rust-native/agoralink_media/src/main.rs", "lines": "1948-1955"},
+      "python_gui": {"value": 120, "path": "screen_runtime.py", "symbol": "NATIVE_SCREEN_PRESETS.stable", "line": 47, "product_default": true},
+      "r4_change": false
+    }
+  ],
+  "fixed_r4_default": {
+    "width": 1920,
+    "height": 1080,
+    "fps": 60,
+    "bitrate_mbps": 22,
+    "encoder": "intel-qsv",
+    "convert_backend": "d3d11",
+    "repair": "nack",
+    "adaptive_quality": "off",
+    "explicit_bitrate_must_win": true
+  },
+  "adaptive_state_machine": {
+    "mode_default": "off",
+    "states": [
+      "disabled",
+      "startup",
+      "stable",
+      "mild-pressure",
+      "severe-pressure",
+      "profile-transition",
+      "emergency-fps-reduction",
+      "recovering",
+      "cooldown"
+    ],
+    "source": {"path": "rust-native/agoralink_media/src/adaptive_quality.rs", "lines": "4-60"},
+    "eligibility": {
+      "startup_warmup_sec": 5,
+      "min_valid_windows": 5,
+      "mild_pressure_windows": 5,
+      "severe_pressure_windows": 3,
+      "stable_windows_for_upgrade": 15,
+      "transition_feedback_suppressed": true,
+      "source_lines": "213-247,812-898"
+    },
+    "cooldowns_sec": {
+      "bitrate": 10,
+      "resolution": 30,
+      "fps": 20
+    },
+    "pressure_formula_source_lines": "1273-1343",
+    "current_profile_generation": {
+      "classification": "mixed resolution table plus inferred F0-F5 bounds plus percentage bitrate steps and separate FPS tiers",
+      "profile_name_source_lines": "147-163",
+      "bitrate_bounds": {
+        "F0": [42, 50],
+        "F1": [34, 42],
+        "F2": [28, 36],
+        "F3": [20, 28],
+        "F4": [14, 22],
+        "F5": [8, 14]
+      },
+      "degrade_factors": {"severe": 0.88, "mild": 0.92},
+      "recover_factor": 1.06,
+      "resolution_tiers": ["1920x1080", "1600x900", "1280x720"],
+      "fps_tiers": [60, 45, 30]
+    },
+    "current_degrade_order": [
+      "render-only pressure may reduce FPS first",
+      "decoder-only pressure may reduce resolution first",
+      "general/network/mixed pressure reduces bitrate to inferred floor",
+      "then lowers resolution",
+      "then emergency FPS"
+    ],
+    "current_recovery_order": ["fps", "resolution", "bitrate"],
+    "target_ladder": [
+      {"id": "Q0", "width": 1920, "height": 1080, "fps": 60, "bitrate_mbps": 22},
+      {"id": "Q1", "width": 1600, "height": 900, "fps": 60, "bitrate_mbps": 22},
+      {"id": "Q2", "width": 1280, "height": 720, "fps": 60, "bitrate_mbps": 22},
+      {"id": "Q3", "width": 1280, "height": 720, "fps": 60, "bitrate_mbps": 18},
+      {"id": "Q4", "width": 1280, "height": 720, "fps": 60, "bitrate_mbps": 15}
+    ],
+    "emergency_ladder": [
+      {"id": "E1", "width": 1280, "height": 720, "fps": 45, "bitrate_mbps": 15},
+      {"id": "E2", "width": 1280, "height": 720, "fps": 30, "bitrate_mbps": 15}
+    ],
+    "target_invariants": [
+      "normal downgrade is Q0->Q1->Q2->Q3->Q4",
+      "normal recovery is exact reverse",
+      "emergency FPS states are separate",
+      "no ladder steps may be skipped",
+      "no new adaptive action while profile transition is active"
+    ]
+  },
+  "transition_behavior": {
+    "bitrate_only_success": {
+      "control": "CapturePipelineControl::UpdateBitrate",
+      "encoder_rebuild": false,
+      "new_session": false,
+      "keyframe_requested": true,
+      "profile_transition": false,
+      "evidence": ["capture_encode_probe.rs:883-923", "h264_send_probe.rs:2841-2889"]
+    },
+    "bitrate_only_runtime_failure": {
+      "encoder_rebuild": true,
+      "new_session": true,
+      "profile_transition": true,
+      "reason": "existing fallback path",
+      "evidence": ["h264_send_probe.rs:2890-3087"]
+    },
+    "resolution_change": {
+      "structural": true,
+      "new_session": true,
+      "keyframe": true,
+      "profile_transition": true
+    },
+    "fps_change": {
+      "structural": true,
+      "new_session": true,
+      "keyframe": true,
+      "profile_transition": true
+    },
+    "protocol": {
+      "messages": ["MPRF", "MPAK"],
+      "activation_guards": ["pinned peer", "old session match", "monotonic sequence", "monotonic generation", "matching ACK"],
+      "duplicate_behavior": "re-ack without duplicate activation",
+      "finite_deadlines_source": "profile_transition.rs:9-16",
+      "implementation_source": "profile_transition.rs:307-642; h264_send_probe.rs:1242-1542"
+    },
+    "r4_action": "reuse unchanged"
+  },
+  "test_coverage": [
+    {
+      "topic": "adaptive off",
+      "tests": ["adaptive_off_never_changes_fixed_profile"],
+      "status": "covered",
+      "r4_change": false
+    },
+    {
+      "topic": "current downgrade order",
+      "tests": ["fps_priority_and_hysteresis", "resolution_before_emergency_fps", "emergency_fps_reduction_requires_sustained_severe_pressure_at_floor"],
+      "status": "covered for old policy",
+      "r4_change": true,
+      "reason": "fps_priority_and_hysteresis asserts bitrate-first behavior incompatible with R4"
+    },
+    {
+      "topic": "current recovery order",
+      "tests": ["recovery_order_is_fps_resolution_bitrate"],
+      "status": "covered for old policy",
+      "r4_change": true,
+      "reason": "assertion conflicts with exact reverse Q4->Q0 recovery"
+    },
+    {
+      "topic": "hysteresis and classifier stability",
+      "tests": [
+        "spikes_stale_feedback_and_short_stability_do_not_change_profile",
+        "bottleneck_classification_matrix",
+        "virtual_soak_does_not_oscillate",
+        "startup_zero_fps_is_ineligible_and_cannot_pollute_pressure_windows",
+        "initial_decoder_warmup_then_sixty_fps_stays_at_f0_for_sixty_seconds",
+        "stable_network_at_fifty_eight_to_sixty_fps_keeps_f0",
+        "transition_feedback_never_enters_classifier_or_triggers_positive_feedback",
+        "deterministic_ten_minute_soak_has_no_self_excited_degradation",
+        "sliding_window_resets_at_session_boundary_and_requires_a_fresh_baseline",
+        "isolated_thirty_three_ms_present_sample_is_not_network_pressure",
+        "transport_window_gate_blocks_adaptation_even_after_local_warmup"
+      ],
+      "status": "strong",
+      "r4_change": "fixtures/profile names only; formulas remain"
+    },
+    {
+      "topic": "bitrate override and runtime classification",
+      "tests": ["bitrate::run_self_test explicit override", "bitrate_only_action_does_not_increment_profile_generation", "bitrate_only_action_is_not_a_structural_profile_change"],
+      "status": "partial",
+      "gap": "no complete screen-send R4 default tuple test and no defined explicit-bitrate-plus-adaptive policy"
+    },
+    {
+      "topic": "profile transition and session rollover",
+      "tests": [
+        "all_control_packets_lost_never_activates_sender_session",
+        "duplicate_control_is_reacked_without_activation",
+        "higher_sequence_cannot_roll_generation_back",
+        "forged_peer_cannot_create_pending_transition",
+        "malformed_profile_datagrams_cannot_redirect_or_mutate_receiver_state",
+        "pending_expiry_keeps_old_session_active",
+        "expired_controls_cannot_replay_sequence_or_generation",
+        "matching_ack_is_required_before_sender_activation",
+        "all_acks_lost_leave_receiver_on_old_session_until_pending_expires",
+        "successful_transition_commits_each_side_once",
+        "delayed_new_session_activates_before_pending_deadline",
+        "readiness_timeout_is_finite_and_fails_after_ack",
+        "old_data_during_pending_and_stale_data_after_commit_do_not_switch_sessions",
+        "duplicate_ack_and_cancellation_are_idempotent_and_finite",
+        "cancellation_during_control_ack_and_readiness_is_finite",
+        "damaged_settle_recovers_once_and_commits_within_hard_deadline",
+        "repeated_damaged_settle_fails_after_one_restart",
+        "cancellation_soak_leaves_no_sender_transition_active",
+        "readiness_failure_telemetry_is_committed_before_snapshot",
+        "matching_rejected_ack_terminates_control_wait_without_activation",
+        "virtual_thirty_minute_fault_soak_has_no_permanent_transition_or_rollback"
+      ],
+      "status": "strong",
+      "r4_change": false
+    },
+    {
+      "topic": "window close, Ctrl+C, STREAM_CLOSE, worker join",
+      "tests": [
+        "receiver_close_retries_after_socket_timeout_and_accepts_matching_ack",
+        "receiver_close_ignores_wrong_close_id_before_matching_ack",
+        "receiver_close_ignores_full_size_media_datagram_before_ack",
+        "simultaneous_close_is_acknowledged_before_local_ack_arrives",
+        "duplicate_stream_close_is_reackable_but_shutdown_reason_is_idempotent",
+        "stream_close_ack_requires_exact_stream_session_and_close_id",
+        "cancellation_reason_is_first_writer_wins",
+        "shutdown_cleanup_is_single_entry_and_idempotent",
+        "finite_join_reports_success_and_timeout",
+        "failed_worker_cleanup_never_reports_stopped",
+        "cancelled_worker_exits_and_releases_udp_socket",
+        "shared_cancellation_stops_all_workers_within_one_deadline",
+        "one_slow_worker_does_not_consume_another_workers_join_budget",
+        "timed_out_worker_can_be_retained_then_reaped_without_detach",
+        "ctrl_c_and_window_close_reasons_remain_distinct"
+      ],
+      "status": "strong",
+      "r4_change": false
+    },
+    {
+      "topic": "R4 ladder",
+      "tests": [],
+      "status": "gap",
+      "required": [
+        "exact Q0-Q4 values",
+        "adjacent downgrade without skips",
+        "exact reverse restore",
+        "separate E1/E2 emergency states",
+        "no concurrent transition",
+        "full fixed product default tuple",
+        "GUI native command construction"
+      ]
+    }
+  ],
+  "required_changes": [
+    {
+      "file": "rust-native/agoralink_media/src/main.rs",
+      "symbols": ["parse_screen_send_args", "print_help", "run_self_test"],
+      "current": "1280x720/30/4, auto/auto, repair off, adaptive off",
+      "target": "1920x1080/60/22, Intel QSV, D3D11, NACK, adaptive off; explicit bitrate wins",
+      "tests": ["complete default tuple", "explicit bitrate precedence"],
+      "risk": "CLI compatibility and hard-vs-fallback backend semantics"
+    },
+    {
+      "file": "rust-native/agoralink_media/src/adaptive_quality.rs",
+      "symbols": ["QualityProfile", "degrade", "recover", "apply_action", "inline tests"],
+      "current": "mixed inferred F profiles and percentage bitrate policy",
+      "target": "explicit adjacent Q0-Q4 ladder plus E1/E2 emergency FPS",
+      "tests": ["exact ladder", "no skip", "reverse recovery", "hysteresis", "transition suppression", "soak"],
+      "risk": "adaptive-only action order and structural transition frequency"
+    },
+    {
+      "file": "screen_runtime.py",
+      "symbols": ["DEFAULT_NATIVE_SCREEN_PRESET", "NATIVE_SCREEN_PRESETS", "_build_native_sender_command", "_build_native_receiver_command"],
+      "current": "stable 720p30/20/off",
+      "target": "R4 default command tuple and explicit preset semantics",
+      "tests": ["command arrays", "default preset"],
+      "risk": "saved preset id meaning"
+    },
+    {
+      "file": "main_kivy.py",
+      "symbols": ["screen_native_preset load/save and settings binding"],
+      "current": "missing key resolves to stable; only preset id persists",
+      "target": "explicit R4 default and safe legacy migration",
+      "tests": ["config migration", "settings persistence"],
+      "risk": "silent behavior change for existing users"
+    }
+  ],
+  "optional_changes": [
+    {
+      "file": "rust-native/agoralink_media/src/h264_send_probe.rs",
+      "reason": "Q0-Q4 telemetry labels may need exposure",
+      "constraint": "do not change transition, NACK, capture, send, or shutdown mechanics"
+    },
+    {
+      "file": "screen_share_presenter.py",
+      "reason": "updated preset/profile display text only"
+    },
+    {
+      "file": "README.md and CHANGELOG.md",
+      "reason": "remove stale 20/50/80 recommendation drift after behavior lands"
+    },
+    {
+      "file": "rust-native/agoralink_media/src/bitrate.rs",
+      "reason": "promote explicit precedence self-test to a unit test; no logic change expected"
+    }
+  ],
+  "explicitly_unchanged": [
+    "NACK mechanics and parameters",
+    "playout buffering and delay",
+    "network pressure formulas",
+    "MPRF/MPAK wire format",
+    "session rollover mechanism",
+    "WGC resource lifetime and callback lifecycle",
+    "STREAM_CLOSE",
+    "shutdown coordinator and worker join",
+    "QSV/WMF encoder implementation",
+    "D3D11 conversion implementation",
+    "WMF decoder and renderers",
+    "audio and A/V synchronization"
+  ],
+  "deferred_changes": [
+    "large main.rs split",
+    "legacy AGM1 prototype extraction",
+    "playout-delay optimization",
+    "new network classifier or pressure formula",
+    "FPS policy redesign beyond E1/E2",
+    "wire-format extensions",
+    "QSV/D3D11/WGC/decoder/renderer refactors",
+    "unrelated Clippy cleanup within R4 commits"
+  ],
+  "risks": [
+    {"id": "R1", "severity": "high", "summary": "Rust, GUI, help, and scripts carry conflicting values", "mitigation": "single audited product default plus source-classification tests"},
+    {"id": "R2", "severity": "high", "summary": "22 Mbps conflicts with current F1/F3 bitrate floors", "mitigation": "replace action-generation bounds with explicit Q ladder"},
+    {"id": "R3", "severity": "high", "summary": "Changing stable preset semantics can silently migrate users", "mitigation": "versioned preset migration or new preset id"},
+    {"id": "R4", "severity": "medium", "summary": "Auto backend permits fallback while target names Intel QSV and D3D11", "mitigation": "specify hard-fail versus preferred-fallback semantics"},
+    {"id": "R5", "severity": "medium", "summary": "Runtime bitrate failure becomes structural transition", "mitigation": "retain existing fallback and test both outcomes"},
+    {"id": "R6", "severity": "high", "summary": "Current source baseline is dirty and several R3 modules are untracked", "mitigation": "capture intended R3 source baseline deliberately before R4"},
+    {"id": "R7", "severity": "medium", "summary": "Strict Clippy gate fails with about 70 diagnostics", "mitigation": "separate lint baseline/cleanup from R4 behavior commits"},
+    {"id": "R8", "severity": "low", "summary": "screen-send help omits core defaults", "mitigation": "update help with implementation"},
+    {"id": "R9", "severity": "low", "summary": "No independent frozen R3 EXE copy found under local artifacts", "mitigation": "retain immutable delivery artifact by hash for future audits"}
+  ],
+  "recommended_commits": [
+    {
+      "number": 1,
+      "title": "Add R4 policy tests without changing product behavior",
+      "scope": ["adaptive_quality.rs tests", "main.rs self-test/default tests", "optional Python command tests"],
+      "rollback": "remove tests only",
+      "exclude": ["refactors", "lint cleanup", "protocol changes"]
+    },
+    {
+      "number": 2,
+      "title": "Unify fixed product defaults at 1080p60/22",
+      "scope": ["main.rs screen-send defaults"],
+      "rollback": "restore parser defaults",
+      "exclude": ["adaptive ladder", "media runtime internals"]
+    },
+    {
+      "number": 3,
+      "title": "Introduce explicit Q0-Q4 and E1/E2 profile tables",
+      "scope": ["adaptive_quality.rs profile representation and telemetry"],
+      "rollback": "restore old inferred generator",
+      "exclude": ["transition/session code"]
+    },
+    {
+      "number": 4,
+      "title": "Implement adjacent downgrade and exact reverse recovery",
+      "scope": ["adaptive_quality.rs policy", "optional telemetry-only h264_send_probe integration"],
+      "rollback": "revert controller policy",
+      "exclude": ["classifier thresholds", "NACK", "playout", "wire/session logic"]
+    },
+    {
+      "number": 5,
+      "title": "Align GUI preset, config migration, help, and docs",
+      "scope": ["screen_runtime.py", "main_kivy.py", "main.rs help", "README.md", "CHANGELOG.md"],
+      "rollback": "restore preset/default id and labels",
+      "exclude": ["UI redesign", "unrelated cleanup"]
+    },
+    {
+      "number": 6,
+      "title": "Run targeted regressions and generate R4 evidence",
+      "scope": ["tests and separately authorized evidence only"],
+      "rollback": "remove evidence only",
+      "exclude": ["opportunistic product fixes"]
+    }
+  ],
+  "open_questions": [
+    "When adaptive smoothness and explicit --bitrate-mbps are combined, does the explicit value define nominal Q0 only or remain fixed outside the 22/18/15 ladder?",
+    "Are Intel QSV and D3D11 hard requirements or preferred defaults with existing fallback?",
+    "Should GUI use a new r4_default preset id or version-migrate the existing stable id?",
+    "Should legacy 50/80 Mbps presets remain optional choices without recommendation status?",
+    "Must strict Clippy be green before R4 implementation begins, or may lint debt be baselined separately?"
+  ],
+  "blockers": [
+    {
+      "type": "validation-gate",
+      "summary": "The mandated strict Clippy command currently fails with approximately 70 diagnostics.",
+      "functional_r4_design_blocker": false,
+      "release_gate_blocker_if_clippy_is_mandatory": true
+    }
+  ],
+  "recommended_r4_approach": "Make a narrow, test-first policy/default change; preserve the R3 media and transition runtime; defer main.rs restructuring."
+}

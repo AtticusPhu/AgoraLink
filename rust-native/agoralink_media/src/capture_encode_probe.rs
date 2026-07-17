@@ -33,16 +33,12 @@ pub struct CaptureEncodeConfig {
 
 #[cfg(windows)]
 mod platform {
+    use std::collections::VecDeque;
     use std::fs::File;
     use std::io::{self, Write};
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
-
-    use windows::Win32::System::Console::{
-        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
-    };
 
     use super::{CaptureEncodeConfig, ConvertBackend};
     use crate::bgra_to_nv12;
@@ -50,10 +46,15 @@ mod platform {
     use crate::color_spec::{ColorSpec, MediaColorMetadata};
     use crate::gpu_nv12_capture::{GpuCaptureStats, GpuNv12Capture};
     use crate::wgc_latest_capture::{LatestCapture, LatestCaptureStats};
-    use crate::wmf_h264_encoder::{EncodedSample, EncoderSelection, EncoderStats, WmfH264Encoder};
+    use crate::wmf_h264_encoder::{
+        EncodedSample, EncoderKeyframeControl, EncoderSelection, EncoderStats, WmfH264Encoder,
+    };
 
     const PIXEL_FORMAT_NAME: &str = "B8G8R8A8";
-    static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+    const KEYFRAME_TELEMETRY_HISTORY: usize = 16;
+    pub fn stop_requested() -> bool {
+        crate::shutdown::ctrl_c_requested()
+    }
 
     #[derive(Clone, Debug)]
     pub struct ConversionSelection {
@@ -125,6 +126,13 @@ mod platform {
         pub encode_lag_skips: u64,
         pub keyframe_force_requests: u64,
         pub keyframe_force_failures: u64,
+        pub keyframe_force_last_requested_frame_id: Option<u64>,
+        pub keyframe_force_last_effective_frame_id: Option<u64>,
+        pub keyframe_force_latency_frames_avg: f64,
+        pub keyframe_force_latency_frames_max: u64,
+        pub keyframe_force_request_frame_ids: Vec<u64>,
+        pub keyframe_force_effective_frame_ids: Vec<u64>,
+        pub keyframe_force_latency_frames: Vec<u64>,
         pub samples_out: u64,
         pub bytes_out: u64,
         pub raw_fps: f64,
@@ -141,6 +149,9 @@ mod platform {
         pub gpu_convert_ms_avg: f64,
         pub cpu_convert_ms_avg: f64,
         pub encode_ms_avg: f64,
+        pub qsv_async_wait_timeouts: u64,
+        pub qsv_async_wait_cancelled: u64,
+        pub qsv_drain_timeouts: u64,
         pub conversion_selection: ConversionSelection,
         pub color_spec: ColorSpec,
         pub encoder_selection: EncoderSelection,
@@ -163,6 +174,7 @@ mod platform {
         pub keyframe_interval_applied: bool,
         pub keyframe_interval_target_frames: Option<u32>,
         pub keyframe_force_supported: bool,
+        pub keyframe_control: EncoderKeyframeControl,
     }
 
     #[derive(Clone, Debug)]
@@ -198,6 +210,21 @@ mod platform {
         pub encoder_output_color_metadata: MediaColorMetadata,
         pub keyframe_force_requests: u64,
         pub keyframe_force_failures: u64,
+        pub keyframe_force_last_requested_frame_id: Option<u64>,
+        pub keyframe_force_last_effective_frame_id: Option<u64>,
+        pub keyframe_force_latency_frames_avg: f64,
+        pub keyframe_force_latency_frames_max: u64,
+        pub keyframe_force_request_frame_ids: Vec<u64>,
+        pub keyframe_force_effective_frame_ids: Vec<u64>,
+        pub keyframe_force_latency_frames: Vec<u64>,
+        pub reconfigure_requested: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum CapturePipelineControl {
+        Continue,
+        UpdateBitrate(f64),
+        Restart,
     }
 
     pub trait CaptureEncodeObserver {
@@ -207,6 +234,29 @@ mod platform {
 
         fn on_sample(&mut self, sample: EncodedSample) -> Result<(), String>;
         fn on_stats(&mut self, stats: &CapturePipelineStats) -> Result<(), String>;
+
+        fn on_encoder_terminal_stats(&mut self, _stats: EncoderStats) {}
+
+        fn stop_requested(&self) -> bool {
+            false
+        }
+
+        fn cancellation_token(&self) -> Option<crate::shutdown::CancellationToken> {
+            None
+        }
+
+        fn take_control(&mut self) -> CapturePipelineControl {
+            CapturePipelineControl::Continue
+        }
+
+        fn on_bitrate_update_result(
+            &mut self,
+            _requested_mbps: f64,
+            result: &Result<(), String>,
+            _idr_requested: bool,
+        ) -> Result<bool, String> {
+            Ok(result.is_err())
+        }
     }
 
     #[derive(Clone, Copy, Default)]
@@ -220,6 +270,94 @@ mod platform {
         keyframe_force_failures: u64,
         cpu_convert_ms_total: f64,
         encode_ms_total: f64,
+    }
+
+    #[derive(Default)]
+    struct KeyframeRequestTracker {
+        pending: VecDeque<u64>,
+        last_requested_frame_id: Option<u64>,
+        last_effective_frame_id: Option<u64>,
+        latency_frames_total: u64,
+        latency_frames_max: u64,
+        effective_requests: u64,
+        recent_requested: VecDeque<u64>,
+        recent_effective: VecDeque<u64>,
+        recent_latencies: VecDeque<u64>,
+    }
+
+    impl KeyframeRequestTracker {
+        fn record_request(&mut self, frame_id: u64) {
+            self.pending.push_back(frame_id);
+            self.last_requested_frame_id = Some(frame_id);
+            push_bounded(&mut self.recent_requested, frame_id);
+        }
+
+        fn observe_sample(&mut self, sample: &EncodedSample, fps: u32) {
+            if !crate::h264_annex_b::summarize_nals(&sample.bytes).has_idr_slice {
+                return;
+            }
+            let Some(sample_time_hns) = sample.sample_time_hns else {
+                return;
+            };
+            let effective_frame_id =
+                ((sample_time_hns.max(0) as u128 * u128::from(fps) + 5_000_000) / 10_000_000)
+                    .min(u128::from(u64::MAX)) as u64;
+            let Some(requested_frame_id) = self
+                .pending
+                .iter()
+                .copied()
+                .filter(|frame_id| *frame_id <= effective_frame_id)
+                .next_back()
+            else {
+                return;
+            };
+            while self
+                .pending
+                .front()
+                .is_some_and(|frame_id| *frame_id <= requested_frame_id)
+            {
+                self.pending.pop_front();
+            }
+            let latency = effective_frame_id.saturating_sub(requested_frame_id);
+            self.last_effective_frame_id = Some(effective_frame_id);
+            self.latency_frames_total = self.latency_frames_total.saturating_add(latency);
+            self.latency_frames_max = self.latency_frames_max.max(latency);
+            self.effective_requests += 1;
+            push_bounded(&mut self.recent_effective, effective_frame_id);
+            push_bounded(&mut self.recent_latencies, latency);
+        }
+
+        fn latency_frames_avg(&self) -> f64 {
+            if self.effective_requests == 0 {
+                0.0
+            } else {
+                self.latency_frames_total as f64 / self.effective_requests as f64
+            }
+        }
+
+        fn request_frame_ids(&self) -> Vec<u64> {
+            self.recent_requested.iter().copied().collect()
+        }
+
+        fn effective_frame_ids(&self) -> Vec<u64> {
+            self.recent_effective.iter().copied().collect()
+        }
+
+        fn latency_frames(&self) -> Vec<u64> {
+            self.recent_latencies.iter().copied().collect()
+        }
+    }
+
+    fn push_bounded(values: &mut VecDeque<u64>, value: u64) {
+        if values.len() == KEYFRAME_TELEMETRY_HISTORY {
+            values.pop_front();
+        }
+        values.push_back(value);
+    }
+
+    fn keyframe_request_due(frames_encoded: u64, target_frames: Option<u32>) -> bool {
+        frames_encoded > 0
+            && target_frames.is_some_and(|frames| frames_encoded % u64::from(frames) == 0)
     }
 
     impl CaptureRuntime {
@@ -260,14 +398,19 @@ mod platform {
                             fallback_reason: None,
                         },
                     }),
-                    Err(gpu_error) => Ok(Self {
-                        source: CaptureSource::Cpu(LatestCapture::start()?),
-                        selection: ConversionSelection {
-                            requested: ConvertBackend::Auto,
-                            selected: ConvertBackend::Cpu,
-                            fallback_reason: Some(gpu_error),
-                        },
-                    }),
+                    Err(gpu_error) => {
+                        if crate::shutdown::worker_ownership_failed(&gpu_error) {
+                            return Err(gpu_error);
+                        }
+                        Ok(Self {
+                            source: CaptureSource::Cpu(LatestCapture::start()?),
+                            selection: ConversionSelection {
+                                requested: ConvertBackend::Auto,
+                                selected: ConvertBackend::Cpu,
+                                fallback_reason: Some(gpu_error),
+                            },
+                        })
+                    }
                 },
             }
         }
@@ -400,7 +543,7 @@ mod platform {
 
         fn on_stats(&mut self, stats: &CapturePipelineStats) -> Result<(), String> {
             println!(
-                r#"{{"type":"CAPTURE_ENCODE_STATS","mode":"capture_encode_probe","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"mbps":{:.3},"target_bitrate_mbps":{:.3},"width":{},"height":{},"format_in":"{}","format_encode":"NV12","copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"gpu_convert_ms_avg":{:.3},"cpu_convert_ms_avg":{:.3},"encode_ms_avg":{:.3},{},{},{},{},{},{}}}"#,
+                r#"{{"type":"CAPTURE_ENCODE_STATS","mode":"capture_encode_probe","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"raw_fps":{:.2},"accepted_fps":{:.2},"encode_fps":{:.2},"target_fps":{},"mbps":{:.3},"target_bitrate_mbps":{:.3},"width":{},"height":{},"format_in":"{}","format_encode":"NV12","copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"gpu_convert_ms_avg":{:.3},"cpu_convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"qsv_async_wait_timeouts":{},"qsv_async_wait_cancelled":{},"qsv_drain_timeouts":{},{},{},{},{},{},{}}}"#,
                 stats.capture_raw_frames,
                 stats.capture_latest_updates,
                 stats.capture_callback_skipped,
@@ -426,6 +569,9 @@ mod platform {
                 stats.gpu_convert_ms_avg,
                 stats.cpu_convert_ms_avg,
                 stats.encode_ms_avg,
+                stats.qsv_async_wait_timeouts,
+                stats.qsv_async_wait_cancelled,
+                stats.qsv_drain_timeouts,
                 stats.bitrate_selection.json_fragment(Some(stats.mbps)),
                 stats.conversion_selection.json_fragment(),
                 stats.encoder_selection.json_fragment(),
@@ -442,33 +588,10 @@ mod platform {
         }
     }
 
-    struct ConsoleCtrlGuard;
+    pub type ConsoleCtrlGuard = crate::shutdown::ConsoleCtrlGuard;
 
-    impl ConsoleCtrlGuard {
-        fn install() -> Result<Self, String> {
-            STOP_REQUESTED.store(false, Ordering::SeqCst);
-            unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), true) }
-                .map_err(|err| format!("SetConsoleCtrlHandler failed: {err}"))?;
-            Ok(Self)
-        }
-    }
-
-    impl Drop for ConsoleCtrlGuard {
-        fn drop(&mut self) {
-            let _ = unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), false) };
-        }
-    }
-
-    unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> windows::core::BOOL {
-        if matches!(
-            ctrl_type,
-            CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT
-        ) {
-            STOP_REQUESTED.store(true, Ordering::SeqCst);
-            true.into()
-        } else {
-            false.into()
-        }
+    pub fn install_console_ctrl_guard() -> Result<ConsoleCtrlGuard, String> {
+        ConsoleCtrlGuard::install()
     }
 
     pub fn run(config: CaptureEncodeConfig) -> Result<(), String> {
@@ -482,7 +605,7 @@ mod platform {
             .flush()
             .map_err(|err| format!("flush output failed: {err}"))?;
         println!(
-            r#"{{"type":"CAPTURE_ENCODE_DONE","encoder":"{}","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"target_bitrate_mbps":{:.3},"keyframes":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"gpu_convert_ms_avg":{:.3},"cpu_convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"output":"{}",{},{},{},{},{},{}}}"#,
+            r#"{{"type":"CAPTURE_ENCODE_DONE","encoder":"{}","capture_raw_frames":{},"capture_latest_updates":{},"capture_callback_skipped":{},"capture_dropped":{},"encode_ticks":{},"no_new_frame_skipped":{},"no_new_frame_reused":{},"frames_encoded":{},"encode_lag_skips":{},"samples_out":{},"bytes_out":{},"duration_sec":{:.3},"wall_time_sec":{:.3},"fps":{},"processing_fps":{:.2},"mbps":{:.3},"target_bitrate_mbps":{:.3},"keyframes":{},"width":{},"height":{},"copy_ms_avg":{:.3},"convert_ms_avg":{:.3},"gpu_convert_ms_avg":{:.3},"cpu_convert_ms_avg":{:.3},"encode_ms_avg":{:.3},"qsv_async_wait_timeouts":{},"qsv_async_wait_cancelled":{},"qsv_drain_timeouts":{},"output":"{}",{},{},{},{},{},{}}}"#,
             json_escape(&done.encoder_selection.selected_name),
             done.capture_raw_frames,
             done.capture_latest_updates,
@@ -509,6 +632,9 @@ mod platform {
             done.gpu_convert_ms_avg,
             done.cpu_convert_ms_avg,
             done.encode_ms_avg,
+            done.encoder.async_wait_timeouts,
+            done.encoder.async_wait_cancelled,
+            done.encoder.async_drain_timeouts,
             json_escape(&config.output),
             done.bitrate_selection.json_fragment(Some(done.mbps)),
             done.conversion_selection.json_fragment(),
@@ -533,47 +659,78 @@ mod platform {
         Ok(())
     }
 
-    pub fn run_with_observer(
+    pub struct PreparedCapturePipeline {
+        capture: CaptureRuntime,
+        encoder: WmfH264Encoder,
+    }
+
+    impl PreparedCapturePipeline {
+        pub fn discard(self) -> Result<(), String> {
+            self.capture.stop()
+        }
+    }
+
+    pub fn prepare_pipeline(
         config: &CaptureEncodeConfig,
-        observer: &mut dyn CaptureEncodeObserver,
-    ) -> Result<CapturePipelineDone, String> {
+        cancellation: Option<crate::shutdown::CancellationToken>,
+    ) -> Result<PreparedCapturePipeline, String> {
         validate_stream_config(config)?;
-        let _console_ctrl = ConsoleCtrlGuard::install()?;
         let capture = CaptureRuntime::start(config)?;
-        let capture_info = capture.info();
-        let mut encoder = WmfH264Encoder::new_stream_with_color_and_choice(
+        let keyframe_interval_target_frames = config.keyframe_interval_sec.map(|seconds| {
+            (seconds * f64::from(config.target_fps))
+                .round()
+                .clamp(1.0, f64::from(u32::MAX)) as u32
+        });
+        let encoder_result = WmfH264Encoder::new_stream_with_color_choice_and_keyframe_interval(
             config.out_width,
             config.out_height,
             config.target_fps,
             config.bitrate_mbps,
             config.color_spec,
             config.encoder,
-        )?;
+            keyframe_interval_target_frames,
+        );
+        let mut encoder = match encoder_result {
+            Ok(encoder) => encoder,
+            Err(error) => {
+                let _ = capture.stop();
+                return Err(error);
+            }
+        };
+        encoder.set_async_cancellation(cancellation.unwrap_or_default());
+        Ok(PreparedCapturePipeline { capture, encoder })
+    }
+
+    pub fn run_with_observer(
+        config: &CaptureEncodeConfig,
+        observer: &mut dyn CaptureEncodeObserver,
+    ) -> Result<CapturePipelineDone, String> {
+        let prepared = prepare_pipeline(config, observer.cancellation_token())?;
+        run_prepared_with_observer(config, observer, prepared)
+    }
+
+    pub fn run_prepared_with_observer(
+        config: &CaptureEncodeConfig,
+        observer: &mut dyn CaptureEncodeObserver,
+        prepared: PreparedCapturePipeline,
+    ) -> Result<CapturePipelineDone, String> {
+        validate_stream_config(config)?;
+        let _console_ctrl = ConsoleCtrlGuard::install()?;
+        let PreparedCapturePipeline {
+            capture,
+            mut encoder,
+        } = prepared;
+        let capture_info = capture.info();
         let keyframe_interval_target_frames = config.keyframe_interval_sec.map(|seconds| {
             (seconds * f64::from(config.target_fps))
                 .round()
                 .clamp(1.0, f64::from(u32::MAX)) as u32
         });
-        let mut keyframe_interval_applied = false;
-        if let Some(frames) = keyframe_interval_target_frames {
-            match encoder.set_keyframe_interval_frames(frames) {
-                Ok(()) => keyframe_interval_applied = true,
-                Err(err) => {
-                    if config.verbose {
-                        eprintln!(
-                            "encoder could not apply keyframe interval {:.3}s ({} frames): {}",
-                            config.keyframe_interval_sec.unwrap_or_default(),
-                            frames,
-                            err
-                        );
-                    }
-                }
-            }
-        }
+        let keyframe_control = encoder.keyframe_control().clone();
         let keyframe_force_supported =
-            keyframe_interval_target_frames.is_some() && encoder.supports_force_keyframe();
+            keyframe_interval_target_frames.is_some() && keyframe_control.force_supported;
         let mut keyframe_force_enabled = keyframe_force_supported;
-        keyframe_interval_applied |= keyframe_force_supported;
+        let keyframe_interval_applied = keyframe_control.config_applied || keyframe_force_supported;
         let mut nv12 = vec![0u8; bgra_to_nv12::buffer_size(config.out_width, config.out_height)?];
         let frame_interval = Duration::from_nanos(1_000_000_000u64 / u64::from(config.target_fps));
         let started_at = Instant::now();
@@ -583,8 +740,11 @@ mod platform {
         let mut previous_pipeline = PipelineCounters::default();
         let mut previous_encoder = EncoderStats::default();
         let mut counters = PipelineCounters::default();
+        let mut keyframe_requests = KeyframeRequestTracker::default();
         let mut last_version = 0u64;
         let mut have_nv12 = false;
+        let mut effective_bitrate_mbps = config.bitrate_mbps;
+        let mut reconfigure_requested = false;
 
         if config.verbose {
             eprintln!(
@@ -623,10 +783,12 @@ mod platform {
             keyframe_interval_applied,
             keyframe_interval_target_frames,
             keyframe_force_supported,
+            keyframe_control: keyframe_control.clone(),
         })?;
 
         while !duration_elapsed(started_at, config.duration_sec)
-            && !STOP_REQUESTED.load(Ordering::SeqCst)
+            && !stop_requested()
+            && !observer.stop_requested()
         {
             sleep_until(next_tick);
             if let Some(error) = capture.error() {
@@ -639,9 +801,11 @@ mod platform {
                 counters.no_new_frame_reused += 1;
             }
             if have_nv12 {
-                if counters.frames_encoded > 0
-                    && keyframe_interval_target_frames
-                        .is_some_and(|frames| counters.frames_encoded % u64::from(frames) == 0)
+                if (counters.frames_encoded == 0
+                    || keyframe_request_due(
+                        counters.frames_encoded,
+                        keyframe_interval_target_frames,
+                    ))
                     && keyframe_force_enabled
                 {
                     counters.keyframe_force_requests += 1;
@@ -651,13 +815,24 @@ mod platform {
                         if config.verbose {
                             eprintln!("encoder forced-IDR request failed: {err}");
                         }
+                    } else {
+                        keyframe_requests.record_request(counters.frames_encoded);
                     }
                 }
                 let encode_started = Instant::now();
-                encoder.encode_nv12(&nv12, counters.frames_encoded)?;
+                if let Err(error) = encoder.encode_nv12(&nv12, counters.frames_encoded) {
+                    observer.on_encoder_terminal_stats(encoder.stats());
+                    let _ = capture.stop();
+                    return Err(error);
+                }
                 counters.encode_ms_total += encode_started.elapsed().as_secs_f64() * 1000.0;
                 counters.frames_encoded += 1;
-                emit_encoded_samples(&mut encoder, observer)?;
+                emit_encoded_samples(
+                    &mut encoder,
+                    observer,
+                    &mut keyframe_requests,
+                    config.target_fps,
+                )?;
             } else {
                 counters.no_new_frame_skipped += 1;
             }
@@ -686,9 +861,67 @@ mod platform {
                     encoder.output_color_metadata(),
                     encoder.encoder_selection().clone(),
                     capture.selection.clone(),
+                    &keyframe_requests,
                     after_work.duration_since(report_at),
+                    effective_bitrate_mbps,
                 );
-                observer.on_stats(&stats)?;
+                if let Err(error) = observer.on_stats(&stats) {
+                    let capture_error = capture.stop().err();
+                    let encoder_error = encoder.finish().err();
+                    observer.on_encoder_terminal_stats(encoder.stats());
+                    let cleanup_error = [capture_error, encoder_error]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return if cleanup_error.is_empty() {
+                        Err(error)
+                    } else {
+                        Err(format!("{error}; pipeline cleanup: {cleanup_error}"))
+                    };
+                }
+                match observer.take_control() {
+                    CapturePipelineControl::Continue => {}
+                    CapturePipelineControl::UpdateBitrate(requested_mbps) => {
+                        let mut idr_requested = false;
+                        let result = match encoder.set_mean_bitrate_mbps(requested_mbps) {
+                            Ok(()) => {
+                                counters.keyframe_force_requests =
+                                    counters.keyframe_force_requests.saturating_add(1);
+                                match encoder.request_keyframe() {
+                                    Ok(()) => {
+                                        idr_requested = true;
+                                        keyframe_requests.record_request(counters.frames_encoded);
+                                        Ok(())
+                                    }
+                                    Err(error) => {
+                                        counters.keyframe_force_failures =
+                                            counters.keyframe_force_failures.saturating_add(1);
+                                        Err(format!(
+                                            "bitrate updated but forced-IDR request failed: {error}"
+                                        ))
+                                    }
+                                }
+                            }
+                            Err(error) => Err(error),
+                        };
+                        if result.is_ok() {
+                            effective_bitrate_mbps = requested_mbps;
+                        }
+                        if observer.on_bitrate_update_result(
+                            requested_mbps,
+                            &result,
+                            idr_requested,
+                        )? {
+                            reconfigure_requested = true;
+                            break;
+                        }
+                    }
+                    CapturePipelineControl::Restart => {
+                        reconfigure_requested = true;
+                        break;
+                    }
+                }
                 previous_capture = capture_stats;
                 previous_pipeline = counters;
                 previous_encoder = encoder_stats;
@@ -699,8 +932,19 @@ mod platform {
         let capture_stats = capture.stats();
         let conversion_selection = capture.selection.clone();
         capture.stop()?;
-        let encoder_stats = encoder.finish()?;
-        emit_encoded_samples(&mut encoder, observer)?;
+        let encoder_stats = match encoder.finish() {
+            Ok(stats) => stats,
+            Err(error) => {
+                observer.on_encoder_terminal_stats(encoder.stats());
+                return Err(error);
+            }
+        };
+        emit_encoded_samples(
+            &mut encoder,
+            observer,
+            &mut keyframe_requests,
+            config.target_fps,
+        )?;
         let wall_time_sec = started_at.elapsed().as_secs_f64();
         let media_duration_sec = encoder_stats.frames_in as f64 / f64::from(config.target_fps);
         Ok(CapturePipelineDone {
@@ -720,7 +964,7 @@ mod platform {
             mbps: encoder_stats.bytes_out as f64 * 8.0
                 / media_duration_sec.max(0.001)
                 / 1_000_000.0,
-            bitrate_mbps: config.bitrate_mbps,
+            bitrate_mbps: effective_bitrate_mbps,
             bitrate_selection: config.bitrate_selection.clone(),
             width: config.out_width,
             height: config.out_height,
@@ -739,7 +983,7 @@ mod platform {
             ),
             cpu_convert_ms_avg: average_ms(counters.cpu_convert_ms_total, counters.frames_encoded),
             encode_ms_avg: average_ms(counters.encode_ms_total, counters.frames_encoded),
-            stopped_by_console: STOP_REQUESTED.load(Ordering::SeqCst),
+            stopped_by_console: stop_requested(),
             color_spec: config.color_spec,
             conversion_selection,
             encoder_selection: encoder.encoder_selection().clone(),
@@ -747,6 +991,14 @@ mod platform {
             encoder_output_color_metadata: encoder.output_color_metadata(),
             keyframe_force_requests: counters.keyframe_force_requests,
             keyframe_force_failures: counters.keyframe_force_failures,
+            keyframe_force_last_requested_frame_id: keyframe_requests.last_requested_frame_id,
+            keyframe_force_last_effective_frame_id: keyframe_requests.last_effective_frame_id,
+            keyframe_force_latency_frames_avg: keyframe_requests.latency_frames_avg(),
+            keyframe_force_latency_frames_max: keyframe_requests.latency_frames_max,
+            keyframe_force_request_frame_ids: keyframe_requests.request_frame_ids(),
+            keyframe_force_effective_frame_ids: keyframe_requests.effective_frame_ids(),
+            keyframe_force_latency_frames: keyframe_requests.latency_frames(),
+            reconfigure_requested,
         })
     }
 
@@ -763,7 +1015,9 @@ mod platform {
         encoder_output_color_metadata: MediaColorMetadata,
         encoder_selection: EncoderSelection,
         conversion_selection: ConversionSelection,
+        keyframe_requests: &KeyframeRequestTracker,
         elapsed: Duration,
+        effective_bitrate_mbps: f64,
     ) -> CapturePipelineStats {
         let elapsed_sec = elapsed.as_secs_f64().max(0.001);
         CapturePipelineStats {
@@ -778,6 +1032,13 @@ mod platform {
             encode_lag_skips: pipeline.encode_lag_skips,
             keyframe_force_requests: pipeline.keyframe_force_requests,
             keyframe_force_failures: pipeline.keyframe_force_failures,
+            keyframe_force_last_requested_frame_id: keyframe_requests.last_requested_frame_id,
+            keyframe_force_last_effective_frame_id: keyframe_requests.last_effective_frame_id,
+            keyframe_force_latency_frames_avg: keyframe_requests.latency_frames_avg(),
+            keyframe_force_latency_frames_max: keyframe_requests.latency_frames_max,
+            keyframe_force_request_frame_ids: keyframe_requests.request_frame_ids(),
+            keyframe_force_effective_frame_ids: keyframe_requests.effective_frame_ids(),
+            keyframe_force_latency_frames: keyframe_requests.latency_frames(),
             samples_out: encoder.samples_out,
             bytes_out: encoder.bytes_out,
             raw_fps: capture
@@ -794,7 +1055,7 @@ mod platform {
             mbps: encoder.bytes_out.saturating_sub(previous_encoder.bytes_out) as f64 * 8.0
                 / elapsed_sec
                 / 1_000_000.0,
-            target_bitrate_mbps: config.bitrate_mbps,
+            target_bitrate_mbps: effective_bitrate_mbps,
             bitrate_selection: config.bitrate_selection.clone(),
             width: config.out_width,
             height: config.out_height,
@@ -807,6 +1068,9 @@ mod platform {
             gpu_convert_ms_avg: average_ms(capture.gpu_convert_ms_total, capture.latest_updates),
             cpu_convert_ms_avg: average_ms(pipeline.cpu_convert_ms_total, pipeline.frames_encoded),
             encode_ms_avg: average_ms(pipeline.encode_ms_total, pipeline.frames_encoded),
+            qsv_async_wait_timeouts: encoder.async_wait_timeouts,
+            qsv_async_wait_cancelled: encoder.async_wait_cancelled,
+            qsv_drain_timeouts: encoder.async_drain_timeouts,
             conversion_selection,
             color_spec: config.color_spec,
             encoder_selection,
@@ -818,8 +1082,11 @@ mod platform {
     fn emit_encoded_samples(
         encoder: &mut WmfH264Encoder,
         observer: &mut dyn CaptureEncodeObserver,
+        keyframe_requests: &mut KeyframeRequestTracker,
+        fps: u32,
     ) -> Result<(), String> {
         for sample in encoder.take_encoded_samples() {
+            keyframe_requests.observe_sample(&sample, fps);
             observer.on_sample(sample)?;
         }
         Ok(())
@@ -852,6 +1119,44 @@ mod platform {
         Ok(())
     }
 
+    pub fn run_keyframe_schedule_self_test() -> Result<(), String> {
+        let request_ids = (0..=600u64)
+            .filter(|frame_id| keyframe_request_due(*frame_id, Some(60)))
+            .collect::<Vec<_>>();
+        let expected = (1..=10u64).map(|step| step * 60).collect::<Vec<_>>();
+        if request_ids != expected {
+            return Err(format!(
+                "60 FPS keyframe request schedule mismatch: {request_ids:?}"
+            ));
+        }
+        for damaged_frame_id in 0..600u64 {
+            let next_periodic_idr = (damaged_frame_id / 60 + 1) * 60;
+            if next_periodic_idr.saturating_sub(damaged_frame_id) > 60 {
+                return Err("periodic IDR recovery exceeded 60 frames".to_string());
+            }
+        }
+
+        let mut tracker = KeyframeRequestTracker::default();
+        tracker.record_request(60);
+        tracker.observe_sample(
+            &EncodedSample {
+                bytes: vec![0, 0, 0, 1, 5, 0x80],
+                keyframe: Some(true),
+                sample_time_hns: Some(61 * 10_000_000 / 60),
+            },
+            60,
+        );
+        if tracker.request_frame_ids() != vec![60]
+            || tracker.effective_frame_ids() != vec![61]
+            || tracker.latency_frames() != vec![1]
+            || tracker.latency_frames_avg() != 1.0
+            || tracker.latency_frames_max != 1
+        {
+            return Err("forced-IDR request/effective latency tracking failed".to_string());
+        }
+        Ok(())
+    }
+
     fn duration_elapsed(started_at: Instant, duration_sec: Option<u64>) -> bool {
         duration_sec
             .map(|seconds| started_at.elapsed() >= Duration::from_secs(seconds))
@@ -864,7 +1169,7 @@ mod platform {
 
     fn sleep_until(target: Instant) {
         loop {
-            if STOP_REQUESTED.load(Ordering::SeqCst) {
+            if stop_requested() {
                 return;
             }
             let now = Instant::now();
@@ -908,9 +1213,19 @@ mod platform {
 
 #[cfg(windows)]
 pub use platform::{
-    run, run_with_observer, CaptureEncodeObserver, CapturePipelineDone, CapturePipelineStarted,
-    CapturePipelineStats, ConversionSelection,
+    install_console_ctrl_guard, prepare_pipeline, run, run_keyframe_schedule_self_test,
+    run_prepared_with_observer, run_with_observer, CaptureEncodeObserver, CapturePipelineControl,
+    CapturePipelineDone, CapturePipelineStarted, CapturePipelineStats, ConversionSelection,
+    PreparedCapturePipeline,
 };
+
+#[cfg(all(test, windows))]
+mod tests {
+    #[test]
+    fn deterministic_keyframe_schedule() {
+        super::run_keyframe_schedule_self_test().expect("keyframe schedule self-test");
+    }
+}
 
 #[cfg(not(windows))]
 pub fn run(_config: CaptureEncodeConfig) -> Result<(), String> {
