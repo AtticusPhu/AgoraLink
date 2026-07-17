@@ -1551,11 +1551,11 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
     let mut host = None;
     let mut port = None;
     let mut duration_sec = None;
-    let mut target_fps = 30u32;
+    let mut target_fps = 60u32;
     let mut explicit_bitrate_mbps = None;
     let mut quality_bpf = None;
-    let mut out_width = 1280u32;
-    let mut out_height = 720u32;
+    let mut out_width = 1920u32;
+    let mut out_height = 1080u32;
     let mut color_spec = color_spec::ColorSpec::default();
     let mut encoder = wmf_h264_encoder::EncoderChoice::Auto;
     let mut convert_backend = capture_encode_probe::ConvertBackend::Auto;
@@ -1563,7 +1563,7 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
     let mut fec_mode = fec::FecMode::Off;
     let mut udp_payload_size = DEFAULT_REALTIME_UDP_PAYLOAD_SIZE;
     let mut keyframe_interval_sec = 1.0f64;
-    let mut repair_mode = repair::RepairMode::Off;
+    let mut repair_mode = repair::RepairMode::Nack;
     let mut repair_cache_ms = 3000u64;
     let mut audio_mode = h264_send_probe::AudioSendMode::Off;
     let mut adaptive = h264_send_probe::AdaptiveRuntimeConfig::default();
@@ -1683,7 +1683,7 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
         out_width,
         out_height,
         target_fps,
-        4.0,
+        22.0,
         explicit_bitrate_mbps,
         quality_bpf,
     )?;
