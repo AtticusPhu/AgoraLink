@@ -91,16 +91,16 @@ rust_media_dir = Path(
     or project_dir / 'rust-native' / 'agoralink_media' / 'target' / 'release'
 ).resolve()
 rust_media_exe = rust_media_dir / 'agoralink_media.exe'
-rust_media_pdb = rust_media_dir / 'agoralink_media.pdb'
-if rust_media_exe.exists():
-    datas.append((str(rust_media_exe), 'tools/agoralink_media'))
-if rust_media_pdb.exists():
-    datas.append((str(rust_media_pdb), 'tools/agoralink_media'))
+if not rust_media_exe.exists():
+    raise FileNotFoundError(
+        f"Required native media runtime not found: {rust_media_exe}"
+    )
+datas.append((str(rust_media_exe), 'tools/agoralink_media'))
 
 for src, dest in [
     (project_dir / 'assets' / 'app.png', 'assets'),
     (project_dir / 'assets' / 'app.ico', 'assets'),
-    (project_dir / 'requirements.txt', '.'),
+    (project_dir / 'requirements.lock', '.'),
     (project_dir / 'allow_firewall_udp_9999_admin.bat', '.'),
 ]:
     if src.exists():

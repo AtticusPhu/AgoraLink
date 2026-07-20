@@ -23,15 +23,13 @@ sender_controls/
 build/
 dist/
 __pycache__/
+.venv*/
 *.pyc
 *.pyo
 *.zip
 *.exe
+*.pdb
 rust-native/**/target/
-
-# Bundled local FFmpeg binaries for packaging only
-tools/ffmpeg/bin/*.exe
-tools/ffmpeg/bin/*.dll
 
 # Bundled local Rust native media binary for packaging only
 tools/agoralink_media/*.exe
@@ -43,10 +41,6 @@ dshow_devices.txt
 stereo_mix_level.txt
 stereo_mix_test.wav
 
-rust-native/agoralink_media/*.h264
-
-rust-native/agoralink_media/*.h264
-
 # local test artifacts
 _local_artifacts/
 native_*_test_package*/
@@ -54,21 +48,8 @@ agoralink_media_*_test*.zip
 rust-native/agoralink_media/send_stdout.txt
 rust-native/agoralink_media/send_stderr.txt
 
-# Local FFmpeg tools for full package builds
-tools/ffmpeg/bin/
-tools/ffmpeg/*.exe
-tools/ffmpeg/**/*.exe
-
-# Local Codex / AI assistant workspace
-.codex/
-
 # Local AI assistant workspace
 .codex/
-
-# Local FFmpeg tools for full package builds
-tools/ffmpeg/bin/
-tools/ffmpeg/*.exe
-tools/ffmpeg/**/*.exe
 
 # Build outputs
 dist/
