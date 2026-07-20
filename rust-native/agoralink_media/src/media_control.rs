@@ -491,7 +491,7 @@ impl StreamClose {
     pub fn validate(self) -> Result<(), String> {
         if self.version != MEDIA_CONTROL_VERSION
             || self.stream_id == 0
-            || self.reason_code == 0
+            || crate::shutdown::StopReason::from_code(self.reason_code).is_none()
             || self.close_id == 0
         {
             return Err("invalid STREAM_CLOSE fields".to_string());

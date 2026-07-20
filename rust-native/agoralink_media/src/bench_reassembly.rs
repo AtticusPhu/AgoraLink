@@ -67,7 +67,7 @@ pub fn run(config: BenchReassemblyConfig) -> Result<(), String> {
     let elapsed = started.elapsed().as_secs_f64().max(0.000_001);
     let stats = reassembler.stats();
     println!(
-        r#"{{"type":"BENCH_REASSEMBLY","frames":{},"packets_per_frame":{},"payload_size":{},"loss_rate":{:.6},"packets_inserted":{},"packets_per_second":{:.2},"frames_completed":{},"reassembly_ms":{:.3},"mbps_equivalent":{:.3},"reassembly_frames_active":{},"reassembly_packets_active":{},"reassembly_allocations_estimate":{},"reassembly_complete_scan_count":{}}}"#,
+        r#"{{"type":"BENCH_REASSEMBLY","frames":{},"packets_per_frame":{},"payload_size":{},"loss_rate":{:.6},"packets_inserted":{},"packets_per_second":{:.2},"frames_completed":{},"reassembly_ms":{:.3},"mbps_equivalent":{:.3},"reassembly_frames_active":{},"reassembly_packets_active":{},"reassembly_packet_slots_reserved":{},"reassembly_payload_bytes_reserved":{},"reassembly_budget_rejected_frames":{},"reassembly_allocations_estimate":{},"reassembly_complete_scan_count":{}}}"#,
         config.frames,
         config.packets_per_frame,
         config.payload_size,
@@ -79,6 +79,9 @@ pub fn run(config: BenchReassemblyConfig) -> Result<(), String> {
         bytes_inserted as f64 * 8.0 / elapsed / 1_000_000.0,
         stats.reassembly_frames_active,
         stats.reassembly_packets_active,
+        stats.reassembly_packet_slots_reserved,
+        stats.reassembly_payload_bytes_reserved,
+        stats.reassembly_budget_rejected_frames,
         stats.reassembly_allocations_estimate,
         stats.reassembly_complete_scan_count,
     );
