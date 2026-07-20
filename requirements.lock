@@ -1,0 +1,20 @@
+# AgoraLink v0.0.12 runtime dependencies.
+# Regenerate intentionally; application and CI installs must not loosen these pins.
+Kivy==2.3.1
+Kivy-Garden==0.1.5
+docutils==0.22.4
+Pygments==2.20.0
+filetype==1.2.0
+requests==2.33.1
+certifi==2026.4.22
+charset-normalizer==3.4.7
+idna==3.13
+urllib3==2.6.3
+cryptography==48.0.0
+cffi==2.0.0
+pycparser==3.0
+kivy-deps.angle==0.4.0; sys_platform == "win32"
+kivy-deps.glew==0.3.1; sys_platform == "win32"
+kivy-deps.sdl2==0.8.0; sys_platform == "win32"
+pypiwin32==223; sys_platform == "win32"
+pywin32==311; sys_platform == "win32"

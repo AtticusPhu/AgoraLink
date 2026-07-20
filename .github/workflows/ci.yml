@@ -1,0 +1,101 @@
+name: Windows validation
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  rust-static-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: rust-native/agoralink_media
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install fixed Rust toolchain
+        run: rustup show active-toolchain
+      - name: Rust format
+        run: cargo fmt --check
+      - name: Rust check
+        run: cargo check --locked
+      - name: Rust tests (debug)
+        run: cargo test --locked
+      - name: Rust tests (release)
+        run: cargo test --release --locked
+      - name: Rust Clippy (debug)
+        run: cargo clippy --locked --all-targets --all-features
+      - name: Rust Clippy (release)
+        run: cargo clippy --release --locked --all-targets --all-features
+      - name: Rust documentation
+        run: cargo doc --locked --no-deps
+      - name: Native deterministic self-test
+        run: cargo run --locked -- self-test
+
+  python-core-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install locked runtime dependencies
+        run: |
+          python -m pip install --disable-pip-version-check pip==26.1.2
+          python -m pip install --disable-pip-version-check --requirement requirements.lock
+      - name: Validate installed dependencies
+        run: python -m pip check
+      - name: Compile Python sources
+        run: python -m compileall -q .
+      - name: Require discovered tests
+        run: python -B scripts/check_python_test_count.py
+      - name: Run Python tests
+        run: python -B -m unittest discover -s tests -p "test_*.py" -v
+      - name: Native runtime self-test
+        run: python -B screen_runtime.py --self-test
+
+  powershell-parse-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse tracked PowerShell files
+        shell: pwsh
+        run: |
+          $parseFailures = 0
+          $files = git ls-files '*.ps1' '*.psm1'
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path -LiteralPath $file),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$file`: $($_.Message)" }
+              $parseFailures += $errors.Count
+            }
+          }
+          if ($parseFailures -ne 0) {
+            throw "$parseFailures PowerShell parse error(s) found"
+          }
+      - name: Parse tracked JSON metadata
+        shell: pwsh
+        run: |
+          $jsonFiles = git ls-files '*.json'
+          foreach ($file in $jsonFiles) {
+            try {
+              Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json | Out-Null
+            } catch {
+              throw "Invalid JSON in $file`: $($_.Exception.Message)"
+            }
+          }
+      - name: Validate Cargo metadata schema
+        working-directory: rust-native/agoralink_media
+        run: cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json | Out-Null
