@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, TextIO
 
@@ -28,8 +29,15 @@ from screen_profile import DEFAULT_SCREEN_PROFILE, profile_id_from_info
 STATE_IDLE = "idle"
 STATE_RECEIVING = "receiving"
 STATE_SENDING = "sending"
+STATE_STOP_REQUESTED = "stop_requested"
 STATE_STOPPING = "stopping"
+STATE_NATIVE_STOPPED = "native_stopped"
 STATE_ERROR = "error"
+
+LOCAL_STOP_VERSION = 1
+GRACEFUL_STOP_TIMEOUT_SEC = 3.0
+TERMINATE_STOP_TIMEOUT_SEC = 2.0
+FORCED_STOP_TIMEOUT_SEC = 2.0
 
 DEFAULT_NATIVE_SCREEN_PRESET = "r4_default"
 NATIVE_SCREEN_PRESETS: Dict[str, Dict[str, object]] = {
@@ -202,6 +210,9 @@ class ScreenRuntime:
         taskkill_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         tool_finder: Optional[Callable[[str], str]] = None,
         stop_timeout: float = 5.0,
+        graceful_stop_timeout: float = GRACEFUL_STOP_TIMEOUT_SEC,
+        terminate_stop_timeout: float = TERMINATE_STOP_TIMEOUT_SEC,
+        forced_stop_timeout: float = FORCED_STOP_TIMEOUT_SEC,
     ) -> None:
         self.script_dir = (
             Path(script_dir) if script_dir is not None else Path(__file__).resolve().parent
@@ -210,7 +221,18 @@ class ScreenRuntime:
         self._taskkill_runner = taskkill_runner
         self._tool_finder = tool_finder
         self.stop_timeout = float(stop_timeout)
+        self.graceful_stop_timeout = max(0.01, float(graceful_stop_timeout))
+        self.terminate_stop_timeout = max(0.01, float(terminate_stop_timeout))
+        self.forced_stop_timeout = max(0.01, float(forced_stop_timeout))
         self._process: Optional[subprocess.Popen[str]] = None
+        self._lifecycle_lock = threading.RLock()
+        self._stop_complete = threading.Event()
+        self._stop_complete.set()
+        self._stop_in_progress = False
+        self._async_stop_thread: Optional[threading.Thread] = None
+        self._reader_threads: List[threading.Thread] = []
+        self._native_stopped_event = threading.Event()
+        self._native_stopped_payload: Dict[str, object] = {}
         self._process_log_file: Optional[TextIO] = None
         self._process_log_path: Optional[Path] = None
         self._state = STATE_IDLE
@@ -232,6 +254,7 @@ class ScreenRuntime:
         self.current_native_preset = DEFAULT_NATIVE_SCREEN_PRESET
         self.native_stats: Dict[str, object] = {}
         self.native_last_event: Dict[str, object] = {}
+        self.stop_telemetry: Dict[str, object] = self._new_stop_telemetry()
         self._native_audio_capabilities_cache: Dict[str, Dict[str, object]] = {}
         self._native_identity_cache: Dict[tuple[str, int, int], Dict[str, object]] = {}
 
@@ -247,6 +270,8 @@ class ScreenRuntime:
         backend: object = SCREEN_BACKEND_RUST,
         native_preset: object = None,
     ) -> Dict[str, object]:
+        if self._stop_is_active():
+            return self._stopping_result()
         if self._has_running_process():
             return self._already_running_result()
         try:
@@ -310,6 +335,8 @@ class ScreenRuntime:
         backend: object = SCREEN_BACKEND_RUST,
         native_preset: object = None,
     ) -> Dict[str, object]:
+        if self._stop_is_active():
+            return self._stopping_result()
         if self._has_running_process():
             return self._already_running_result()
         try:
@@ -364,32 +391,124 @@ class ScreenRuntime:
         self._schedule_startup_exit_check("agoralink_media")
         return self.get_state()
 
-    def stop(self) -> Dict[str, object]:
-        if not self._has_running_process():
-            self._process = None
-            self._close_process_log_file()
-            self._state = STATE_IDLE
-            self.last_error = ""
-            self._clear_current_session()
+    def stop(self, *, reason: str = "gui_stop") -> Dict[str, object]:
+        with self._lifecycle_lock:
+            if self._stop_in_progress:
+                wait_for_existing = True
+            else:
+                wait_for_existing = False
+                self._refresh_process_locked()
+                process = self._process
+                if process is None or process.poll() is not None:
+                    if process is not None:
+                        self.last_returncode = self._process_returncode(process)
+                    self._process = None
+                    self._join_reader_threads(self.forced_stop_timeout)
+                    self._close_process_log_file()
+                    self._state = STATE_IDLE
+                    self.last_error = ""
+                    self._clear_current_session()
+                    return self._snapshot()
+                self._stop_in_progress = True
+                self._stop_complete.clear()
+                self._native_stopped_event.clear()
+                self._native_stopped_payload = {}
+                self.stop_telemetry = self._new_stop_telemetry()
+                self._state = STATE_STOP_REQUESTED
+                self._record_stop_state(STATE_STOP_REQUESTED)
+
+        if wait_for_existing:
+            self._stop_complete.wait(
+                self.graceful_stop_timeout
+                + self.terminate_stop_timeout
+                + self.forced_stop_timeout
+            )
             return self.get_state()
 
-        self._state = STATE_STOPPING
-        process = self._process
+        started_at = time.monotonic()
+        stop_error = ""
         try:
-            if os.name == "nt":
-                self._stop_windows_process_tree(process)
-            else:
-                self._stop_portable_process(process)
+            self.stop_telemetry["graceful_stop_requested"] = self._send_local_stop(
+                process,
+                reason=reason,
+            )
+            self._state = STATE_STOPPING
+            self._record_stop_state(STATE_STOPPING)
+            exited = self._wait_for_native_stop(process, self.graceful_stop_timeout)
+            if not exited:
+                self.stop_telemetry["forced_terminate_used"] = True
+                process.terminate()
+                exited = self._wait_for_process_exit(
+                    process,
+                    self.terminate_stop_timeout,
+                )
+            if not exited:
+                self.stop_telemetry["forced_kill_used"] = True
+                self._force_kill_process_tree(process)
+                exited = self._wait_for_process_exit(process, self.forced_stop_timeout)
+            if not exited:
+                stop_error = "native screen process did not exit after forced termination"
+            self.last_returncode = self._process_returncode(process)
+            self.stop_telemetry["exit_code"] = self.last_returncode
         except Exception as exc:
-            return self._set_error(str(exc))
+            stop_error = str(exc)
+            if process.poll() is None:
+                try:
+                    process.kill()
+                    self._wait_for_process_exit(process, self.forced_stop_timeout)
+                except Exception as kill_exc:
+                    stop_error = f"{stop_error}; final kill failed: {kill_exc}"
         finally:
-            self._process = None
-            self._close_process_log_file()
+            self._close_process_stdin(process)
+            self._join_reader_threads(self.forced_stop_timeout)
+            self.stop_telemetry["native_stopped_received"] = bool(
+                self._native_stopped_event.is_set()
+            )
+            final_event = dict(self._native_stopped_payload)
+            self.stop_telemetry["stream_close_sent"] = bool(
+                final_event.get("stream_close_sent") or final_event.get("close_sent")
+            )
+            self.stop_telemetry["stream_close_ack_received"] = bool(
+                final_event.get("stream_close_ack_received")
+            )
+            self.stop_telemetry["stop_elapsed_ms"] = round(
+                (time.monotonic() - started_at) * 1000.0,
+                3,
+            )
+            with self._lifecycle_lock:
+                process_alive = process.poll() is None
+                if self._process is process and not process_alive:
+                    self._process = None
+                    self._close_process_log_file()
+                self._state = STATE_NATIVE_STOPPED
+                self._record_stop_state(STATE_NATIVE_STOPPED)
+                if stop_error or process_alive:
+                    self.last_error = stop_error or "native screen process is still running"
+                    self._state = STATE_ERROR
+                    self._record_stop_state(STATE_ERROR)
+                else:
+                    self.last_error = ""
+                    self._state = STATE_IDLE
+                    self._record_stop_state(STATE_IDLE)
+                self._clear_current_session()
+                self._stop_in_progress = False
+                self._stop_complete.set()
+        return self._snapshot(ok=not bool(stop_error) and process.poll() is not None)
 
-        self._state = STATE_IDLE
-        self.last_error = ""
-        self._clear_current_session()
-        return self.get_state()
+    def stop_async(self, *, reason: str = "app_close") -> threading.Thread:
+        with self._lifecycle_lock:
+            existing = self._async_stop_thread
+            if existing is not None and existing.is_alive():
+                return existing
+            thread = threading.Thread(
+                target=self.stop,
+                kwargs={"reason": reason},
+                name="agoralink-screen-stop",
+                daemon=False,
+            )
+            self._async_stop_thread = thread
+            thread.start()
+            return thread
 
     def is_running(self) -> bool:
         return self._has_running_process()
@@ -444,7 +563,7 @@ class ScreenRuntime:
             process = self._popen_factory(
                 command,
                 cwd=str(self.script_dir),
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -460,6 +579,8 @@ class ScreenRuntime:
                     pass
             raise
         self._process_log_file = log_file
+        self._native_stopped_event.clear()
+        self._native_stopped_payload = {}
         self._start_native_output_threads(process, log_file)
         return process
 
@@ -468,6 +589,7 @@ class ScreenRuntime:
         process: subprocess.Popen[str],
         log_file: Optional[TextIO],
     ) -> None:
+        threads: List[threading.Thread] = []
         stdout = getattr(process, "stdout", None)
         stderr = getattr(process, "stderr", None)
         if stdout is not None:
@@ -477,6 +599,7 @@ class ScreenRuntime:
                 daemon=True,
             )
             thread.start()
+            threads.append(thread)
         if stderr is not None:
             thread = threading.Thread(
                 target=self._read_native_stderr,
@@ -484,6 +607,9 @@ class ScreenRuntime:
                 daemon=True,
             )
             thread.start()
+            threads.append(thread)
+        with self._lifecycle_lock:
+            self._reader_threads = threads
 
     def _read_native_stdout(
         self,
@@ -536,10 +662,14 @@ class ScreenRuntime:
             self._update_native_audio_state(event)
         elif event_type == "NATIVE_SCREEN_STARTED":
             self._update_native_audio_state(event)
-        elif event_type == "NATIVE_SCREEN_STOPPED":
+        elif event_type in {"NATIVE_SCREEN_STOPPED", "NATIVE_SCREEN_SHUTDOWN_FAILED"}:
             self.native_stats = dict(event)
+            self._native_stopped_payload = dict(event)
+            self._native_stopped_event.set()
             self._update_native_audio_state(event)
-            if process is None or process is self._process:
+            if event_type == "NATIVE_SCREEN_STOPPED" and (
+                process is None or process is self._process
+            ):
                 self.last_error = ""
         elif event_type == "NATIVE_SCREEN_ERROR":
             message = str(
@@ -568,24 +698,28 @@ class ScreenRuntime:
         process: subprocess.Popen[str],
         tool_name: str,
     ) -> None:
-        if process is not self._process:
-            return
-        returncode = process.poll()
-        if returncode is None:
-            return
-        self.last_returncode = int(returncode)
-        self._process = None
-        self._close_process_log_file()
-        if returncode == 0:
-            self._state = STATE_IDLE
-            self.last_error = ""
-            self._clear_current_session()
-            return
-        tail = self._read_process_log_tail(tool_name)
-        self._state = STATE_ERROR
-        self.last_error = f"{tool_name} exited with code {returncode}"
-        if tail:
-            self.last_error = f"{self.last_error}\n{tail}"
+        with self._lifecycle_lock:
+            if process is not self._process:
+                return
+            returncode = process.poll()
+            if returncode is None:
+                return
+            self.last_returncode = int(returncode)
+            if self._stop_in_progress:
+                return
+            self._process = None
+            self._join_reader_threads(self.forced_stop_timeout)
+            self._close_process_log_file()
+            if returncode == 0:
+                self._state = STATE_IDLE
+                self.last_error = ""
+                self._clear_current_session()
+                return
+            tail = self._read_process_log_tail(tool_name)
+            self._state = STATE_ERROR
+            self.last_error = f"{tool_name} exited with code {returncode}"
+            if tail:
+                self.last_error = f"{self.last_error}\n{tail}"
 
     def _read_process_log_tail(
         self,
@@ -614,13 +748,20 @@ class ScreenRuntime:
         return self._process is not None and self._process.poll() is None
 
     def _refresh_process(self) -> None:
+        with self._lifecycle_lock:
+            self._refresh_process_locked()
+
+    def _refresh_process_locked(self) -> None:
         if self._process is None:
             return
         returncode = self._process.poll()
         if returncode is None:
             return
         self.last_returncode = int(returncode)
+        if self._stop_in_progress:
+            return
         self._process = None
+        self._join_reader_threads(FORCED_STOP_TIMEOUT_SEC)
         self._close_process_log_file()
         if self._state == STATE_STOPPING or returncode == 0:
             self._state = STATE_IDLE
@@ -666,6 +807,7 @@ class ScreenRuntime:
             "native_preset": self.current_native_preset,
             "native_stats": dict(self.native_stats),
             "native_last_event": dict(self.native_last_event),
+            "stop_telemetry": dict(self.stop_telemetry),
         }
 
     def _set_error(self, message: str) -> Dict[str, object]:
@@ -678,6 +820,20 @@ class ScreenRuntime:
         result = self._snapshot(ok=False)
         result["error"] = "already running"
         return result
+
+    def _stopping_result(self) -> Dict[str, object]:
+        self.last_error = "screen runtime is stopping"
+        result = self._snapshot(ok=False)
+        result["error"] = self.last_error
+        return result
+
+    def _stop_is_active(self) -> bool:
+        with self._lifecycle_lock:
+            return self._stop_in_progress or self._state in {
+                STATE_STOP_REQUESTED,
+                STATE_STOPPING,
+                STATE_NATIVE_STOPPED,
+            }
 
     def _clear_current_session(self) -> None:
         self.current_mode = None
@@ -1155,10 +1311,127 @@ class ScreenRuntime:
             return SCREEN_BACKEND_RUST
         raise ValueError("only the Rust native screen backend is supported")
 
-    def _stop_windows_process_tree(self, process: subprocess.Popen[str]) -> None:
+    @staticmethod
+    def _new_stop_telemetry() -> Dict[str, object]:
+        return {
+            "graceful_stop_requested": False,
+            "native_stopped_received": False,
+            "stream_close_sent": False,
+            "stream_close_ack_received": False,
+            "forced_terminate_used": False,
+            "forced_kill_used": False,
+            "reader_threads_joined": True,
+            "stop_elapsed_ms": 0.0,
+            "exit_code": None,
+            "state_history": [],
+        }
+
+    def _record_stop_state(self, state: str) -> None:
+        history = self.stop_telemetry.setdefault("state_history", [])
+        if isinstance(history, list) and (not history or history[-1] != state):
+            history.append(state)
+
+    @staticmethod
+    def _process_returncode(process: subprocess.Popen[str]) -> Optional[int]:
+        returncode = process.poll()
+        return None if returncode is None else int(returncode)
+
+    def _send_local_stop(
+        self,
+        process: subprocess.Popen[str],
+        *,
+        reason: str,
+    ) -> bool:
+        if process.poll() is not None:
+            return False
+        stdin = getattr(process, "stdin", None)
+        if stdin is None:
+            return False
+        command = {
+            "type": "LOCAL_STOP",
+            "reason": str(reason or "gui_stop"),
+            "version": LOCAL_STOP_VERSION,
+        }
+        try:
+            stdin.write(json.dumps(command, separators=(",", ":")) + "\n")
+            stdin.flush()
+            return True
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            self._write_process_log_note(f"native local stop channel failed: {exc}")
+            return False
+
+    @staticmethod
+    def _close_process_stdin(process: subprocess.Popen[str]) -> None:
+        stdin = getattr(process, "stdin", None)
+        if stdin is None:
+            return
+        try:
+            stdin.close()
+        except Exception:
+            pass
+
+    def _wait_for_native_stop(
+        self,
+        process: subprocess.Popen[str],
+        timeout_sec: float,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                return True
+            remaining = deadline - time.monotonic()
+            delay = min(0.02, max(0.0, remaining))
+            if self._native_stopped_event.is_set():
+                time.sleep(delay)
+            else:
+                self._native_stopped_event.wait(delay)
+        return process.poll() is not None
+
+    @staticmethod
+    def _wait_for_process_exit(
+        process: subprocess.Popen[str],
+        timeout_sec: float,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                return True
+            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+        return process.poll() is not None
+
+    def _join_reader_threads(self, timeout_sec: float) -> None:
+        with self._lifecycle_lock:
+            threads = list(self._reader_threads)
+            self._reader_threads = []
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        all_joined = True
+        still_running: List[threading.Thread] = []
+        current = threading.current_thread()
+        for thread in threads:
+            if thread is current:
+                all_joined = False
+                still_running.append(thread)
+                continue
+            thread.join(max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                all_joined = False
+                still_running.append(thread)
+        with self._lifecycle_lock:
+            self._reader_threads.extend(still_running)
+        self.stop_telemetry["reader_threads_joined"] = all_joined
+
+    def _force_kill_process_tree(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        if os.name == "nt":
+            self._force_kill_windows_process_tree(process)
+        else:
+            process.kill()
+
+    def _force_kill_windows_process_tree(self, process: subprocess.Popen[str]) -> None:
         pid = getattr(process, "pid", None)
         if pid is None:
-            self._stop_portable_process(process)
+            process.kill()
             return
         try:
             completed = run_no_console(
@@ -1166,41 +1439,19 @@ class ScreenRuntime:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=max(5.0, self.stop_timeout),
+                timeout=max(1.0, self.stop_timeout),
                 run_factory=self._taskkill_runner,
             )
             if int(getattr(completed, "returncode", 0) or 0) != 0:
-                self.last_error = str(
+                detail = str(
                     getattr(completed, "stderr", "")
                     or getattr(completed, "stdout", "")
                     or f"taskkill failed for pid {pid}"
                 ).strip()
-                self._stop_portable_process(process)
-                return
+                raise RuntimeError(detail)
         except Exception as exc:
-            self.last_error = f"taskkill failed for pid {pid}: {exc}"
-            self._stop_portable_process(process)
-            return
-        try:
-            self.last_returncode = int(
-                process.wait(timeout=max(1.0, self.stop_timeout))
-            )
-        except subprocess.TimeoutExpired:
             process.kill()
-            self.last_returncode = int(
-                process.wait(timeout=max(1.0, self.stop_timeout))
-            )
-
-    def _stop_portable_process(self, process: subprocess.Popen[str]) -> None:
-        if process.poll() is not None:
-            self.last_returncode = int(process.poll())
-            return
-        process.terminate()
-        try:
-            self.last_returncode = int(process.wait(timeout=self.stop_timeout))
-        except subprocess.TimeoutExpired:
-            process.kill()
-            self.last_returncode = int(process.wait(timeout=self.stop_timeout))
+            self._write_process_log_note(f"taskkill failed for pid {pid}: {exc}")
 
     @staticmethod
     def _validate_port(port: int) -> int:
@@ -1238,6 +1489,9 @@ class _FakeProcess:
         self.returncode: Optional[int] = None
         self.stdout = None
         self.stderr = None
+        self.stdin = self
+        self.stdin_text = ""
+        self.stdin_closed = False
 
     def poll(self) -> Optional[int]:
         return self.returncode
@@ -1253,6 +1507,17 @@ class _FakeProcess:
         if self.returncode is None:
             self.returncode = 0
         return self.returncode
+
+    def write(self, text: str) -> int:
+        self.stdin_text += str(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if "LOCAL_STOP" in self.stdin_text:
+            self.returncode = 0
+
+    def close(self) -> None:
+        self.stdin_closed = True
 
 
 def _run_self_test() -> Dict[str, object]:
@@ -1326,7 +1591,9 @@ def _run_self_test() -> Dict[str, object]:
         crashed["returncode"] == 42,
         missing["state"] == STATE_ERROR,
         RUST_NATIVE_MISSING_MESSAGE in str(missing["last_error"]),
-        bool(taskkill_commands) if os.name == "nt" else True,
+        not taskkill_commands,
+        bool(stopped["stop_telemetry"]["graceful_stop_requested"]),
+        not bool(stopped["stop_telemetry"]["forced_kill_used"]),
     ]
     return {
         "ok": all(checks),

@@ -10742,7 +10742,9 @@ class RUDPTransferApp(App):
     def on_stop(self):
         try:
             if hasattr(self, "screen_runtime"):
-                self.screen_runtime.stop()
+                # Keep the Kivy shutdown callback responsive; the non-daemon
+                # worker keeps process cleanup alive until the native runtime exits.
+                self.screen_runtime.stop_async(reason="app_close")
         except Exception:
             pass
         try:

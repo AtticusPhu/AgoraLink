@@ -35,6 +35,7 @@ mod h264_reassembly;
 mod h264_recv_dump;
 mod h264_recv_view;
 mod h264_send_probe;
+mod local_control;
 mod media_clock;
 mod media_control;
 mod nv12_synthetic;

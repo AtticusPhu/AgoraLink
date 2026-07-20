@@ -1021,6 +1021,17 @@ mod platform {
         };
         let shutdown_coordinator = crate::shutdown::ShutdownCoordinator::new();
         let cancellation = shutdown_coordinator.token();
+        let _local_control = if config.mode == H264RecvViewMode::Screen {
+            match crate::local_control::spawn_stdin_listener(cancellation.clone()) {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    print_startup_failure(&config, &error);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let event_context = crate::shutdown::RuntimeEventContext::new(crate::make_session_id());
         let socket = match UdpSocket::bind(format!("{}:{}", config.bind, config.port)) {
             Ok(socket) => socket,
