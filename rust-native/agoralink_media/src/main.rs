@@ -2,21 +2,31 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{self, Write};
 use std::net::UdpSocket;
+use std::path::PathBuf;
 use std::process;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod adaptive_quality;
+mod async_mft_wait;
+mod audio_capture_probe;
+mod audio_timeline;
+mod audio_udp;
+mod av_sync;
 mod bench_reassembly;
 mod bgra_to_nv12;
 mod bitrate;
+mod callback_lifecycle;
 mod capture_encode_probe;
 mod capture_probe;
 mod color_spec;
 mod color_test_pattern;
 mod d3d11_nv12_renderer;
 mod decoded_frame_renderer;
+mod display_capability;
 mod encode_probe;
 mod fec;
+mod frame_rate_policy;
 mod gpu_convert_probe;
 mod gpu_nv12_capture;
 mod h264_annex_b;
@@ -25,10 +35,15 @@ mod h264_reassembly;
 mod h264_recv_dump;
 mod h264_recv_view;
 mod h264_send_probe;
+mod media_clock;
+mod media_control;
 mod nv12_synthetic;
 mod nv12_to_bgra;
 mod playout_buffer;
+mod profile_transition;
 mod repair;
+mod sender_scheduling;
+mod shutdown;
 mod udp_socket;
 mod video_renderer;
 mod wgc_latest_capture;
@@ -184,6 +199,9 @@ enum Command {
     H264FileViewer(h264_file_viewer::H264FileViewerConfig),
     ColorTestPattern(color_test_pattern::ColorTestPatternConfig),
     BenchReassembly(bench_reassembly::BenchReassemblyConfig),
+    AudioCaptureProbe(audio_capture_probe::AudioCaptureProbeConfig),
+    AudioSend(audio_udp::AudioSendConfig),
+    AudioRecvPlay(audio_udp::AudioRecvPlayConfig),
     Help,
 }
 
@@ -373,14 +391,12 @@ fn main() {
         }
         Ok(Command::ScreenSend(config)) => {
             if let Err(err) = h264_send_probe::run(config) {
-                print_native_screen_error("sender", "screen-send", &err);
                 eprintln!("screen-send error: {err}");
                 process::exit(1);
             }
         }
         Ok(Command::ScreenRecv(config)) => {
             if let Err(err) = h264_recv_view::run(config) {
-                print_native_screen_error("receiver", "screen-recv", &err);
                 eprintln!("screen-recv error: {err}");
                 process::exit(1);
             }
@@ -400,6 +416,24 @@ fn main() {
         Ok(Command::BenchReassembly(config)) => {
             if let Err(err) = bench_reassembly::run(config) {
                 eprintln!("bench-reassembly error: {err}");
+                process::exit(1);
+            }
+        }
+        Ok(Command::AudioCaptureProbe(config)) => {
+            if let Err(err) = audio_capture_probe::run(config) {
+                eprintln!("audio-capture-probe error: {err}");
+                process::exit(1);
+            }
+        }
+        Ok(Command::AudioSend(config)) => {
+            if let Err(err) = audio_udp::run_audio_send(config) {
+                eprintln!("audio-send error: {err}");
+                process::exit(1);
+            }
+        }
+        Ok(Command::AudioRecvPlay(config)) => {
+            if let Err(err) = audio_udp::run_audio_recv_play(config) {
+                eprintln!("audio-recv-play error: {err}");
                 process::exit(1);
             }
         }
@@ -450,6 +484,9 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         "h264-file-viewer" => parse_h264_file_viewer_args(&args[1..]),
         "color-test-pattern" => parse_color_test_pattern_args(&args[1..]),
         "bench-reassembly" => parse_bench_reassembly_args(&args[1..]),
+        "audio-capture-probe" => parse_audio_capture_probe_args(&args[1..]),
+        "audio-send" => parse_audio_send_args(&args[1..]),
+        "audio-recv-play" => parse_audio_recv_play_args(&args[1..]),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -804,6 +841,7 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
     let mut keyframe_interval_sec = 1.0f64;
     let mut repair_mode = repair::RepairMode::Off;
     let mut repair_cache_ms = 3000u64;
+    let mut adaptive = h264_send_probe::AdaptiveRuntimeConfig::default();
     let mut i = 0;
 
     while i < args.len() {
@@ -896,6 +934,7 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
                 )?;
             }
             "-h" | "--help" => return Ok(Command::Help),
+            other if parse_adaptive_sender_option(other, args, &mut i, &mut adaptive)? => {}
             other => return Err(format!("unknown h264-send-probe argument: {other}")),
         }
         i += 1;
@@ -929,6 +968,8 @@ fn parse_h264_send_probe_args(args: &[String]) -> Result<Command, String> {
         keyframe_interval_sec,
         repair_mode,
         repair_cache_ms,
+        audio_mode: h264_send_probe::AudioSendMode::Off,
+        adaptive,
         mode: h264_send_probe::H264SendMode::Probe,
         verbose: true,
     }))
@@ -993,6 +1034,122 @@ fn parse_bench_reassembly_args(args: &[String]) -> Result<Command, String> {
             loss_rate,
         },
     ))
+}
+
+fn parse_audio_capture_probe_args(args: &[String]) -> Result<Command, String> {
+    let mut duration_sec = 10u64;
+    let mut output = PathBuf::from("audio_probe.pcm");
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--duration-sec" => {
+                i += 1;
+                duration_sec = parse_duration_sec(required_value(args, i, "--duration-sec")?)?;
+            }
+            "--output" => {
+                i += 1;
+                output = PathBuf::from(required_value(args, i, "--output")?);
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown audio-capture-probe argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::AudioCaptureProbe(
+        audio_capture_probe::AudioCaptureProbeConfig {
+            duration_sec,
+            output,
+        },
+    ))
+}
+
+fn parse_audio_send_args(args: &[String]) -> Result<Command, String> {
+    let mut host: Option<String> = None;
+    let mut port: Option<u16> = None;
+    let mut duration_sec = None;
+    let mut frame_ms = 10u32;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" => {
+                i += 1;
+                host = Some(required_value(args, i, "--host")?.to_string());
+            }
+            "--port" => {
+                i += 1;
+                port = Some(parse_port(required_value(args, i, "--port")?)?);
+            }
+            "--duration-sec" => {
+                i += 1;
+                duration_sec = Some(parse_duration_sec(required_value(
+                    args,
+                    i,
+                    "--duration-sec",
+                )?)?);
+            }
+            "--frame-ms" => {
+                i += 1;
+                frame_ms = parse_audio_frame_ms(required_value(args, i, "--frame-ms")?)?;
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown audio-send argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::AudioSend(audio_udp::AudioSendConfig {
+        host: host.ok_or("audio-send requires --host")?,
+        port: port.ok_or("audio-send requires --port")?,
+        duration_sec,
+        frame_ms,
+    }))
+}
+
+fn parse_audio_recv_play_args(args: &[String]) -> Result<Command, String> {
+    let mut bind = "0.0.0.0".to_string();
+    let mut port: Option<u16> = None;
+    let mut duration_sec = None;
+    let mut jitter_buffer_ms = 120u32;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bind" => {
+                i += 1;
+                bind = required_value(args, i, "--bind")?.to_string();
+            }
+            "--port" => {
+                i += 1;
+                port = Some(parse_port(required_value(args, i, "--port")?)?);
+            }
+            "--duration-sec" => {
+                i += 1;
+                duration_sec = Some(parse_duration_sec(required_value(
+                    args,
+                    i,
+                    "--duration-sec",
+                )?)?);
+            }
+            "--jitter-buffer-ms" => {
+                i += 1;
+                jitter_buffer_ms =
+                    parse_audio_jitter_buffer_ms(required_value(args, i, "--jitter-buffer-ms")?)?;
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            other => return Err(format!("unknown audio-recv-play argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(Command::AudioRecvPlay(audio_udp::AudioRecvPlayConfig {
+        bind,
+        port: port.ok_or("audio-recv-play requires --port")?,
+        duration_sec,
+        jitter_buffer_ms,
+    }))
 }
 
 fn parse_color_test_pattern_args(args: &[String]) -> Result<Command, String> {
@@ -1167,6 +1324,7 @@ fn parse_h264_file_viewer_args(args: &[String]) -> Result<Command, String> {
 fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
     let mut bind = "0.0.0.0".to_string();
     let mut port = None;
+    let mut decoder_fps = 30u32;
     let mut frame_timeout_ms = 300u64;
     let mut max_inflight_frames = 120usize;
     let mut max_decode_queue = 30usize;
@@ -1185,6 +1343,8 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
     let mut nack_delay_ms = 20u64;
     let mut nack_repeat_ms = 20u64;
     let mut nack_max_rounds = 3u8;
+    let mut display_refresh_detect = display_capability::DisplayRefreshDetect::Auto;
+    let mut capability_feedback_ms = 1000u64;
     let mut i = 0;
 
     while i < args.len() {
@@ -1196,6 +1356,10 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
             "--port" => {
                 i += 1;
                 port = Some(parse_port(required_value(args, i, "--port")?)?);
+            }
+            "--fps" => {
+                i += 1;
+                decoder_fps = parse_fps(required_value(args, i, "--fps")?)?;
             }
             "--frame-timeout-ms" => {
                 i += 1;
@@ -1330,6 +1494,21 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
                 )? as u8;
             }
             "-h" | "--help" => return Ok(Command::Help),
+            "--display-refresh-detect" => {
+                i += 1;
+                display_refresh_detect = display_capability::DisplayRefreshDetect::parse(
+                    required_value(args, i, "--display-refresh-detect")?,
+                )?;
+            }
+            "--adaptive-feedback-ms" => {
+                i += 1;
+                capability_feedback_ms = parse_milliseconds(
+                    required_value(args, i, "--adaptive-feedback-ms")?,
+                    "adaptive-feedback-ms",
+                    500,
+                    2000,
+                )?;
+            }
             other => return Err(format!("unknown h264-recv-view argument: {other}")),
         }
         i += 1;
@@ -1338,6 +1517,7 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
     Ok(Command::H264RecvView(h264_recv_view::H264RecvViewConfig {
         bind,
         port: port.ok_or_else(|| "h264-recv-view requires --port <port>".to_string())?,
+        decoder_fps,
         duration_sec: None,
         frame_timeout_ms,
         reorder_wait_ms,
@@ -1357,6 +1537,11 @@ fn parse_h264_recv_view_args(args: &[String]) -> Result<Command, String> {
         nack_delay_ms,
         nack_repeat_ms,
         nack_max_rounds,
+        audio_mode: h264_recv_view::AudioRecvMode::Off,
+        audio_jitter_buffer_ms: 120,
+        av_sync_mode: av_sync::AvSyncMode::Off,
+        display_refresh_detect,
+        capability_feedback_ms,
         mode: h264_recv_view::H264RecvViewMode::Probe,
         verbose: true,
     }))
@@ -1366,11 +1551,11 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
     let mut host = None;
     let mut port = None;
     let mut duration_sec = None;
-    let mut target_fps = 30u32;
+    let mut target_fps = 60u32;
     let mut explicit_bitrate_mbps = None;
     let mut quality_bpf = None;
-    let mut out_width = 1280u32;
-    let mut out_height = 720u32;
+    let mut out_width = 1920u32;
+    let mut out_height = 1080u32;
     let mut color_spec = color_spec::ColorSpec::default();
     let mut encoder = wmf_h264_encoder::EncoderChoice::Auto;
     let mut convert_backend = capture_encode_probe::ConvertBackend::Auto;
@@ -1378,8 +1563,10 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
     let mut fec_mode = fec::FecMode::Off;
     let mut udp_payload_size = DEFAULT_REALTIME_UDP_PAYLOAD_SIZE;
     let mut keyframe_interval_sec = 1.0f64;
-    let mut repair_mode = repair::RepairMode::Off;
+    let mut repair_mode = repair::RepairMode::Nack;
     let mut repair_cache_ms = 3000u64;
+    let mut audio_mode = h264_send_probe::AudioSendMode::Off;
+    let mut adaptive = h264_send_probe::AdaptiveRuntimeConfig::default();
     let mut verbose = false;
     let mut i = 0;
 
@@ -1477,10 +1664,16 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
                     10_000,
                 )?;
             }
+            "--audio" => {
+                i += 1;
+                audio_mode =
+                    h264_send_probe::AudioSendMode::parse(required_value(args, i, "--audio")?)?;
+            }
             "--verbose" => {
                 verbose = true;
             }
             "-h" | "--help" => return Ok(Command::Help),
+            other if parse_adaptive_sender_option(other, args, &mut i, &mut adaptive)? => {}
             other => return Err(format!("unknown screen-send argument: {other}")),
         }
         i += 1;
@@ -1490,7 +1683,7 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
         out_width,
         out_height,
         target_fps,
-        4.0,
+        22.0,
         explicit_bitrate_mbps,
         quality_bpf,
     )?;
@@ -1514,6 +1707,8 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
         keyframe_interval_sec,
         repair_mode,
         repair_cache_ms,
+        audio_mode,
+        adaptive,
         mode: h264_send_probe::H264SendMode::Screen,
         verbose,
     }))
@@ -1522,6 +1717,7 @@ fn parse_screen_send_args(args: &[String]) -> Result<Command, String> {
 fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
     let mut bind = "0.0.0.0".to_string();
     let mut port = None;
+    let mut decoder_fps = 30u32;
     let mut duration_sec = None;
     let mut frame_timeout_ms = 300u64;
     let mut max_inflight_frames = 120usize;
@@ -1530,6 +1726,7 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
     let mut drop_damaged_gop = true;
     let mut reorder_wait_ms = None;
     let mut playout_delay_ms = 120u64;
+    let mut playout_delay_explicit = false;
     let mut debug_dump_frames = None;
     let mut debug_dump_limit = 10usize;
     let mut json_interval_ms = 1000u64;
@@ -1541,6 +1738,11 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
     let mut nack_delay_ms = 20u64;
     let mut nack_repeat_ms = 20u64;
     let mut nack_max_rounds = 3u8;
+    let mut audio_mode = h264_recv_view::AudioRecvMode::Off;
+    let mut audio_jitter_buffer_ms = 120u32;
+    let mut requested_av_sync_mode = None;
+    let mut display_refresh_detect = display_capability::DisplayRefreshDetect::Auto;
+    let mut capability_feedback_ms = 1000u64;
     let mut verbose = false;
     let mut i = 0;
 
@@ -1553,6 +1755,10 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
             "--port" => {
                 i += 1;
                 port = Some(parse_port(required_value(args, i, "--port")?)?);
+            }
+            "--fps" => {
+                i += 1;
+                decoder_fps = parse_fps(required_value(args, i, "--fps")?)?;
             }
             "--duration-sec" => {
                 i += 1;
@@ -1611,6 +1817,7 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
                     0,
                     500,
                 )?;
+                playout_delay_explicit = true;
             }
             "--debug-dump-frames" => {
                 i += 1;
@@ -1694,6 +1901,42 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
                     10,
                 )? as u8;
             }
+            "--audio" => {
+                i += 1;
+                audio_mode =
+                    h264_recv_view::AudioRecvMode::parse(required_value(args, i, "--audio")?)?;
+            }
+            "--audio-jitter-buffer-ms" => {
+                i += 1;
+                audio_jitter_buffer_ms = parse_audio_jitter_buffer_ms(required_value(
+                    args,
+                    i,
+                    "--audio-jitter-buffer-ms",
+                )?)?;
+            }
+            "--av-sync" => {
+                i += 1;
+                requested_av_sync_mode = Some(av_sync::AvSyncMode::parse(required_value(
+                    args,
+                    i,
+                    "--av-sync",
+                )?)?);
+            }
+            "--display-refresh-detect" => {
+                i += 1;
+                display_refresh_detect = display_capability::DisplayRefreshDetect::parse(
+                    required_value(args, i, "--display-refresh-detect")?,
+                )?;
+            }
+            "--adaptive-feedback-ms" => {
+                i += 1;
+                capability_feedback_ms = parse_milliseconds(
+                    required_value(args, i, "--adaptive-feedback-ms")?,
+                    "adaptive-feedback-ms",
+                    500,
+                    2000,
+                )?;
+            }
             "--verbose" => {
                 verbose = true;
             }
@@ -1702,10 +1945,19 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
         }
         i += 1;
     }
+    if audio_mode == h264_recv_view::AudioRecvMode::On && !playout_delay_explicit {
+        playout_delay_ms = 250;
+    }
+    let av_sync_mode = if audio_mode == h264_recv_view::AudioRecvMode::On {
+        requested_av_sync_mode.unwrap_or(av_sync::AvSyncMode::Conservative)
+    } else {
+        av_sync::AvSyncMode::Off
+    };
 
     Ok(Command::ScreenRecv(h264_recv_view::H264RecvViewConfig {
         bind,
         port: port.ok_or_else(|| "screen-recv requires --port <port>".to_string())?,
+        decoder_fps,
         duration_sec,
         frame_timeout_ms,
         reorder_wait_ms,
@@ -1725,9 +1977,115 @@ fn parse_screen_recv_args(args: &[String]) -> Result<Command, String> {
         nack_delay_ms,
         nack_repeat_ms,
         nack_max_rounds,
+        audio_mode,
+        audio_jitter_buffer_ms,
+        av_sync_mode,
+        display_refresh_detect,
+        capability_feedback_ms,
         mode: h264_recv_view::H264RecvViewMode::Screen,
         verbose,
     }))
+}
+
+fn parse_adaptive_sender_option(
+    option: &str,
+    args: &[String],
+    index: &mut usize,
+    config: &mut h264_send_probe::AdaptiveRuntimeConfig,
+) -> Result<bool, String> {
+    let name = option;
+    match option {
+        "--adaptive-quality" => {
+            *index += 1;
+            config.quality.mode =
+                adaptive_quality::AdaptiveMode::parse(required_value(args, *index, name)?)?;
+        }
+        "--display-refresh-detect" => {
+            *index += 1;
+            config.display_refresh_detect = display_capability::DisplayRefreshDetect::parse(
+                required_value(args, *index, name)?,
+            )?;
+        }
+        "--max-fps" => {
+            *index += 1;
+            config.max_fps = frame_rate_policy::MaxFps::parse(required_value(args, *index, name)?)?;
+        }
+        "--enable-high-refresh" => {
+            *index += 1;
+            config.enable_high_refresh = parse_bool(required_value(args, *index, name)?)?;
+        }
+        "--adaptive-min-width" => {
+            *index += 1;
+            config.quality.min_width =
+                parse_dimension(required_value(args, *index, name)?, "adaptive-min-width")?;
+        }
+        "--adaptive-min-height" => {
+            *index += 1;
+            config.quality.min_height =
+                parse_dimension(required_value(args, *index, name)?, "adaptive-min-height")?;
+        }
+        "--adaptive-min-fps" => {
+            *index += 1;
+            config.quality.min_fps = parse_fps(required_value(args, *index, name)?)?;
+        }
+        "--adaptive-max-bitrate-mbps" => {
+            *index += 1;
+            config.quality.max_bitrate_mbps =
+                Some(parse_bitrate(required_value(args, *index, name)?)?);
+        }
+        "--adaptive-feedback-ms" => {
+            *index += 1;
+            config.feedback_ms = parse_milliseconds(
+                required_value(args, *index, name)?,
+                "adaptive-feedback-ms",
+                500,
+                2000,
+            )?;
+        }
+        "--adaptive-upgrade-stable-sec" => {
+            *index += 1;
+            config.quality.upgrade_stable_sec = parse_seconds_range(
+                required_value(args, *index, name)?,
+                "adaptive-upgrade-stable-sec",
+                1,
+                3600,
+            )?;
+        }
+        "--adaptive-resolution-cooldown-sec" => {
+            *index += 1;
+            config.quality.resolution_cooldown_sec = parse_seconds_range(
+                required_value(args, *index, name)?,
+                "adaptive-resolution-cooldown-sec",
+                1,
+                3600,
+            )?;
+        }
+        "--adaptive-fps-cooldown-sec" => {
+            *index += 1;
+            config.quality.fps_cooldown_sec = parse_seconds_range(
+                required_value(args, *index, name)?,
+                "adaptive-fps-cooldown-sec",
+                1,
+                3600,
+            )?;
+        }
+        "--interactive-lag-guard" => {
+            *index += 1;
+            config.quality.interactive_lag_guard = parse_bool(required_value(args, *index, name)?)?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn parse_seconds_range(text: &str, name: &str, minimum: u64, maximum: u64) -> Result<u64, String> {
+    let value = text
+        .parse::<u64>()
+        .map_err(|_| format!("{name} must be an integer"))?;
+    if !(minimum..=maximum).contains(&value) {
+        return Err(format!("{name} must be between {minimum} and {maximum}"));
+    }
+    Ok(value)
 }
 
 fn required_value<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a str, String> {
@@ -1827,6 +2185,28 @@ fn parse_duration_sec(text: &str) -> Result<u64, String> {
     }
 }
 
+fn parse_audio_frame_ms(text: &str) -> Result<u32, String> {
+    let value: u32 = text
+        .parse()
+        .map_err(|_| format!("invalid frame-ms: {text}"))?;
+    if value == 10 || value == 20 {
+        Ok(value)
+    } else {
+        Err("frame-ms must be 10 or 20".to_string())
+    }
+}
+
+fn parse_audio_jitter_buffer_ms(text: &str) -> Result<u32, String> {
+    let value: u32 = text
+        .parse()
+        .map_err(|_| format!("invalid jitter-buffer-ms: {text}"))?;
+    if value <= 500 {
+        Ok(value)
+    } else {
+        Err("jitter-buffer-ms must be between 0 and 500".to_string())
+    }
+}
+
 fn parse_idle_timeout(text: &str) -> Result<u64, String> {
     let duration: u64 = text
         .parse()
@@ -1918,16 +2298,6 @@ fn parse_convert_backend(text: &str) -> Result<capture_encode_probe::ConvertBack
     }
 }
 
-fn print_native_screen_error(role: &str, mode: &str, error: &str) {
-    println!(
-        r#"{{"type":"NATIVE_SCREEN_ERROR","role":"{}","mode":"{}","error":"{}"}}"#,
-        json_escape(role),
-        json_escape(mode),
-        json_escape(error)
-    );
-    io::stdout().flush().ok();
-}
-
 fn print_help() {
     println!(
         "AgoraLink Native Media prototype\n\n\
@@ -1938,14 +2308,17 @@ Usage:\n\
   agoralink_media receiver --bind <ip> --port <port>\n\
   agoralink_media capture-probe --duration-sec <seconds> --target-fps <fps>\n\
   agoralink_media wmf-probe\n\
+  agoralink_media audio-capture-probe [--duration-sec <seconds>] [--output <path>]\n\
+  agoralink_media audio-send --host <ip> --port <port> [--duration-sec <seconds>] [--frame-ms 10|20]\n\
+  agoralink_media audio-recv-play --bind <ip> --port <port> [--duration-sec <seconds>] [--jitter-buffer-ms <0-500>]\n\
   agoralink_media gpu-convert-probe --duration-sec <seconds> --target-fps <fps> --out-width <pixels> --out-height <pixels> [--debug-dump-nv12 <dir>] [--debug-dump-bgra <dir>] [--debug-dump-limit <n>]\n\
   agoralink_media encode-probe --width <pixels> --height <pixels> --fps <fps> --duration-sec <seconds> --bitrate-mbps <mbps> --output <path> [--encoder auto|hardware|software|microsoft|intel-qsv] [--color-matrix bt601|bt709]\n\
   agoralink_media capture-encode-probe --duration-sec <seconds> --target-fps <fps> [--bitrate-mbps <mbps>] [--quality-bpf <float>] --out-width <pixels> --out-height <pixels> --output <path> [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--color-matrix bt601|bt709]\n\
-  agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> [--bitrate-mbps <mbps>] [--quality-bpf <float>] --out-width <pixels> --out-height <pixels> [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--packet-pacing auto|off|batch] [--fec off|single-xor] [--repair off|nack] [--repair-cache-ms <500-10000>] [--udp-payload-size <576-1472>] [--keyframe-interval-sec <seconds>] [--color-matrix bt601|bt709]\n\
+  agoralink_media h264-send-probe --host <ip> --port <port> --duration-sec <seconds> --target-fps <fps> [--bitrate-mbps <mbps>] [--quality-bpf <float>] --out-width <pixels> --out-height <pixels> [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--packet-pacing auto|off|batch] [--fec off|single-xor] [--repair off|nack] [--repair-cache-ms <500-10000>] [--udp-payload-size <576-1472>] [--keyframe-interval-sec <seconds>] [--adaptive-quality off|smoothness] [--display-refresh-detect auto|off] [--max-fps auto|60|75|90|120] [--enable-high-refresh true|false] [--adaptive-min-width <pixels>] [--adaptive-min-height <pixels>] [--adaptive-min-fps <fps>] [--adaptive-max-bitrate-mbps <mbps>] [--adaptive-feedback-ms <500-2000>] [--adaptive-upgrade-stable-sec <seconds>] [--adaptive-resolution-cooldown-sec <seconds>] [--adaptive-fps-cooldown-sec <seconds>] [--interactive-lag-guard true|false] [--color-matrix bt601|bt709]\n\
   agoralink_media h264-recv-dump --bind <ip> --port <port> --output <path> [--idle-timeout-sec <seconds>] [--drop-damaged-gop <true|false>] [--reorder-wait-ms auto|<ms>]\n\
-  agoralink_media h264-recv-view --bind <ip> --port <port> [--frame-timeout-ms <ms>] [--reorder-wait-ms auto|<ms>] [--playout-delay-ms <0-500>] [--repair off|nack] [--nack-delay-ms <1-50>] [--nack-repeat-ms <1-50>] [--nack-max-rounds <1-10>] [--render-scale exact|fit|stretch] [--window-mode windowed|borderless-fullscreen] [--render-backend gdi|d3d11] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--drop-damaged-gop <true|false>] [--debug-dump-frames <dir>] [--debug-dump-limit <n>] [--json-interval-ms <ms>] [--title <text>]\n\
-  agoralink_media screen-send --host <ip> --port <port> [--width <pixels>] [--height <pixels>] [--fps <fps>] [--bitrate-mbps <mbps>] [--quality-bpf <float>] [--duration-sec <seconds>] [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--packet-pacing auto|off|batch] [--fec off|single-xor] [--repair off|nack] [--repair-cache-ms <500-10000>] [--udp-payload-size <576-1472>] [--keyframe-interval-sec <seconds>] [--color-matrix bt601|bt709] [--verbose]\n\
-  agoralink_media screen-recv --bind <ip> --port <port> [--duration-sec <seconds>] [--frame-timeout-ms <ms>] [--reorder-wait-ms auto|<ms>] [--playout-delay-ms <0-500>] [--repair off|nack] [--nack-delay-ms <1-50>] [--nack-repeat-ms <1-50>] [--nack-max-rounds <1-10>] [--render-scale exact|fit|stretch] [--window-mode windowed|borderless-fullscreen] [--render-backend gdi|d3d11] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--drop-damaged-gop <true|false>] [--json-interval-ms <ms>] [--title <text>] [--verbose]\n\
+  agoralink_media h264-recv-view --bind <ip> --port <port> [--fps <fps>] [--frame-timeout-ms <ms>] [--reorder-wait-ms auto|<ms>] [--playout-delay-ms <0-500>] [--repair off|nack] [--nack-delay-ms <1-50>] [--nack-repeat-ms <1-50>] [--nack-max-rounds <1-10>] [--render-scale exact|fit|stretch] [--window-mode windowed|borderless-fullscreen] [--render-backend gdi|d3d11] [--display-refresh-detect auto|off] [--adaptive-feedback-ms <500-2000>] [--max-inflight-frames <n>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--drop-damaged-gop <true|false>] [--debug-dump-frames <dir>] [--debug-dump-limit <n>] [--json-interval-ms <ms>] [--title <text>]\n\
+  agoralink_media screen-send --host <ip> --port <port> [--width <pixels>] [--height <pixels>] [--fps <fps>] [--bitrate-mbps <mbps>] [--quality-bpf <float>] [--duration-sec <seconds>] [--encoder auto|hardware|software|microsoft|intel-qsv] [--convert-backend auto|cpu|d3d11] [--packet-pacing auto|off|batch] [--fec off|single-xor] [--repair off|nack] [--repair-cache-ms <500-10000>] [--udp-payload-size <576-1472>] [--keyframe-interval-sec <seconds>] [--adaptive-quality off|smoothness] [--display-refresh-detect auto|off] [--max-fps auto|60|75|90|120] [--enable-high-refresh true|false] [--adaptive-min-width <pixels>] [--adaptive-min-height <pixels>] [--adaptive-min-fps <fps>] [--adaptive-max-bitrate-mbps <mbps>] [--adaptive-feedback-ms <500-2000>] [--adaptive-upgrade-stable-sec <seconds>] [--adaptive-resolution-cooldown-sec <seconds>] [--adaptive-fps-cooldown-sec <seconds>] [--interactive-lag-guard true|false] [--audio off|system] [--color-matrix bt601|bt709] [--verbose]\n\
+  agoralink_media screen-recv --bind <ip> --port <port> [--fps <fps>] [--duration-sec <seconds>] [--frame-timeout-ms <ms>] [--reorder-wait-ms auto|<ms>] [--playout-delay-ms <0-500>] [--repair off|nack] [--nack-delay-ms <1-50>] [--nack-repeat-ms <1-50>] [--nack-max-rounds <1-10>] [--render-scale exact|fit|stretch] [--window-mode windowed|borderless-fullscreen] [--render-backend gdi|d3d11] [--display-refresh-detect auto|off] [--adaptive-feedback-ms <500-2000>] [--max-decode-queue <n>] [--strict-decode-order <true|false>] [--drop-damaged-gop <true|false>] [--audio off|on] [--av-sync off|conservative] [--audio-jitter-buffer-ms <0-500>] [--json-interval-ms <ms>] [--title <text>] [--verbose]\n\
   agoralink_media h264-file-viewer --input <path> [--render-scale exact|fit|stretch] [--window-mode windowed|borderless-fullscreen] [--render-backend gdi|d3d11]\n\n\
   agoralink_media color-test-pattern --output <path> --width <pixels> --height <pixels> --duration-sec <seconds> [--fps <fps>] [--bitrate-mbps <mbps>] [--color-matrix bt601|bt709]\n\n\
 Defaults:\n\
@@ -1953,14 +2326,20 @@ Defaults:\n\
   sender: --host 127.0.0.1 --port 50120 --fps 30 --bitrate-mbps 4\n\
   receiver: --bind 0.0.0.0 --port 50120\n\
   capture-probe: --duration-sec 10 --target-fps 30\n\
+  audio-capture-probe: --duration-sec 10 --output audio_probe.pcm\n\
+  audio-send: --host required --port required --frame-ms 10 --duration-sec unlimited\n\
+  audio-recv-play: --bind 0.0.0.0 --port required --jitter-buffer-ms 120 --duration-sec unlimited\n\
   gpu-convert-probe: --duration-sec 5 --target-fps 30 --out-width 1280 --out-height 720 --color-matrix bt709 --debug-dump-limit 3\n\
   encode-probe: --width 1280 --height 720 --fps 30 --duration-sec 5 --bitrate-mbps 4 --output synthetic_720p30.h264 --encoder auto --color-matrix bt709\n\
   capture-encode-probe: --duration-sec 5 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --output capture_720p30.h264 --encoder auto --convert-backend auto --color-matrix bt709\n\
   h264-send-probe: --host 127.0.0.1 --port 50130 --duration-sec 10 --target-fps 30 --bitrate-mbps 4 --out-width 1280 --out-height 720 --encoder auto --convert-backend auto --packet-pacing auto --fec off --udp-payload-size 1452 --keyframe-interval-sec 1 --color-matrix bt709\n\
   h264-recv-dump: --bind 0.0.0.0 --port 50130 --output received_capture.h264 --idle-timeout-sec 3 --drop-damaged-gop true --reorder-wait-ms auto\n\
-  h264-recv-view: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --reorder-wait-ms auto --playout-delay-ms 120 --render-scale exact --window-mode windowed --render-backend d3d11 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --drop-damaged-gop true --debug-dump-limit 10 --json-interval-ms 1000 --title \"AgoraLink Native Viewer\"\n\
-  screen-send: --host required --port required --width 1280 --height 720 --fps 30 --bitrate-mbps 4 --encoder auto --convert-backend auto --packet-pacing auto --fec off --udp-payload-size 1452 --keyframe-interval-sec 1 --color-matrix bt709 --duration-sec unlimited --verbose off\n\
-  screen-recv: --bind 0.0.0.0 --port required --frame-timeout-ms 300 --reorder-wait-ms auto --playout-delay-ms 120 --render-scale exact --window-mode windowed --render-backend d3d11 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --drop-damaged-gop true --json-interval-ms 1000 --title \"AgoraLink Native Viewer\" --duration-sec unlimited --verbose off\n\
+  h264-recv-view: --bind 0.0.0.0 --port required --fps 30 --frame-timeout-ms 300 --reorder-wait-ms auto --playout-delay-ms 120 --render-scale exact --window-mode windowed --render-backend d3d11 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --drop-damaged-gop true --debug-dump-limit 10 --json-interval-ms 1000 --title \"AgoraLink Native Viewer\"\n\
+  screen-send: --width 1920 --height 1080 --fps 60 --bitrate-mbps 22 --repair nack --adaptive-quality off --encoder auto --convert-backend auto --display-refresh-detect auto --max-fps 60 --enable-high-refresh false --adaptive-min-width 1280 --adaptive-min-height 720 --adaptive-min-fps 30 --adaptive-feedback-ms 1000 --adaptive-upgrade-stable-sec 15 --adaptive-resolution-cooldown-sec 30 --adaptive-fps-cooldown-sec 20 --interactive-lag-guard true\n\
+  screen-send bitrate precedence: explicit --bitrate-mbps, then explicit --quality-bpf, then 22 Mbps\n\
+  adaptive smoothness ladder: Q0 1080p60 -> Q1 900p60 -> Q2 720p60 -> Q3 min(initial,18 Mbps) -> Q4 min(initial,15 Mbps); emergency FPS only after Q4: E1 45 FPS -> E2 30 FPS\n\
+  encoder auto prefers Intel QSV and keeps the existing software fallback; convert-backend auto prefers D3D11 and keeps the existing CPU fallback\n\
+  screen-recv: --bind 0.0.0.0 --port required --fps 30 --frame-timeout-ms 300 --reorder-wait-ms auto --playout-delay-ms 120, or 250 when --audio on unless explicitly set --audio off --av-sync off when audio is off, otherwise conservative --audio-jitter-buffer-ms 120 --render-scale exact --window-mode windowed --render-backend d3d11 --max-inflight-frames 120 --max-decode-queue 30 --strict-decode-order true --drop-damaged-gop true --json-interval-ms 1000 --title \"AgoraLink Native Viewer\" --duration-sec unlimited --verbose off\n\
   h264-file-viewer: --input received_capture_lan.h264 --render-scale exact --window-mode windowed --render-backend gdi\n\
   color-test-pattern: --output color_test_1080p.h264 --width 1920 --height 1080 --fps 30 --duration-sec 3 --bitrate-mbps 8 --color-matrix bt709"
     );
@@ -2209,6 +2588,46 @@ fn run_self_test() -> Result<(), String> {
     if parse_udp_payload_size("500").is_ok() || parse_udp_payload_size("1600").is_ok() {
         return Err("invalid UDP payload size was accepted".to_string());
     }
+    match parse_args(vec![
+        "audio-capture-probe".to_string(),
+        "--duration-sec".to_string(),
+        "2".to_string(),
+        "--output".to_string(),
+        "test_audio.pcm".to_string(),
+    ])? {
+        Command::AudioCaptureProbe(config)
+            if config.duration_sec == 2 && config.output == PathBuf::from("test_audio.pcm") => {}
+        _ => return Err("audio-capture-probe parsing failed".to_string()),
+    }
+    match parse_args(vec![
+        "audio-send".to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        "55200".to_string(),
+        "--frame-ms".to_string(),
+        "20".to_string(),
+    ])? {
+        Command::AudioSend(config)
+            if config.host == "127.0.0.1" && config.port == 55200 && config.frame_ms == 20 => {}
+        _ => return Err("audio-send parsing failed".to_string()),
+    }
+    match parse_args(vec![
+        "audio-recv-play".to_string(),
+        "--port".to_string(),
+        "55200".to_string(),
+        "--jitter-buffer-ms".to_string(),
+        "80".to_string(),
+    ])? {
+        Command::AudioRecvPlay(config)
+            if config.bind == "0.0.0.0"
+                && config.port == 55200
+                && config.jitter_buffer_ms == 80 => {}
+        _ => return Err("audio-recv-play parsing failed".to_string()),
+    }
+    if parse_audio_frame_ms("5").is_ok() || parse_audio_jitter_buffer_ms("501").is_ok() {
+        return Err("invalid audio UDP argument was accepted".to_string());
+    }
     for value in ["0", "120", "500"] {
         parse_milliseconds(value, "playout-delay-ms", 0, 500)?;
     }
@@ -2245,28 +2664,116 @@ fn run_self_test() -> Result<(), String> {
         "55134".to_string(),
     ])? {
         Command::ScreenSend(config)
-            if config.udp_payload_size == DEFAULT_REALTIME_UDP_PAYLOAD_SIZE => {}
+            if config.udp_payload_size == DEFAULT_REALTIME_UDP_PAYLOAD_SIZE
+                && config.audio_mode == h264_send_probe::AudioSendMode::Off
+                && config.adaptive.quality.mode == adaptive_quality::AdaptiveMode::Off
+                && config.adaptive.max_fps == frame_rate_policy::MaxFps::Fixed(60)
+                && !config.adaptive.enable_high_refresh
+                && config.adaptive.feedback_ms == 1000 => {}
         _ => return Err("screen-send UDP payload default mismatch".to_string()),
+    }
+    match parse_args(vec![
+        "screen-send".to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        "55134".to_string(),
+        "--adaptive-quality".to_string(),
+        "smoothness".to_string(),
+        "--max-fps".to_string(),
+        "120".to_string(),
+        "--enable-high-refresh".to_string(),
+        "true".to_string(),
+        "--adaptive-feedback-ms".to_string(),
+        "750".to_string(),
+    ])? {
+        Command::ScreenSend(config)
+            if config.adaptive.quality.mode == adaptive_quality::AdaptiveMode::Smoothness
+                && config.adaptive.max_fps == frame_rate_policy::MaxFps::Fixed(120)
+                && config.adaptive.enable_high_refresh
+                && config.adaptive.feedback_ms == 750 => {}
+        _ => return Err("screen-send adaptive option parsing failed".to_string()),
+    }
+    match parse_args(vec![
+        "screen-send".to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        "55134".to_string(),
+        "--audio".to_string(),
+        "system".to_string(),
+    ])? {
+        Command::ScreenSend(config)
+            if config.audio_mode == h264_send_probe::AudioSendMode::System => {}
+        _ => return Err("screen-send audio parsing failed".to_string()),
     }
     match parse_args(vec![
         "screen-recv".to_string(),
         "--port".to_string(),
         "55134".to_string(),
+        "--fps".to_string(),
+        "60".to_string(),
     ])? {
         Command::ScreenRecv(config)
             if config.playout_delay_ms == 120
+                && config.decoder_fps == 60
                 && config.render_scale == win32_gdi_viewer::RenderScaleMode::Exact
                 && config.window_mode == win32_gdi_viewer::WindowMode::Windowed
-                && config.render_backend == video_renderer::RenderBackend::D3d11 => {}
+                && config.render_backend == video_renderer::RenderBackend::D3d11
+                && config.audio_mode == h264_recv_view::AudioRecvMode::Off
+                && config.display_refresh_detect
+                    == display_capability::DisplayRefreshDetect::Auto
+                && config.capability_feedback_ms == 1000 => {}
         _ => return Err("screen-recv playout delay default mismatch".to_string()),
+    }
+    match parse_args(vec![
+        "screen-recv".to_string(),
+        "--port".to_string(),
+        "55134".to_string(),
+        "--audio".to_string(),
+        "on".to_string(),
+    ])? {
+        Command::ScreenRecv(config)
+            if config.audio_mode == h264_recv_view::AudioRecvMode::On
+                && config.playout_delay_ms == 250
+                && config.audio_jitter_buffer_ms == 120
+                && config.av_sync_mode == av_sync::AvSyncMode::Conservative => {}
+        _ => return Err("screen-recv audio parsing failed".to_string()),
+    }
+    match parse_args(vec![
+        "screen-recv".to_string(),
+        "--port".to_string(),
+        "55134".to_string(),
+        "--audio".to_string(),
+        "on".to_string(),
+        "--av-sync".to_string(),
+        "off".to_string(),
+    ])? {
+        Command::ScreenRecv(config) if config.av_sync_mode == av_sync::AvSyncMode::Off => {}
+        _ => return Err("screen-recv av-sync off parsing failed".to_string()),
+    }
+    match parse_args(vec![
+        "screen-recv".to_string(),
+        "--port".to_string(),
+        "55134".to_string(),
+        "--audio".to_string(),
+        "off".to_string(),
+        "--av-sync".to_string(),
+        "conservative".to_string(),
+    ])? {
+        Command::ScreenRecv(config) if config.av_sync_mode == av_sync::AvSyncMode::Off => {}
+        _ => return Err("audio-off did not force AV sync off".to_string()),
     }
     match parse_args(vec![
         "h264-recv-view".to_string(),
         "--port".to_string(),
         "55135".to_string(),
+        "--fps".to_string(),
+        "60".to_string(),
     ])? {
         Command::H264RecvView(config)
             if config.playout_delay_ms == 120
+                && config.decoder_fps == 60
                 && config.render_scale == win32_gdi_viewer::RenderScaleMode::Exact
                 && config.window_mode == win32_gdi_viewer::WindowMode::Windowed
                 && config.render_backend == video_renderer::RenderBackend::D3d11 => {}
@@ -2296,17 +2803,24 @@ fn run_self_test() -> Result<(), String> {
         _ => return Err("h264-file-viewer window mode parsing mismatch".to_string()),
     }
     bgra_to_nv12::run_self_test()?;
+    audio_udp::run_self_test()?;
+    adaptive_quality::run_self_test()?;
     bench_reassembly::run_self_test()?;
     bitrate::run_self_test()?;
     color_spec::run_self_test()?;
     d3d11_nv12_renderer::run_self_test()?;
+    display_capability::run_self_test()?;
+    frame_rate_policy::run_self_test()?;
     h264_annex_b::run_self_test()?;
     h264_recv_dump::run_self_test()?;
     h264_recv_view::run_self_test()?;
     h264_send_probe::run_self_test()?;
+    media_clock::run_self_test()?;
+    media_control::run_self_test()?;
     nv12_to_bgra::run_self_test()?;
     playout_buffer::run_self_test()?;
     repair::run_self_test()?;
+    sender_scheduling::run_self_test()?;
     win32_gdi_viewer::run_self_test()?;
     let nv12_size = nv12_synthetic::buffer_size(16, 16)?;
     if nv12_size != 16 * 16 * 3 / 2 {
@@ -2404,4 +2918,70 @@ fn run_self_test() -> Result<(), String> {
 
 fn json_escape(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod r4_cli_policy_tests {
+    use super::*;
+
+    fn screen_send_config(extra: &[&str]) -> h264_send_probe::H264SendConfig {
+        let mut args = vec![
+            "screen-send".to_string(),
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            "55134".to_string(),
+        ];
+        args.extend(extra.iter().map(|value| (*value).to_string()));
+        match parse_args(args).expect("screen-send arguments should parse") {
+            Command::ScreenSend(config) => config,
+            other => panic!("expected screen-send command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn r4_screen_send_default_is_complete_product_tuple() {
+        let config = screen_send_config(&[]);
+
+        assert_eq!((config.out_width, config.out_height), (1920, 1080));
+        assert_eq!(config.target_fps, 60);
+        assert!((config.bitrate_mbps - 22.0).abs() < f64::EPSILON);
+        assert_eq!(config.bitrate_selection.source.name(), "default");
+        assert_eq!(
+            config.adaptive.quality.mode,
+            adaptive_quality::AdaptiveMode::Off
+        );
+        assert_eq!(config.repair_mode.name(), "nack");
+        assert_eq!(config.encoder.name(), "auto");
+        assert_eq!(config.convert_backend.name(), "auto");
+    }
+
+    #[test]
+    fn r4_explicit_bitrate_overrides_quality_bpf() {
+        let config = screen_send_config(&["--bitrate-mbps", "30", "--quality-bpf", "1.0"]);
+
+        assert!((config.bitrate_mbps - 30.0).abs() < f64::EPSILON);
+        assert_eq!(config.bitrate_selection.source.name(), "explicit-bitrate");
+        assert_eq!(config.bitrate_selection.quality_bpf_requested, Some(1.0));
+    }
+
+    #[test]
+    fn r4_explicit_bitrate_is_preserved_with_adaptive_quality_off() {
+        let config = screen_send_config(&["--bitrate-mbps", "30", "--adaptive-quality", "off"]);
+
+        assert!((config.bitrate_mbps - 30.0).abs() < f64::EPSILON);
+        assert_eq!(
+            config.adaptive.quality.mode,
+            adaptive_quality::AdaptiveMode::Off
+        );
+    }
+
+    #[test]
+    fn r4_quality_bpf_is_used_when_explicit_bitrate_is_absent() {
+        let config = screen_send_config(&["--quality-bpf", "0.5"]);
+        let expected = 1920.0 * 1080.0 * 60.0 * 0.5 / 1_000_000.0;
+
+        assert!((config.bitrate_mbps - expected).abs() < 0.001);
+        assert_eq!(config.bitrate_selection.source.name(), "quality-bpf");
+    }
 }

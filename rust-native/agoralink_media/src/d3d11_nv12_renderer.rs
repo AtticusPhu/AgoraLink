@@ -1,7 +1,8 @@
 #[cfg(windows)]
 mod platform {
+    use std::collections::VecDeque;
     use std::ptr;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use windows::core::s;
     use windows::Win32::Foundation::HMODULE;
@@ -70,6 +71,15 @@ float4 main(float4 position : SV_POSITION, float2 texcoord : TEXCOORD0) : SV_TAR
         pub upload_ms_total: f64,
         pub upload_ms_max: f64,
         pub shader_nv12_to_rgb: bool,
+        pub present_interval_ms_avg: f64,
+        pub present_interval_ms_p50: f64,
+        pub present_interval_ms_p95: f64,
+        pub present_interval_ms_p99: f64,
+        pub present_interval_ms_max: f64,
+        pub present_fps_measured: f64,
+        pub present_missed_deadlines: u64,
+        pub present_samples: u64,
+        pub display_refresh_hz_nominal: f64,
     }
 
     impl D3d11RenderStats {
@@ -80,7 +90,13 @@ float4 main(float4 position : SV_POSITION, float2 texcoord : TEXCOORD0) : SV_TAR
                     r#""d3d11_present_count":{},"d3d11_present_errors":{},"#,
                     r#""d3d11_present_ms_avg":{:.3},"d3d11_present_ms_max":{:.3},"#,
                     r#""d3d11_upload_ms_avg":{:.3},"d3d11_upload_ms_max":{:.3},"#,
-                    r#""d3d11_shader_nv12_to_rgb":{},"d3d11_vsync_mode":"off""#
+                    r#""d3d11_shader_nv12_to_rgb":{},"d3d11_vsync_mode":"off","#,
+                    r#""present_interval_ms_avg":{:.3},"present_interval_ms_p50":{:.3},"#,
+                    r#""present_interval_ms_p95":{:.3},"present_interval_ms_p99":{:.3},"#,
+                    r#""present_interval_ms_max":{:.3},"present_fps_measured":{:.3},"#,
+                    r#""present_missed_deadlines":{},"present_samples":{},"#,
+                    r#""display_refresh_hz_nominal":{:.3},"#,
+                    r#""present_measurement_scope":"application-submit-interval-not-scanout""#
                 ),
                 self.device_created,
                 self.swapchain_created,
@@ -91,6 +107,15 @@ float4 main(float4 position : SV_POSITION, float2 texcoord : TEXCOORD0) : SV_TAR
                 average(self.upload_ms_total, self.present_count),
                 self.upload_ms_max,
                 self.shader_nv12_to_rgb,
+                self.present_interval_ms_avg,
+                self.present_interval_ms_p50,
+                self.present_interval_ms_p95,
+                self.present_interval_ms_p99,
+                self.present_interval_ms_max,
+                self.present_fps_measured,
+                self.present_missed_deadlines,
+                self.present_samples,
+                self.display_refresh_hz_nominal,
             )
         }
     }
@@ -112,6 +137,9 @@ float4 main(float4 position : SV_POSITION, float2 texcoord : TEXCOORD0) : SV_TAR
         client_width: u32,
         client_height: u32,
         stats: D3d11RenderStats,
+        last_present_at: Option<Instant>,
+        present_interval_window_us: VecDeque<u64>,
+        present_interval_publish_at: Instant,
     }
 
     impl D3d11Nv12Renderer {
@@ -212,6 +240,9 @@ float4 main(float4 position : SV_POSITION, float2 texcoord : TEXCOORD0) : SV_TAR
                     shader_nv12_to_rgb: true,
                     ..D3d11RenderStats::default()
                 },
+                last_present_at: None,
+                present_interval_window_us: VecDeque::with_capacity(256),
+                present_interval_publish_at: Instant::now(),
             };
             renderer.recreate_render_target()?;
             Ok(renderer)
@@ -283,7 +314,55 @@ float4 main(float4 position : SV_POSITION, float2 texcoord : TEXCOORD0) : SV_TAR
             self.stats.present_count += 1;
             self.stats.present_ms_total += present_ms;
             self.stats.present_ms_max = self.stats.present_ms_max.max(present_ms);
+            self.record_present_interval(Instant::now(), layout);
             Ok(())
+        }
+
+        fn record_present_interval(&mut self, now: Instant, layout: &GdiRenderStats) {
+            self.stats.display_refresh_hz_nominal = layout.display.refresh.hz();
+            if let Some(previous) = self.last_present_at.replace(now) {
+                let interval_us = now
+                    .saturating_duration_since(previous)
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64;
+                self.present_interval_window_us.push_back(interval_us);
+                self.stats.present_samples = self.stats.present_samples.saturating_add(1);
+                let nominal_hz = self.stats.display_refresh_hz_nominal;
+                if nominal_hz > 0.0 && interval_us as f64 > (1_000_000.0 / nominal_hz) * 1.5 {
+                    self.stats.present_missed_deadlines =
+                        self.stats.present_missed_deadlines.saturating_add(1);
+                }
+            }
+            if now.saturating_duration_since(self.present_interval_publish_at)
+                >= Duration::from_secs(1)
+            {
+                self.publish_present_intervals();
+                self.present_interval_publish_at = now;
+            }
+        }
+
+        fn publish_present_intervals(&mut self) {
+            if self.present_interval_window_us.is_empty() {
+                return;
+            }
+            let mut values = self
+                .present_interval_window_us
+                .drain(..)
+                .collect::<Vec<_>>();
+            values.sort_unstable();
+            let total = values.iter().copied().map(u128::from).sum::<u128>();
+            let avg_us = total as f64 / values.len() as f64;
+            self.stats.present_interval_ms_avg = avg_us / 1000.0;
+            self.stats.present_interval_ms_p50 = percentile_us(&values, 50) as f64 / 1000.0;
+            self.stats.present_interval_ms_p95 = percentile_us(&values, 95) as f64 / 1000.0;
+            self.stats.present_interval_ms_p99 = percentile_us(&values, 99) as f64 / 1000.0;
+            self.stats.present_interval_ms_max =
+                values.last().copied().unwrap_or_default() as f64 / 1000.0;
+            self.stats.present_fps_measured = if avg_us > 0.0 {
+                1_000_000.0 / avg_us
+            } else {
+                0.0
+            };
         }
 
         fn ensure_client_size(&mut self, width: u32, height: u32) -> Result<(), String> {
@@ -495,6 +574,14 @@ float4 main(float4 position : SV_POSITION, float2 texcoord : TEXCOORD0) : SV_TAR
         } else {
             total / count as f64
         }
+    }
+
+    fn percentile_us(values: &[u64], percentile: usize) -> u64 {
+        if values.is_empty() {
+            return 0;
+        }
+        let index = ((values.len() - 1) * percentile + 50) / 100;
+        values[index.min(values.len() - 1)]
     }
 
     pub fn run_self_test() -> Result<(), String> {

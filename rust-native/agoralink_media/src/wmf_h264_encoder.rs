@@ -8,13 +8,18 @@ mod platform {
     use std::path::Path;
     use std::ptr;
     use std::slice;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
+    use crate::async_mft_wait::{
+        poll_until, AsyncMftPollError, AsyncMftWaitFailure, AsyncMftWaitKind,
+    };
     use crate::color_spec::{ColorMatrix, ColorSpec, MediaColorMetadata};
     use windows::core::{IUnknown, Interface, Result as WindowsResult, GUID, PWSTR};
     use windows::Win32::Media::MediaFoundation::{
-        eAVEncH264VProfile_Main, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame,
-        CODECAPI_AVEncVideoNumGOPsPerIDR, ICodecAPI, IMFActivate, IMFMediaBuffer,
-        IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, MEError,
+        eAVEncH264VProfile_Main, CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncMPVGOPSize,
+        CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoNumGOPsPerIDR, ICodecAPI, IMFActivate,
+        IMFMediaBuffer, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, MEError,
         METransformDrainComplete, METransformHaveOutput, METransformNeedInput, MFCreateMediaType,
         MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFNominalRange_16_235,
         MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFTEnumEx,
@@ -22,9 +27,8 @@ mod platform {
         MFT_FRIENDLY_NAME_Attribute, MFT_TRANSFORM_CLSID_Attribute, MFVideoFormat_H264,
         MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709,
         MFVideoPrimaries_SMPTE170M, MFVideoTransFunc_709, MFVideoTransferMatrix_BT601,
-        MFVideoTransferMatrix_BT709, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MFSTARTUP_FULL,
-        MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_SORTANDFILTER,
-        MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+        MFVideoTransferMatrix_BT709, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ALL,
+        MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
         MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
         MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
         MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_INFO,
@@ -48,6 +52,9 @@ mod platform {
         GUID::from_u128(0x6ca50344_051a_4ded_9779_a43305165e35);
     const HNS_PER_SECOND: i64 = 10_000_000;
     const MIN_OUTPUT_BUFFER_SIZE: u32 = 1_048_576;
+    const ASYNC_NEED_INPUT_TIMEOUT: Duration = Duration::from_secs(1);
+    const ASYNC_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+    const ASYNC_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum EncoderChoice {
@@ -102,6 +109,9 @@ mod platform {
         pub async_mft: bool,
         pub hardware_url: Option<String>,
         pub hardware_vendor: Option<String>,
+        pub activation_entries_skipped: u64,
+        pub activation_skip_missing_clsid: u64,
+        pub activation_skip_other: u64,
     }
 
     impl EncoderSelection {
@@ -111,7 +121,7 @@ mod platform {
 
         pub fn json_fragment(&self) -> String {
             format!(
-                r#""encoder_requested":"{}","encoder_selected":"{}","encoder_clsid":"{}","encoder_kind":"{}","encoder_fallback":{},"encoder_fallback_reason":{},"hardware_accelerated":{},"encoder_async":{},"encoder_hardware_url":{},"encoder_hardware_vendor":{}"#,
+                r#""encoder_requested":"{}","encoder_selected":"{}","encoder_clsid":"{}","encoder_kind":"{}","encoder_fallback":{},"encoder_fallback_reason":{},"hardware_accelerated":{},"encoder_async":{},"encoder_hardware_url":{},"encoder_hardware_vendor":{},"encoder_activation_entries_skipped":{},"encoder_activation_skip_reason_counts":{{"missing-transform-clsid":{},"other":{}}}"#,
                 self.requested.name(),
                 json_escape(&self.selected_name),
                 json_escape(&self.clsid),
@@ -121,7 +131,10 @@ mod platform {
                 self.hardware_accelerated(),
                 self.async_mft,
                 optional_json_string(self.hardware_url.as_deref()),
-                optional_json_string(self.hardware_vendor.as_deref())
+                optional_json_string(self.hardware_vendor.as_deref()),
+                self.activation_entries_skipped,
+                self.activation_skip_missing_clsid,
+                self.activation_skip_other,
             )
         }
     }
@@ -138,6 +151,9 @@ mod platform {
                 async_mft: false,
                 hardware_url: None,
                 hardware_vendor: None,
+                activation_entries_skipped: 0,
+                activation_skip_missing_clsid: 0,
+                activation_skip_other: 0,
             }
         }
     }
@@ -149,12 +165,24 @@ mod platform {
         pub bytes_out: u64,
         pub keyframes: u64,
         pub keyframe_detection_available: bool,
+        pub async_wait_timeouts: u64,
+        pub async_wait_cancelled: u64,
+        pub async_drain_timeouts: u64,
     }
 
     #[derive(Debug)]
     pub struct EncodedSample {
         pub bytes: Vec<u8>,
         pub keyframe: Option<bool>,
+        pub sample_time_hns: Option<i64>,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    pub struct EncoderKeyframeControl {
+        pub config_method: String,
+        pub config_applied: bool,
+        pub config_error: Option<String>,
+        pub force_supported: bool,
     }
 
     struct ComGuard;
@@ -216,6 +244,8 @@ mod platform {
         event_generator: Option<IMFMediaEventGenerator>,
         async_need_input: u32,
         async_drain_complete: bool,
+        async_cancellation: Option<crate::shutdown::CancellationToken>,
+        keyframe_control: EncoderKeyframeControl,
         _mf: MediaFoundationGuard,
         _com: ComGuard,
     }
@@ -256,6 +286,7 @@ mod platform {
                 false,
                 color_spec,
                 EncoderChoice::Software,
+                None,
             )
         }
 
@@ -277,6 +308,7 @@ mod platform {
                 false,
                 color_spec,
                 encoder_choice,
+                None,
             )
         }
 
@@ -306,9 +338,11 @@ mod platform {
                 true,
                 color_spec,
                 EncoderChoice::Software,
+                None,
             )
         }
 
+        #[allow(dead_code)]
         pub fn new_stream_with_color_and_choice(
             width: u32,
             height: u32,
@@ -326,6 +360,30 @@ mod platform {
                 true,
                 color_spec,
                 encoder_choice,
+                None,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn new_stream_with_color_choice_and_keyframe_interval(
+            width: u32,
+            height: u32,
+            fps: u32,
+            bitrate_mbps: f64,
+            color_spec: ColorSpec,
+            encoder_choice: EncoderChoice,
+            keyframe_interval_frames: Option<u32>,
+        ) -> Result<Self, String> {
+            Self::new_internal(
+                width,
+                height,
+                fps,
+                bitrate_mbps,
+                None,
+                true,
+                color_spec,
+                encoder_choice,
+                keyframe_interval_frames,
             )
         }
 
@@ -338,6 +396,7 @@ mod platform {
             collect_samples: bool,
             color_spec: ColorSpec,
             encoder_choice: EncoderChoice,
+            keyframe_interval_frames: Option<u32>,
         ) -> Result<Self, String> {
             if encoder_choice == EncoderChoice::Auto {
                 let hardware_result = Self::new_internal_selected(
@@ -351,6 +410,7 @@ mod platform {
                     EncoderChoice::Hardware,
                     EncoderChoice::Auto,
                     None,
+                    keyframe_interval_frames,
                 );
                 return match hardware_result {
                     Ok(mut encoder) => {
@@ -368,6 +428,7 @@ mod platform {
                         EncoderChoice::Software,
                         EncoderChoice::Auto,
                         Some(hardware_error),
+                        keyframe_interval_frames,
                     ),
                 };
             }
@@ -382,6 +443,7 @@ mod platform {
                 encoder_choice,
                 encoder_choice,
                 None,
+                keyframe_interval_frames,
             )
         }
 
@@ -397,6 +459,7 @@ mod platform {
             creation_choice: EncoderChoice,
             requested_choice: EncoderChoice,
             fallback_reason: Option<String>,
+            keyframe_interval_frames: Option<u32>,
         ) -> Result<Self, String> {
             if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
                 return Err("encoder width and height must be non-zero even values".to_string());
@@ -414,6 +477,11 @@ mod platform {
                 selection.fallback = true;
                 selection.fallback_reason = Some(reason);
             }
+
+            // Static CodecAPI properties must be set before output type negotiation and
+            // before MFT_MESSAGE_NOTIFY_BEGIN_STREAMING. Hardware MFTs may otherwise
+            // accept SetValue while silently retaining their default GOP.
+            let keyframe_control = configure_keyframe_control(&transform, keyframe_interval_frames);
 
             let output_type =
                 create_video_type(width, height, fps, MFVideoFormat_H264, bitrate_bps, None)?;
@@ -518,6 +586,8 @@ mod platform {
                 event_generator,
                 async_need_input: 0,
                 async_drain_complete: false,
+                async_cancellation: None,
+                keyframe_control,
                 _mf: mf,
                 _com: com,
             })
@@ -556,7 +626,7 @@ mod platform {
             }
             self.stats.frames_in += 1;
             if self.event_generator.is_some() {
-                while self.pump_async_event(false)? {}
+                while self.pump_async_event()? {}
             } else {
                 drain_available(
                     &self.transform,
@@ -571,6 +641,7 @@ mod platform {
             Ok(())
         }
 
+        #[allow(dead_code)]
         pub fn set_keyframe_interval_frames(&mut self, frames: u32) -> Result<(), String> {
             if frames == 0 {
                 return Err("keyframe interval frames must be greater than zero".to_string());
@@ -593,15 +664,13 @@ mod platform {
             Ok(())
         }
 
+        pub fn keyframe_control(&self) -> &EncoderKeyframeControl {
+            &self.keyframe_control
+        }
+
+        #[allow(dead_code)]
         pub fn supports_force_keyframe(&self) -> bool {
-            self.transform
-                .cast::<ICodecAPI>()
-                .ok()
-                .is_some_and(|codec_api| unsafe {
-                    codec_api
-                        .IsSupported(&CODECAPI_AVEncVideoForceKeyFrame)
-                        .is_ok()
-                })
+            self.keyframe_control.force_supported
         }
 
         pub fn request_keyframe(&mut self) -> Result<(), String> {
@@ -611,9 +680,43 @@ mod platform {
                 .map_err(|err| format!("encoder does not expose ICodecAPI: {err}"))?;
             unsafe { codec_api.IsSupported(&CODECAPI_AVEncVideoForceKeyFrame) }
                 .map_err(|err| format!("encoder does not support forced keyframes: {err}"))?;
-            let force = VARIANT::from(true);
+            // CODECAPI_AVEncVideoForceKeyFrame is ULONG (VT_UI4), not VT_BOOL.
+            let force = VARIANT::from(1u32);
             unsafe { codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &force) }
                 .map_err(|err| format!("force next encoder frame to IDR failed: {err}"))
+        }
+
+        pub fn set_mean_bitrate_mbps(&mut self, bitrate_mbps: f64) -> Result<(), String> {
+            if !bitrate_mbps.is_finite() || !(0.1..=1000.0).contains(&bitrate_mbps) {
+                return Err("encoder bitrate must be between 0.1 and 1000 Mbps".to_string());
+            }
+            let bitrate_bps = (bitrate_mbps * 1_000_000.0)
+                .round()
+                .clamp(1.0, f64::from(u32::MAX)) as u32;
+            let codec_api = self
+                .transform
+                .cast::<ICodecAPI>()
+                .map_err(|err| format!("encoder does not expose ICodecAPI: {err}"))?;
+            unsafe { codec_api.IsSupported(&CODECAPI_AVEncCommonMeanBitRate) }.map_err(|err| {
+                format!("encoder does not support runtime mean bitrate control: {err}")
+            })?;
+            unsafe { codec_api.IsModifiable(&CODECAPI_AVEncCommonMeanBitRate) }
+                .ok()
+                .map_err(|err| format!("encoder mean bitrate is not runtime-modifiable: {err}"))?;
+            let value = VARIANT::from(bitrate_bps);
+            unsafe { codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &value) }.map_err(
+                |err| format!("set encoder mean bitrate to {bitrate_mbps:.3} Mbps failed: {err}"),
+            )?;
+            let observed = unsafe { codec_api.GetValue(&CODECAPI_AVEncCommonMeanBitRate) }
+                .map_err(|err| format!("read encoder mean bitrate after update failed: {err}"))?;
+            let observed_bps = u32::try_from(&observed)
+                .map_err(|err| format!("encoder mean bitrate readback was not UINT32: {err}"))?;
+            if observed_bps != bitrate_bps {
+                return Err(format!(
+                    "encoder mean bitrate readback mismatch: requested {bitrate_bps}, observed {observed_bps}"
+                ));
+            }
+            Ok(())
         }
 
         pub fn finish(&mut self) -> Result<EncoderStats, String> {
@@ -630,8 +733,22 @@ mod platform {
             }
             if self.event_generator.is_some() {
                 self.async_drain_complete = false;
-                while !self.async_drain_complete {
-                    self.pump_async_event(true)?;
+                let drain_result = self.wait_for_async_state(
+                    AsyncMftWaitKind::Drain,
+                    ASYNC_DRAIN_TIMEOUT,
+                    |encoder| encoder.async_drain_complete,
+                );
+                if let Err(error) = drain_result {
+                    let cancelled = self
+                        .async_cancellation
+                        .as_ref()
+                        .is_some_and(crate::shutdown::CancellationToken::is_cancelled);
+                    if !cancelled {
+                        return Err(error);
+                    }
+                    // Cancellation is a normal shutdown path. The bounded wait has
+                    // already recorded it; skip any unavailable tail output and let
+                    // END_STREAMING release the transform below.
                 }
             } else {
                 drain_available(
@@ -658,31 +775,75 @@ mod platform {
         }
 
         fn submit_async_input(&mut self, sample: &IMFSample) -> Result<(), String> {
-            while self.async_need_input == 0 {
-                self.pump_async_event(true)?;
-            }
+            self.wait_for_async_state(
+                AsyncMftWaitKind::NeedInput,
+                ASYNC_NEED_INPUT_TIMEOUT,
+                |encoder| encoder.async_need_input > 0,
+            )?;
             unsafe { self.transform.ProcessInput(0, sample, 0) }
                 .map_err(|err| format!("async ProcessInput failed: {err}"))?;
             self.async_need_input -= 1;
             Ok(())
         }
 
-        fn pump_async_event(&mut self, blocking: bool) -> Result<bool, String> {
+        fn wait_for_async_state(
+            &mut self,
+            kind: AsyncMftWaitKind,
+            timeout: Duration,
+            ready: fn(&Self) -> bool,
+        ) -> Result<(), String> {
+            let started = Instant::now();
+            let cancellation = self.async_cancellation.clone();
+            let result = poll_until(
+                kind,
+                timeout,
+                || started.elapsed(),
+                || {
+                    cancellation
+                        .as_ref()
+                        .is_some_and(crate::shutdown::CancellationToken::is_cancelled)
+                },
+                || {
+                    if ready(self) {
+                        return Ok(Some(()));
+                    }
+                    let _ = self.pump_async_event()?;
+                    Ok(ready(self).then_some(()))
+                },
+                || thread::sleep(ASYNC_EVENT_POLL_INTERVAL),
+            );
+            match result {
+                Ok(()) => Ok(()),
+                Err(AsyncMftPollError::Source(error)) => Err(error),
+                Err(AsyncMftPollError::Wait(failure)) => {
+                    match failure {
+                        AsyncMftWaitFailure::Timeout { kind, .. } => {
+                            self.stats.async_wait_timeouts =
+                                self.stats.async_wait_timeouts.saturating_add(1);
+                            if kind == AsyncMftWaitKind::Drain {
+                                self.stats.async_drain_timeouts =
+                                    self.stats.async_drain_timeouts.saturating_add(1);
+                            }
+                        }
+                        AsyncMftWaitFailure::Cancelled { .. } => {
+                            self.stats.async_wait_cancelled =
+                                self.stats.async_wait_cancelled.saturating_add(1);
+                        }
+                    }
+                    Err(failure.to_string())
+                }
+            }
+        }
+
+        fn pump_async_event(&mut self) -> Result<bool, String> {
             let generator = self
                 .event_generator
                 .as_ref()
                 .ok_or_else(|| "async encoder event generator is unavailable".to_string())?
                 .clone();
-            let flags = if blocking {
-                MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0)
-            } else {
-                MF_EVENT_FLAG_NO_WAIT
-            };
-            let event = match unsafe { generator.GetEvent(flags) } {
+            let event = match unsafe { generator.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                 Ok(event) => event,
-                Err(err) if !blocking && err.code() == MF_E_NO_EVENTS_AVAILABLE => {
-                    return Ok(false)
-                }
+                Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(false),
                 Err(err) => return Err(format!("async encoder GetEvent failed: {err}")),
             };
             let status = unsafe { event.GetStatus() }
@@ -718,6 +879,10 @@ mod platform {
                 return Err("async encoder emitted MEError".to_string());
             }
             Ok(true)
+        }
+
+        pub fn set_async_cancellation(&mut self, cancellation: crate::shutdown::CancellationToken) {
+            self.async_cancellation = Some(cancellation);
         }
 
         pub fn take_encoded_samples(&mut self) -> Vec<EncodedSample> {
@@ -800,6 +965,9 @@ mod platform {
                 async_mft: false,
                 hardware_url: None,
                 hardware_vendor: None,
+                activation_entries_skipped: 0,
+                activation_skip_missing_clsid: 0,
+                activation_skip_other: 0,
             },
         ))
     }
@@ -808,8 +976,10 @@ mod platform {
         intel_only: bool,
         requested: EncoderChoice,
     ) -> Result<(IMFTransform, EncoderSelection), String> {
-        let candidates = enumerate_h264_encoder_activations()?;
-        let mut hardware_candidates: Vec<EncoderCandidate> = candidates
+        let enumeration = enumerate_h264_encoder_activations()?;
+        let diagnostics = enumeration.diagnostics;
+        let mut hardware_candidates: Vec<EncoderCandidate> = enumeration
+            .candidates
             .into_iter()
             .filter(|candidate| candidate.is_hardware_or_async_hint())
             .filter(|candidate| !intel_only || candidate.is_intel_qsv())
@@ -826,7 +996,10 @@ mod platform {
         let mut activation_errors = Vec::new();
         for candidate in hardware_candidates {
             match activate_encoder_candidate(&candidate, requested) {
-                Ok(result) => return Ok(result),
+                Ok((transform, mut selection)) => {
+                    diagnostics.apply_to(&mut selection);
+                    return Ok((transform, selection));
+                }
                 Err(err) => activation_errors.push(format!("{}: {err}", candidate.name)),
             }
         }
@@ -921,11 +1094,43 @@ mod platform {
                 async_mft: self.async_mft,
                 hardware_url: self.hardware_url.clone(),
                 hardware_vendor: self.hardware_vendor.clone(),
+                activation_entries_skipped: 0,
+                activation_skip_missing_clsid: 0,
+                activation_skip_other: 0,
             }
         }
     }
 
-    fn enumerate_h264_encoder_activations() -> Result<Vec<EncoderCandidate>, String> {
+    #[derive(Clone, Copy, Debug, Default)]
+    struct EncoderActivationDiagnostics {
+        entries_skipped: u64,
+        missing_clsid: u64,
+        other: u64,
+    }
+
+    impl EncoderActivationDiagnostics {
+        fn observe_skip(&mut self, error: &str) {
+            self.entries_skipped = self.entries_skipped.saturating_add(1);
+            if error.starts_with("missing transform CLSID") {
+                self.missing_clsid = self.missing_clsid.saturating_add(1);
+            } else {
+                self.other = self.other.saturating_add(1);
+            }
+        }
+
+        fn apply_to(self, selection: &mut EncoderSelection) {
+            selection.activation_entries_skipped = self.entries_skipped;
+            selection.activation_skip_missing_clsid = self.missing_clsid;
+            selection.activation_skip_other = self.other;
+        }
+    }
+
+    struct EncoderEnumeration {
+        candidates: Vec<EncoderCandidate>,
+        diagnostics: EncoderActivationDiagnostics,
+    }
+
+    fn enumerate_h264_encoder_activations() -> Result<EncoderEnumeration, String> {
         let input_type = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
             guidSubtype: MFVideoFormat_NV12,
@@ -950,6 +1155,7 @@ mod platform {
         .map_err(|err| format!("MFTEnumEx H.264 encoder failed: {err}"))?;
 
         let mut candidates = Vec::new();
+        let mut diagnostics = EncoderActivationDiagnostics::default();
         if !activates.is_null() {
             for index in 0..count as usize {
                 let activate = unsafe { ptr::read(activates.add(index)) };
@@ -965,12 +1171,15 @@ mod platform {
                             candidates.push(candidate);
                         }
                     }
-                    Err(err) => eprintln!("encoder activation inspect failed index={index}: {err}"),
+                    Err(err) => diagnostics.observe_skip(&err),
                 }
             }
             unsafe { CoTaskMemFree(Some(activates.cast::<c_void>())) };
         }
-        Ok(candidates)
+        Ok(EncoderEnumeration {
+            candidates,
+            diagnostics,
+        })
     }
 
     fn inspect_activation(activate: IMFActivate) -> Result<EncoderCandidate, String> {
@@ -1053,6 +1262,67 @@ mod platform {
             if let Err(err) = unsafe { media_type.SetUINT32(attribute, value) } {
                 eprintln!("encoder media type could not set {name}: {err}");
             }
+        }
+    }
+
+    fn configure_keyframe_control(
+        transform: &IMFTransform,
+        keyframe_interval_frames: Option<u32>,
+    ) -> EncoderKeyframeControl {
+        let method = "codecapi-static-gop+force-next-frame-ui4".to_string();
+        let codec_api = match transform.cast::<ICodecAPI>() {
+            Ok(codec_api) => codec_api,
+            Err(err) => {
+                return EncoderKeyframeControl {
+                    config_method: method,
+                    config_applied: false,
+                    config_error: Some(format!("encoder does not expose ICodecAPI: {err}")),
+                    force_supported: false,
+                };
+            }
+        };
+        let force_supported = unsafe {
+            codec_api
+                .IsSupported(&CODECAPI_AVEncVideoForceKeyFrame)
+                .is_ok()
+        };
+        let Some(frames) = keyframe_interval_frames else {
+            return EncoderKeyframeControl {
+                config_method: method,
+                config_applied: false,
+                config_error: None,
+                force_supported,
+            };
+        };
+        if frames == 0 {
+            return EncoderKeyframeControl {
+                config_method: method,
+                config_applied: false,
+                config_error: Some(
+                    "keyframe interval frames must be greater than zero".to_string(),
+                ),
+                force_supported,
+            };
+        }
+
+        let result = (|| {
+            unsafe { codec_api.IsSupported(&CODECAPI_AVEncMPVGOPSize) }
+                .map_err(|err| format!("encoder does not support GOP size control: {err}"))?;
+            unsafe { codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(frames)) }
+                .map_err(|err| format!("set encoder GOP size to {frames} frames failed: {err}"))?;
+            if unsafe { codec_api.IsSupported(&CODECAPI_AVEncVideoNumGOPsPerIDR) }.is_ok() {
+                unsafe {
+                    codec_api.SetValue(&CODECAPI_AVEncVideoNumGOPsPerIDR, &VARIANT::from(1u32))
+                }
+                .map_err(|err| format!("set one GOP per IDR failed: {err}"))?;
+            }
+            Ok::<(), String>(())
+        })();
+        EncoderKeyframeControl {
+            config_method: method,
+            config_applied: result.is_ok(),
+            config_error: result.err(),
+            force_supported,
         }
     }
 
@@ -1226,7 +1496,11 @@ mod platform {
                     }
                 }
                 if collect_samples {
-                    pending_samples.push_back(EncodedSample { bytes, keyframe });
+                    pending_samples.push_back(EncodedSample {
+                        bytes,
+                        keyframe,
+                        sample_time_hns: unsafe { sample.GetSampleTime() }.ok(),
+                    });
                 }
                 Ok(OutputResult::Produced)
             }
@@ -1382,5 +1656,6 @@ mod platform {
 
 #[cfg(windows)]
 pub use platform::{
-    EncodedSample, EncoderChoice, EncoderSelection, EncoderStats, WmfH264Encoder, ENCODER_NAME,
+    EncodedSample, EncoderChoice, EncoderKeyframeControl, EncoderSelection, EncoderStats,
+    WmfH264Encoder, ENCODER_NAME,
 };

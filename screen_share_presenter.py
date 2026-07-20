@@ -42,6 +42,12 @@ def screen_audio_text(audio: object = None, lang: object = "en") -> str:
         return "系统音频不可用，已继续视频投屏" if zh else "System audio unavailable · Video only"
     if state in ("failed", "audio_failed"):
         return "音频失败，已继续视频投屏" if zh else "Audio failed · Continued video only"
+    if state == "capturing":
+        return "系统音频采集中" if zh else "System audio capturing"
+    if state == "playing":
+        return "系统音频播放中" if zh else "System audio playing"
+    if state == "available":
+        return "系统音频可用" if zh else "System audio available"
     if enabled and mode == "system":
         return "系统音频开启" if zh else "System audio on"
     return "无音频" if zh else "Video only"

@@ -1,3 +1,17 @@
+pub fn decoder_sample_duration_us(fps: u32) -> Result<u64, String> {
+    if fps == 0 {
+        return Err("decoder fps must be greater than zero".to_string());
+    }
+    Ok(1_000_000 / u64::from(fps))
+}
+
+pub fn decoder_sample_duration_100ns(fps: u32) -> Result<i64, String> {
+    if fps == 0 {
+        return Err("decoder fps must be greater than zero".to_string());
+    }
+    Ok(10_000_000 / i64::from(fps))
+}
+
 #[cfg(windows)]
 mod platform {
     use std::mem::ManuallyDrop;
@@ -29,7 +43,6 @@ mod platform {
 
     pub const DECODER_NAME: &str = "Microsoft H.264 Video Decoder MFT";
     const H264_DECODER_CLSID: GUID = GUID::from_u128(0x62ce7e72_4c71_4d20_b15d_452831a87d9d);
-    const HNS_PER_SECOND: i64 = 10_000_000;
 
     pub struct DecodedFrame {
         pub nv12: Vec<u8>,
@@ -166,11 +179,10 @@ mod platform {
             if self.finished {
                 return Err("decoder has already been finished".to_string());
             }
+            let sample_duration = super::decoder_sample_duration_100ns(self.fps)?;
             let sample_time = (frame_index as i64)
-                .checked_mul(HNS_PER_SECOND)
-                .ok_or_else(|| "decoder sample time overflow".to_string())?
-                / i64::from(self.fps);
-            let sample_duration = HNS_PER_SECOND / i64::from(self.fps);
+                .checked_mul(sample_duration)
+                .ok_or_else(|| "decoder sample time overflow".to_string())?;
             let sample = create_input_sample(bytes, sample_time, sample_duration)?;
             let mut frames = Vec::new();
             loop {
@@ -707,3 +719,18 @@ mod platform {
 
 #[cfg(windows)]
 pub use platform::{DecodedFrame, WmfH264Decoder, DECODER_NAME};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoder_timing_matches_configured_fps() {
+        assert_eq!(decoder_sample_duration_us(24).unwrap(), 41_666);
+        assert_eq!(decoder_sample_duration_us(30).unwrap(), 33_333);
+        assert_eq!(decoder_sample_duration_us(60).unwrap(), 16_666);
+        assert_eq!(decoder_sample_duration_us(120).unwrap(), 8_333);
+        assert_eq!(decoder_sample_duration_100ns(60).unwrap(), 166_666);
+        assert!(decoder_sample_duration_us(0).is_err());
+    }
+}

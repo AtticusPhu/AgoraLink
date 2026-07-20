@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 pub const MAX_NACK_ITEMS: usize = 64;
@@ -40,6 +40,101 @@ impl Default for RepairMode {
 pub struct PacketKey {
     pub frame_id: u64,
     pub packet_index: u16,
+}
+
+#[derive(Default)]
+pub struct PacketUniquenessTracker {
+    seen: HashSet<PacketKey>,
+    unique: u64,
+    duplicate: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RepairSuppressionStats {
+    pub requests: u64,
+    pub allowed: u64,
+    pub suppressed: u64,
+    pub evicted: u64,
+}
+
+pub struct RepairSuppression {
+    interval: Duration,
+    last_sent: HashMap<PacketKey, Instant>,
+    order: VecDeque<(Instant, PacketKey)>,
+    stats: RepairSuppressionStats,
+}
+
+impl RepairSuppression {
+    pub fn new(interval: Duration) -> Result<Self, String> {
+        if interval.is_zero() {
+            return Err("repair suppression interval must be greater than zero".to_string());
+        }
+        Ok(Self {
+            interval,
+            last_sent: HashMap::new(),
+            order: VecDeque::new(),
+            stats: RepairSuppressionStats::default(),
+        })
+    }
+
+    pub fn should_send(&mut self, key: PacketKey, now: Instant) -> bool {
+        self.evict(now);
+        self.stats.requests = self.stats.requests.saturating_add(1);
+        if self
+            .last_sent
+            .get(&key)
+            .is_some_and(|last| now.saturating_duration_since(*last) < self.interval)
+        {
+            self.stats.suppressed = self.stats.suppressed.saturating_add(1);
+            return false;
+        }
+        self.last_sent.insert(key, now);
+        self.order.push_back((now, key));
+        self.stats.allowed = self.stats.allowed.saturating_add(1);
+        true
+    }
+
+    fn evict(&mut self, now: Instant) {
+        let retention = self.interval.saturating_mul(4);
+        while let Some((sent_at, key)) = self.order.front().copied() {
+            if now.saturating_duration_since(sent_at) <= retention {
+                break;
+            }
+            self.order.pop_front();
+            if self
+                .last_sent
+                .get(&key)
+                .is_some_and(|last| *last == sent_at)
+            {
+                self.last_sent.remove(&key);
+                self.stats.evicted = self.stats.evicted.saturating_add(1);
+            }
+        }
+    }
+
+    pub fn stats(&self) -> RepairSuppressionStats {
+        self.stats
+    }
+}
+
+impl PacketUniquenessTracker {
+    pub fn observe(&mut self, key: PacketKey) -> bool {
+        if self.seen.insert(key) {
+            self.unique += 1;
+            true
+        } else {
+            self.duplicate += 1;
+            false
+        }
+    }
+
+    pub fn unique(&self) -> u64 {
+        self.unique
+    }
+
+    pub fn duplicate(&self) -> u64 {
+        self.duplicate
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -170,6 +265,12 @@ impl RepairCache {
     pub fn evictions(&self) -> u64 {
         self.evictions
     }
+
+    pub fn clear(&mut self) {
+        self.packets.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
 }
 
 pub fn media_packet_key(datagram: &[u8]) -> Option<(u64, PacketKey, u16)> {
@@ -229,5 +330,35 @@ pub fn run_self_test() -> Result<(), String> {
     if cache.get(key, now + Duration::from_millis(11)).is_some() {
         return Err("expired repair cache entry remained available".to_string());
     }
+    let mut uniqueness = PacketUniquenessTracker::default();
+    let second_key = PacketKey {
+        frame_id: 4,
+        packet_index: 3,
+    };
+    if !uniqueness.observe(key)
+        || uniqueness.observe(key)
+        || !uniqueness.observe(second_key)
+        || uniqueness.observe(key)
+        || uniqueness.unique() != 2
+        || uniqueness.duplicate() != 2
+    {
+        return Err("multi-round repair unique/duplicate accounting failed".to_string());
+    }
+    let mut suppression = RepairSuppression::new(Duration::from_millis(30))?;
+    if !suppression.should_send(key, now)
+        || suppression.should_send(key, now + Duration::from_millis(10))
+        || !suppression.should_send(key, now + Duration::from_millis(31))
+        || suppression.stats().suppressed != 1
+    {
+        return Err("repair resend suppression failed".to_string());
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn deterministic_repair_regressions() {
+        super::run_self_test().expect("repair self-test");
+    }
 }

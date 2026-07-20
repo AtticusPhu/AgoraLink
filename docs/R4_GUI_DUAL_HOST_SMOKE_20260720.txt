@@ -1,0 +1,94 @@
+AgoraLink R4 GUI dual-host smoke instructions
+Test ID: R4_GUI_SMOKE_20260720_R1
+Status: USER_EXECUTION_REQUIRED
+
+Purpose
+-------
+Validate the final extracted portable on two real Windows hosts. Codex does not
+substitute loopback or command-line-only testing for these GUI interactions.
+
+Prerequisites on both hosts
+---------------------------
+1. Use the same AgoraLink_R4_portable_20260720 directory or ZIP.
+2. Verify the ZIP SHA-256 against AgoraLink_R4_portable_20260720.sha256.txt.
+3. Verify bundled _internal/tools/agoralink_media/agoralink_media.exe SHA-256:
+   D0CEE722185FF1E294894557C008CA96B37FF8C75F909162DB7B658286C8AE9D
+4. Do not use a manually renamed .bin, source target/release, old dist, or r4_test directory.
+5. Run Prepare-R4GuiSmoke.ps1 separately on sender and receiver. It does not alter Firewall rules.
+
+Prepare commands
+----------------
+Sender:
+  powershell -ExecutionPolicy Bypass -File .\scripts\r4_gui_smoke\Prepare-R4GuiSmoke.ps1 `
+    -PortableDir <portable_dir> -Role sender
+
+Receiver:
+  powershell -ExecutionPolicy Bypass -File .\scripts\r4_gui_smoke\Prepare-R4GuiSmoke.ps1 `
+    -PortableDir <portable_dir> -Role receiver
+
+G1 - GUI start and defaults
+---------------------------
+- Start AgoraLink.exe on both hosts.
+- With a fresh configuration, verify r4_default, 1920x1080, 60 FPS, 22 Mbps,
+  NACK, adaptive off.
+- Verify diagnostics show the bundled portable native path and exact R4 hash.
+- No exception dialog, NATIVE_SCREEN_ERROR, or R3 hash.
+
+G2 - Start sharing
+------------------
+- Receiver accepts/starts the existing screen-share GUI flow.
+- Sender selects receiver and starts screen sharing with r4_default.
+- Run at least 60 seconds.
+- Verify picture, sharing/receiving state, and QSV/D3D11 preferred selections.
+- Record GUI and native JSON telemetry.
+
+G3 - Sender GUI stop
+--------------------
+- Sender clicks the existing GUI Stop control.
+- Verify STREAM_CLOSE completes, receiver returns to idle/waiting, no peer_timeout,
+  worker_join_all_clean=true, retained_worker_count=0, and controls recover.
+
+G4 - Restart without closing GUI
+--------------------------------
+- Wait five seconds and start the same share again for at least 60 seconds.
+- Verify a new session, no occupied port, no stale already-running state, and normal picture/stats.
+
+G5 - Receiver GUI/viewer stop
+-----------------------------
+- Receiver stops through GUI or closes the native viewer.
+- Verify receiver reason=window_closed (or the documented GUI-stop reason), sender
+  reason=peer_closed, no peer_timeout, both GUIs return idle, and no residual process.
+
+Append feature definition and smoke
+-----------------------------------
+There is no separate control literally named Append. The existing behavior is:
+while one chat file transfer is active, clicking Send file again creates another
+independent chat file message and transfer task. Each invocation flows through
+send_file_to_current_chat -> _send_file_path_to_current_chat ->
+_start_file_transfer_for_message and owns a distinct message_id/card/worker thread.
+
+Regression steps:
+1. Send a non-sensitive 10-50 MiB file and begin transfer.
+2. While active, click Send file again and select a second 10-50 MiB file.
+3. Verify the second task/card becomes pending or active without replacing the first.
+4. Verify both complete, source/destination SHA-256 values match, task/card counts are
+   correct, and no duplicate or missing task occurs.
+
+Collect commands
+----------------
+Run the command printed by each Prepare script, or:
+  powershell -ExecutionPolicy Bypass -File .\scripts\r4_gui_smoke\Collect-R4GuiSmoke.ps1 `
+    -EvidenceDir <prepared_evidence_dir> -Role <sender|receiver>
+
+Expected evidence ZIP names
+---------------------------
+r4_gui_smoke_sender_R4_GUI_SMOKE_20260720_R1.zip
+r4_gui_smoke_receiver_R4_GUI_SMOKE_20260720_R1.zip
+
+Immediate FAIL conditions
+-------------------------
+- NATIVE_SCREEN_ERROR or NATIVE_SCREEN_SHUTDOWN_FAILED
+- peer_timeout during a GUI stop case
+- failed restart, stale session, residual process, new DMP
+- retained_worker_count > 0 or worker_join_all_clean != true
+- file mismatch, duplicate transfer, missing transfer, or UI freeze

@@ -1,5 +1,6 @@
 #[cfg(windows)]
 mod platform {
+    use crate::callback_lifecycle::{shutdown_callback_source, CallbackBarrier};
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -63,6 +64,75 @@ mod platform {
     impl Drop for WinRtGuard {
         fn drop(&mut self) {
             unsafe { RoUninitialize() };
+        }
+    }
+
+    struct CaptureResourcesGuard {
+        frame_pool: Direct3D11CaptureFramePool,
+        session: GraphicsCaptureSession,
+        frame_token: Option<i64>,
+        callback_barrier: Arc<CallbackBarrier>,
+        resources_closed: bool,
+    }
+
+    impl CaptureResourcesGuard {
+        fn new(
+            frame_pool: Direct3D11CaptureFramePool,
+            session: GraphicsCaptureSession,
+            frame_token: i64,
+            callback_barrier: Arc<CallbackBarrier>,
+        ) -> Self {
+            Self {
+                frame_pool,
+                session,
+                frame_token: Some(frame_token),
+                callback_barrier,
+                resources_closed: false,
+            }
+        }
+
+        fn close(&mut self) -> Result<(), String> {
+            let token = self.frame_token.take();
+            let close_resources = !self.resources_closed;
+            self.resources_closed = true;
+            let remove_pool = self.frame_pool.clone();
+            let close_pool = self.frame_pool.clone();
+            let close_session = self.session.clone();
+            shutdown_callback_source(
+                &self.callback_barrier,
+                move || {
+                    token.map_or(Ok(()), |token| {
+                        remove_pool
+                            .RemoveFrameArrived(token)
+                            .map_err(|error| format!("RemoveFrameArrived failed: {error}"))
+                    })
+                },
+                || Ok(()),
+                move || {
+                    if close_resources {
+                        close_session.Close().map_err(|error| {
+                            format!("GraphicsCaptureSession::Close failed: {error}")
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+                move || {
+                    if close_resources {
+                        close_pool.Close().map_err(|error| {
+                            format!("Direct3D11CaptureFramePool::Close failed: {error}")
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        }
+    }
+
+    impl Drop for CaptureResourcesGuard {
+        fn drop(&mut self) {
+            let _ = self.close();
         }
     }
 
@@ -154,9 +224,14 @@ mod platform {
             frame_interval,
         }));
         let callback_counters = Arc::clone(&counters);
+        let callback_barrier = CallbackBarrier::new();
+        let handler_barrier = Arc::clone(&callback_barrier);
         let frame_handler: TypedEventHandler<Direct3D11CaptureFramePool, IInspectable> =
             TypedEventHandler::new(
                 move |sender: Ref<Direct3D11CaptureFramePool>, _args: Ref<IInspectable>| {
+                    let Some(_callback_lease) = handler_barrier.try_enter() else {
+                        return Ok(());
+                    };
                     let Some(pool) = sender.as_ref() else {
                         increment_dropped(&callback_counters);
                         return Ok(());
@@ -199,13 +274,18 @@ mod platform {
                     Ok(())
                 },
             );
-        let frame_token = frame_pool
-            .FrameArrived(&frame_handler)
-            .map_err(|err| format!("FrameArrived registration failed: {err}"))?;
-
         let session = frame_pool
             .CreateCaptureSession(&capture_item)
             .map_err(|err| format!("CreateCaptureSession failed: {err}"))?;
+        let frame_token = frame_pool
+            .FrameArrived(&frame_handler)
+            .map_err(|err| format!("FrameArrived registration failed: {err}"))?;
+        let mut resources = CaptureResourcesGuard::new(
+            frame_pool.clone(),
+            session.clone(),
+            frame_token,
+            callback_barrier,
+        );
         session
             .StartCapture()
             .map_err(|err| format!("StartCapture failed: {err}"))?;
@@ -255,9 +335,7 @@ mod platform {
             print_stats(snapshot, raw_fps, accepted_fps, target_fps);
         }
 
-        let _ = frame_pool.RemoveFrameArrived(frame_token);
-        let _ = session.Close();
-        let _ = frame_pool.Close();
+        resources.close()?;
         eprintln!(
             "capture-probe stopped reason={}",
             if STOP_REQUESTED.load(Ordering::SeqCst) {

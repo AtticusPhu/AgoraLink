@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "report": "R4_WINDOWS_BUILD_REPRODUCIBILITY_NOTE_20260720",
+  "date": "2026-07-20",
+  "conclusion": "WINDOWS_MSVC_DEBUG_BUILD_BYTE_REPRODUCIBILITY_NOT_ESTABLISHED",
+  "source_mismatch": false,
+  "release_policy": "publish the previously validated frozen portable; never replace it with the diagnostic rebuild",
+  "inputs": {
+    "frozen_exe": {
+      "size_bytes": 2143744,
+      "sha256": "D0CEE722185FF1E294894557C008CA96B37FF8C75F909162DB7B658286C8AE9D"
+    },
+    "rebuilt_exe": {
+      "size_bytes": 2143744,
+      "sha256": "99D58D69DB31FF32F862B0D100E07DF7AE7C677B1E71A6D1DB5F6EC65272F1D1"
+    },
+    "frozen_pdb_sha256": "0761475AD6D852B4A55A02D05C51706FCC838F9F0BBDE2FB5D40135EA32ECC2E",
+    "rebuilt_pdb_sha256": "724D51220F75AF45E5911D3EEBDA86567F68E8595959A1E56FD06B0175417562"
+  },
+  "toolchain": {
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "target": "x86_64-pc-windows-msvc",
+    "llvm": "22.1.2",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "msvc_tools": "14.44.35207",
+    "pe_linker_version": "14.44",
+    "dumpbin_used": true,
+    "llvm_readobj_available": false,
+    "llvm_objdump_available": false
+  },
+  "source_provenance": {
+    "baseline_commit": "ad23a3c2daf08868afd2784fcb4b8e476458ce64",
+    "comparison_commit": "6181f71eb2438bc5c56dd3540de5abfe995848b6",
+    "baseline_rust_source_tree": "f4a2399b5d60c79a60ff1818b39b72e1cb799d42",
+    "comparison_rust_source_tree": "f4a2399b5d60c79a60ff1818b39b72e1cb799d42",
+    "source_tree_equal": true,
+    "baseline_cargo_lock_blob": "90f71cae3ddbcf6b8020f45912ba46b8230c3110",
+    "comparison_cargo_lock_blob": "90f71cae3ddbcf6b8020f45912ba46b8230c3110",
+    "cargo_lock_equal": true,
+    "changed_rust_core_files": 0
+  },
+  "pe_comparison": {
+    "same_file_size": true,
+    "same_core_layout": true,
+    "same_entry_point": true,
+    "same_image_size": true,
+    "same_imports": true,
+    "differing_byte_count": 28,
+    "sections": {
+      ".text": { "layout_equal": true, "content_equal": true },
+      ".rdata": { "layout_equal": true, "content_equal": false, "difference": "debug directory timestamps and RSDS GUID" },
+      ".data": { "layout_equal": true, "content_equal": true },
+      ".pdata": { "layout_equal": true, "content_equal": true },
+      ".reloc": { "layout_equal": true, "content_equal": true }
+    },
+    "frozen_timestamp": "6A59DE7A",
+    "rebuilt_timestamp": "6A5DADE1",
+    "frozen_rsds_guid": "24F83E43-212C-44B3-817C-D250857EB121",
+    "rebuilt_rsds_guid": "ACA93669-BFAE-4ECE-A6D7-26C75AC20B9D",
+    "pdb_basename_equal": true
+  },
+  "frozen_release": {
+    "portable_sha256": "41CBAEE0ADC3F0F542811D783A7B84B66F1A011C56FD4F82D39FAEDD8B18E942",
+    "bundled_native_sha256": "D0CEE722185FF1E294894557C008CA96B37FF8C75F909162DB7B658286C8AE9D",
+    "diagnostic_rebuild_must_not_replace_frozen_artifact": true
+  },
+  "evidence_dir": "_local_artifacts/R4_WINDOWS_BUILD_REPRO_20260720"
+}

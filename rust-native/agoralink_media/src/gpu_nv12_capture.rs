@@ -8,6 +8,7 @@ mod platform {
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
+    use crate::callback_lifecycle::{shutdown_callback_source, CallbackBarrier};
     use crate::color_spec::{ColorMatrix, ColorSpec};
     use windows::core::{factory, IInspectable, Interface, Ref};
     use windows::Foundation::TypedEventHandler;
@@ -118,31 +119,49 @@ mod platform {
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let thread_shared = Arc::clone(&shared);
             let thread_stop = Arc::clone(&stop);
-            let thread = thread::Builder::new()
-                .name("agoralink-wgc-gpu-nv12".to_string())
-                .spawn(move || {
-                    if let Err(err) = capture_thread(
-                        thread_shared.clone(),
-                        thread_stop,
-                        ready_tx,
-                        output_width,
-                        output_height,
-                        target_fps,
-                    ) {
-                        if let Ok(mut state) = thread_shared.lock() {
-                            state.error = Some(err);
+            let mut thread = Some(
+                thread::Builder::new()
+                    .name("agoralink-wgc-gpu-nv12".to_string())
+                    .spawn(move || {
+                        if let Err(err) = capture_thread(
+                            thread_shared.clone(),
+                            thread_stop,
+                            ready_tx,
+                            output_width,
+                            output_height,
+                            target_fps,
+                        ) {
+                            if let Ok(mut state) = thread_shared.lock() {
+                                state.error = Some(err);
+                            }
                         }
-                    }
-                })
-                .map_err(|err| format!("spawn GPU capture thread failed: {err}"))?;
-            let info = ready_rx
-                .recv_timeout(Duration::from_secs(5))
-                .map_err(|err| format!("GPU capture initialization timed out: {err}"))??;
+                    })
+                    .map_err(|err| format!("spawn GPU capture thread failed: {err}"))?,
+            );
+            let info = match ready_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(info)) => info,
+                Ok(Err(error)) => {
+                    return Err(stop_failed_startup_worker(
+                        &stop,
+                        &mut thread,
+                        "wgc-gpu-nv12",
+                        error,
+                    ));
+                }
+                Err(error) => {
+                    return Err(stop_failed_startup_worker(
+                        &stop,
+                        &mut thread,
+                        "wgc-gpu-nv12",
+                        format!("GPU capture initialization timed out: {error}"),
+                    ));
+                }
+            };
             Ok(Self {
                 info,
                 shared,
                 stop,
-                thread: Some(thread),
+                thread,
             })
         }
 
@@ -173,10 +192,19 @@ mod platform {
 
         pub fn stop(mut self) -> Result<(), String> {
             self.stop.store(true, Ordering::SeqCst);
-            if let Some(thread) = self.thread.take() {
-                thread
-                    .join()
-                    .map_err(|_| "GPU capture thread panicked".to_string())?;
+            let status = crate::shutdown::try_join_until(
+                &mut self.thread,
+                Instant::now() + Duration::from_secs(2),
+            );
+            if status == crate::shutdown::WorkerJoinStatus::TimedOut {
+                crate::shutdown::retain_unjoined_worker("wgc-gpu-nv12", &mut self.thread);
+            }
+            if !status.clean() {
+                return Err(format!(
+                    "{}: GPU capture thread shutdown: {}",
+                    crate::shutdown::WORKER_OWNERSHIP_FAILURE_TAG,
+                    status.name()
+                ));
             }
             if let Some(error) = self.error() {
                 Err(error)
@@ -189,9 +217,41 @@ mod platform {
     impl Drop for GpuNv12Capture {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::SeqCst);
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
+            let status = crate::shutdown::try_join_until(
+                &mut self.thread,
+                Instant::now() + Duration::from_secs(1),
+            );
+            if status == crate::shutdown::WorkerJoinStatus::TimedOut {
+                crate::shutdown::retain_unjoined_worker("wgc-gpu-nv12", &mut self.thread);
+                if let Ok(mut state) = self.shared.lock() {
+                    state.error = Some(format!(
+                        "{}: GPU capture Drop retained an unjoined worker",
+                        crate::shutdown::WORKER_OWNERSHIP_FAILURE_TAG
+                    ));
+                }
             }
+        }
+    }
+
+    fn stop_failed_startup_worker(
+        stop: &Arc<AtomicBool>,
+        thread: &mut Option<JoinHandle<()>>,
+        worker_name: &str,
+        primary_error: String,
+    ) -> String {
+        stop.store(true, Ordering::SeqCst);
+        let status =
+            crate::shutdown::try_join_until(thread, Instant::now() + Duration::from_secs(5));
+        if status == crate::shutdown::WorkerJoinStatus::TimedOut {
+            crate::shutdown::retain_unjoined_worker(worker_name, thread);
+            format!(
+                "{}: {primary_error}; startup worker did not exit after cancellation",
+                crate::shutdown::WORKER_OWNERSHIP_FAILURE_TAG
+            )
+        } else if status.clean() {
+            primary_error
+        } else {
+            format!("{primary_error}; startup worker join={}", status.name())
         }
     }
 
@@ -208,6 +268,105 @@ mod platform {
     impl Drop for WinRtGuard {
         fn drop(&mut self) {
             unsafe { RoUninitialize() };
+        }
+    }
+
+    struct CaptureResourcesGuard {
+        frame_pool: Direct3D11CaptureFramePool,
+        session: GraphicsCaptureSession,
+        frame_token: Option<i64>,
+        callback_barrier: Arc<CallbackBarrier>,
+        pending_frames: mpsc::Receiver<Direct3D11CaptureFrame>,
+        resources_closed: bool,
+    }
+
+    impl CaptureResourcesGuard {
+        fn new(
+            frame_pool: Direct3D11CaptureFramePool,
+            session: GraphicsCaptureSession,
+            frame_token: i64,
+            callback_barrier: Arc<CallbackBarrier>,
+            pending_frames: mpsc::Receiver<Direct3D11CaptureFrame>,
+        ) -> Self {
+            Self {
+                frame_pool,
+                session,
+                frame_token: Some(frame_token),
+                callback_barrier,
+                pending_frames,
+                resources_closed: false,
+            }
+        }
+
+        fn recv_timeout(
+            &self,
+            timeout: Duration,
+        ) -> Result<Direct3D11CaptureFrame, mpsc::RecvTimeoutError> {
+            self.pending_frames.recv_timeout(timeout)
+        }
+
+        fn close(&mut self) -> Result<(), String> {
+            let token = self.frame_token.take();
+            let close_resources = !self.resources_closed;
+            self.resources_closed = true;
+            let remove_pool = self.frame_pool.clone();
+            let close_pool = self.frame_pool.clone();
+            let close_session = self.session.clone();
+            let pending_frames = &self.pending_frames;
+            shutdown_callback_source(
+                &self.callback_barrier,
+                move || {
+                    token.map_or(Ok(()), |token| {
+                        remove_pool
+                            .RemoveFrameArrived(token)
+                            .map_err(|error| format!("RemoveFrameArrived failed: {error}"))
+                    })
+                },
+                move || {
+                    let mut errors = Vec::new();
+                    loop {
+                        match pending_frames.try_recv() {
+                            Ok(frame) => {
+                                if let Err(error) = frame.Close() {
+                                    errors.push(format!("pending frame Close failed: {error}"));
+                                }
+                            }
+                            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                                break;
+                            }
+                        }
+                    }
+                    if errors.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(errors.join("; "))
+                    }
+                },
+                move || {
+                    if close_resources {
+                        close_session.Close().map_err(|error| {
+                            format!("GraphicsCaptureSession::Close failed: {error}")
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+                move || {
+                    if close_resources {
+                        close_pool.Close().map_err(|error| {
+                            format!("Direct3D11CaptureFramePool::Close failed: {error}")
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        }
+    }
+
+    impl Drop for CaptureResourcesGuard {
+        fn drop(&mut self) {
+            let _ = self.close();
         }
     }
 
@@ -490,10 +649,19 @@ mod platform {
         };
         let (frame_tx, frame_rx) = mpsc::sync_channel(FRAME_QUEUE_CAPACITY);
         let callback_shared = Arc::clone(&shared);
-        let frame_handler = create_frame_handler(callback_shared, frame_tx);
+        let callback_barrier = CallbackBarrier::new();
+        let frame_handler =
+            create_frame_handler(callback_shared, frame_tx, Arc::clone(&callback_barrier));
         let frame_token = frame_pool
             .FrameArrived(&frame_handler)
             .map_err(|err| format!("FrameArrived registration failed: {err}"))?;
+        let mut resources = CaptureResourcesGuard::new(
+            frame_pool.clone(),
+            session.clone(),
+            frame_token,
+            callback_barrier,
+            frame_rx,
+        );
         session
             .StartCapture()
             .map_err(|err| format!("StartCapture failed: {err}"))?;
@@ -511,7 +679,7 @@ mod platform {
         let frame_interval = Duration::from_nanos(1_000_000_000u64 / u64::from(target_fps));
         let mut next_convert_at = Instant::now();
         while !stop.load(Ordering::SeqCst) {
-            match frame_rx.recv_timeout(Duration::from_millis(20)) {
+            match resources.recv_timeout(Duration::from_millis(20)) {
                 Ok(frame) => {
                     let now = Instant::now();
                     if now < next_convert_at {
@@ -557,10 +725,7 @@ mod platform {
             }
         }
 
-        let _ = frame_pool.RemoveFrameArrived(frame_token);
-        let _ = session.Close();
-        let _ = frame_pool.Close();
-        Ok(())
+        resources.close()
     }
 
     fn setup_capture() -> Result<
@@ -607,9 +772,13 @@ mod platform {
     fn create_frame_handler(
         shared: Arc<Mutex<SharedState>>,
         sender: SyncSender<Direct3D11CaptureFrame>,
+        callback_barrier: Arc<CallbackBarrier>,
     ) -> TypedEventHandler<Direct3D11CaptureFramePool, IInspectable> {
         TypedEventHandler::new(
             move |pool: Ref<Direct3D11CaptureFramePool>, _args: Ref<IInspectable>| {
+                let Some(_callback_lease) = callback_barrier.try_enter() else {
+                    return Ok(());
+                };
                 let Some(pool) = pool.as_ref() else {
                     increment_dropped(&shared);
                     return Ok(());

@@ -93,9 +93,16 @@ ffmpeg_dir = project_dir / 'tools' / 'ffmpeg'
 if include_ffmpeg and ffmpeg_dir.exists():
     datas.append((str(ffmpeg_dir), 'tools/ffmpeg'))
 
-rust_media_exe = project_dir / 'rust-native' / 'agoralink_media' / 'target' / 'release' / 'agoralink_media.exe'
+rust_media_dir = Path(
+    os.environ.get('AGORALINK_NATIVE_RUNTIME_DIR')
+    or project_dir / 'rust-native' / 'agoralink_media' / 'target' / 'release'
+).resolve()
+rust_media_exe = rust_media_dir / 'agoralink_media.exe'
+rust_media_pdb = rust_media_dir / 'agoralink_media.pdb'
 if rust_media_exe.exists():
     datas.append((str(rust_media_exe), 'tools/agoralink_media'))
+if rust_media_pdb.exists():
+    datas.append((str(rust_media_pdb), 'tools/agoralink_media'))
 
 for src, dest in [
     (project_dir / 'assets' / 'app.png', 'assets'),

@@ -24,6 +24,7 @@ from process_utils import run_no_console
 
 MAX_LOG_BYTES = 5 * 1024 * 1024
 DEFAULT_PORTS = (9999, 50020)
+SENSITIVE_LOG_NAME_PARTS = ("chat", "protocol", "pin", "key", "secret")
 
 
 def _json_default(value):
@@ -50,6 +51,10 @@ def _read_tail_bytes(path: Path, max_bytes: int = MAX_LOG_BYTES) -> bytes:
 def _add_log_file(zf: zipfile.ZipFile, path: Path, arcname: str) -> None:
     try:
         if path.exists() and path.is_file():
+            name = path.name.lower()
+            if any(part in name for part in SENSITIVE_LOG_NAME_PARTS):
+                zf.writestr(f"debug/{path.name}.skipped.txt", "Skipped to avoid exporting chat, protocol, PIN, or key material.\n")
+                return
             zf.writestr(arcname, _read_tail_bytes(path))
     except Exception as exc:
         zf.writestr(f"errors/{path.name}.txt", f"failed to add log {path}: {exc}\n")
