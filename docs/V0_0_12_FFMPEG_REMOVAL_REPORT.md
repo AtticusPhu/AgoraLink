@@ -1,6 +1,7 @@
 # AgoraLink v0.0.12 FFmpeg Removal Report
 
-Date: 2026-07-20  
+Date: 2026-07-20
+
 Decision: all AgoraLink media behavior uses the bundled native Windows runtime.
 
 ## Result
@@ -59,7 +60,6 @@ Residual media processes after deterministic validation: 0. The Python command-b
 
 ## Preserved Native Path
 
-Sender: WGC -> D3D11 conversion -> QSV/WMF H.264 -> AGM1 UDP.  
-Receiver: AGM1 UDP -> reassembly/NACK -> WMF H.264 -> D3D11 render.  
-Audio: WASAPI/native UDP when native audio capability is available.
-
+- Sender: WGC -> D3D11 conversion -> QSV/WMF H.264 -> AGM1 UDP.
+- Receiver: AGM1 UDP -> reassembly/NACK -> WMF H.264 -> D3D11 render.
+- Audio: WASAPI/native UDP when native audio capability is available.

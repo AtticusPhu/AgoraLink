@@ -42,4 +42,3 @@ v0.0.12 hardens the native media control/reassembly boundaries, removes the exte
 - Live two-host file-append smoke was not run in this remediation workspace; deterministic file-transfer tests passed.
 - A repository license has not been selected. Status: `USER_DECISION_REQUIRED`.
 - The large Rust/Python module split is deferred to a dedicated architecture change after golden CLI/JSON/state-machine coverage is established.
-

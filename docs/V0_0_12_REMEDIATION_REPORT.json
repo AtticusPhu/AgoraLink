@@ -11,7 +11,7 @@
     {"batch": 4, "commit": "b3783c1", "status": "PASS", "scope": "deterministic Python validation"},
     {"batch": 5, "commit": "4915c40", "status": "PASS", "scope": "locked Windows CI"},
     {"batch": 6, "commit": "5817853", "status": "PASS", "scope": "portable and symbols privacy"},
-    {"batch": 7, "commit": null, "status": "PASS", "scope": "release evidence"}
+    {"batch": 7, "commit": "6655d75", "status": "PASS", "scope": "release evidence"}
   ],
   "controls": {
     "udp_control_hardening": "PASS",

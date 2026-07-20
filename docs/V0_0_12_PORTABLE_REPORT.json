@@ -2,12 +2,19 @@
   "type": "V0_0_12_PORTABLE_REPORT",
   "date": "2026-07-20",
   "branch": "audit-fixes-v0.0.12",
-  "status": "PENDING_FINAL_RELEASE_BUILD",
+  "status": "PASS",
   "final_asset": {
-    "path": null,
-    "size_bytes": null,
-    "sha256": null,
-    "source_commit": null
+    "path": "_local_artifacts/V0_0_12_RELEASE/AgoraLink_v0.0.12_portable.zip",
+    "size_bytes": 43626481,
+    "sha256": "E16926EB865A2D9802AABE26B68718ACBFFA19271C4D8EFA838CCCAAA9A8AD6D",
+    "source_commit": "6655d758281b0a7bed95845d83c58163b33350cd",
+    "native_exe_sha256": "F0104BBC8946B6A03F8C7EEF7EB3CE03424C03B05F193989C320E3D509E1A5A6",
+    "zip_entries": 1454,
+    "pdb_files": 0,
+    "source_files": 0,
+    "external_media_files": 0,
+    "privacy_scan": "PASS",
+    "extracted_verification": "PASS"
   },
   "dry_run": {
     "status": "PASS",

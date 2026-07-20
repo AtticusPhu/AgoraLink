@@ -1,7 +1,8 @@
 # AgoraLink v0.0.12 Validation Report
 
-Date: 2026-07-20  
-Branch: `audit-fixes-v0.0.12`  
+Date: 2026-07-20
+
+Branch: `audit-fixes-v0.0.12`
 Validation type: deterministic local gates plus portable dry-run.
 
 ## Status Summary
@@ -95,6 +96,16 @@ Results: 30 discovered tests, 30 passed, dependency check clean, and all 18 runt
 
 This is dry-run evidence for Batch 6, not the final release asset. Final asset identity is written after the documentation commit and recorded in the portable report/build result.
 
+## Final Portable Evidence
+
+- Source commit: `6655d758281b0a7bed95845d83c58163b33350cd`.
+- ZIP size: 43,626,481 bytes.
+- ZIP SHA-256: `E16926EB865A2D9802AABE26B68718ACBFFA19271C4D8EFA838CCCAAA9A8AD6D`.
+- Native executable SHA-256: `F0104BBC8946B6A03F8C7EEF7EB3CE03424C03B05F193989C320E3D509E1A5A6`.
+- Entries: 1,454.
+- PDB, source, and removed external-media named files: 0.
+- Staging/extraction privacy scans and native self-tests: PASS.
+
 ## Privacy Notes
 
 The portable scan found no current user profile or source checkout prefix. Eight prebuilt third-party DLL/PYD files contain their vendors' upstream build-machine paths; these are recorded as provenance and are not local AgoraLink source paths.
@@ -110,4 +121,3 @@ The PDB privacy scan failed on local checkout/toolchain paths. That is expected 
 ## Limitations
 
 `NOT_RUN` is intentional for WGC, QSV, D3D11 window rendering, dual-host network behavior, peer stop, and live GUI smoke. Those require the manual Windows release matrix and cannot be inferred from unit tests or loopback-free self-tests.
-

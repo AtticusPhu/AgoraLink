@@ -43,6 +43,19 @@
     "native_self_test": "PASS",
     "third_party_build_path_file_count": 8
   },
+  "portable_final": {
+    "status": "PASS",
+    "source_commit": "6655d758281b0a7bed95845d83c58163b33350cd",
+    "size_bytes": 43626481,
+    "sha256": "E16926EB865A2D9802AABE26B68718ACBFFA19271C4D8EFA838CCCAAA9A8AD6D",
+    "native_exe_sha256": "F0104BBC8946B6A03F8C7EEF7EB3CE03424C03B05F193989C320E3D509E1A5A6",
+    "zip_entries": 1454,
+    "pdb_files": 0,
+    "source_files": 0,
+    "external_media_files": 0,
+    "privacy_scan": "PASS",
+    "extracted_verification": "PASS"
+  },
   "symbols": {
     "status": "NOT_CREATED_PRIVACY_GATE",
     "finding": "local_user_path",

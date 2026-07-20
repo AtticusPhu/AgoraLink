@@ -1,13 +1,25 @@
 # AgoraLink v0.0.12 Portable Report
 
-Date: 2026-07-20  
+Date: 2026-07-20
+
 Branch: `audit-fixes-v0.0.12`
 
 ## Release Asset Status
 
-`PENDING_FINAL_RELEASE_BUILD`
+`PASS`
 
-The packaging implementation and full dry-run passed. The final public ZIP must be built from the clean Batch 7 documentation commit so `BUILD_INFO.json` identifies the exact source commit. Final path, size, and SHA-256 will be recorded after that build.
+The final public ZIP was built from clean source commit `6655d758281b0a7bed95845d83c58163b33350cd`. `BUILD_INFO.json` records that commit and CPython 3.12.10.
+
+Final asset:
+
+- Path: `_local_artifacts/V0_0_12_RELEASE/AgoraLink_v0.0.12_portable.zip`.
+- Size: 43,626,481 bytes.
+- SHA-256: `E16926EB865A2D9802AABE26B68718ACBFFA19271C4D8EFA838CCCAAA9A8AD6D`.
+- Native executable SHA-256: `F0104BBC8946B6A03F8C7EEF7EB3CE03424C03B05F193989C320E3D509E1A5A6`.
+- ZIP entries: 1,454.
+- PDB, source, and removed external-media named files: 0.
+- Staging/extraction privacy scans: PASS.
+- Native self-test before/after extraction: PASS.
 
 ## Packaging Contract
 
@@ -65,4 +77,3 @@ Forbidden public contents:
 ## License
 
 `USER_DECISION_REQUIRED`. No LICENSE file is required by the packaging gate until the owner selects a license, and automation did not create one.
-

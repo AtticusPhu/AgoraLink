@@ -1,8 +1,10 @@
 # AgoraLink v0.0.12 Remediation Report
 
-Date: 2026-07-20  
-Baseline: `c0e7bc5`  
-Branch: `audit-fixes-v0.0.12`  
+Date: 2026-07-20
+
+Baseline: `c0e7bc5`
+
+Branch: `audit-fixes-v0.0.12`
 Scope: v0.0.11 audit follow-up, native-only media runtime, deterministic validation, and portable hardening.
 
 ## Result
@@ -21,7 +23,7 @@ The requested source changes are complete. Deterministic Rust/Python/PowerShell 
 | 4 | `b3783c1` | PASS | Deterministic Python discovery and regression tests |
 | 5 | `4915c40` | PASS | Locked environments and Windows CI definitions |
 | 6 | `5817853` | PASS | PDB separation, privacy gate, portable/symbol scripts |
-| 7 | current documentation batch | PASS | README, changelog, release and evidence reports |
+| 7 | `6655d75` | PASS | README, changelog, release and evidence reports |
 
 ## Input Boundary Hardening
 
@@ -89,4 +91,3 @@ The requested source changes are complete. Deterministic Rust/Python/PowerShell 
 - Repository license: `USER_DECISION_REQUIRED`; no license was selected by automation.
 - Branch protection: not applied because this branch was not pushed.
 - Dual-host, WGC, QSV, D3D11 window, and live GUI smoke: `NOT_RUN`.
-
