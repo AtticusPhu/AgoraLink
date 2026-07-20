@@ -74,3 +74,11 @@ tools/ffmpeg/**/*.exe
 dist/
 installer/*.exe
 rust-native/agoralink_media/target/
+
+# Local release, probe, and validation artifacts
+artifacts/
+rust-native/agoralink_media/*.pcm
+scripts/wgc_raii_validation/*.before_registry_fix_*
+
+# Local AI assistant workspace
+.agents/
