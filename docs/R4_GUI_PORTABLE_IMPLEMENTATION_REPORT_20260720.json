@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "report": "R4_GUI_PORTABLE_IMPLEMENTATION_REPORT_20260720",
+  "date": "2026-07-20",
+  "release": "R4",
+  "app_version": "v0.0.11",
+  "branch": "r4-default-adaptive-ladder",
+  "build_commit": "0e1f65988694f163a267db1802464fc39435265a",
+  "commits": [
+    {
+      "sha": "f662a8e408091b60613568f3072a8a522feeba3b",
+      "subject": "build: bundle R4 native media runtime"
+    },
+    {
+      "sha": "cbbb7aeec4780f56e167aa1698c843c322c43edb",
+      "subject": "test: verify r4_default GUI integration"
+    },
+    {
+      "sha": "0e1f65988694f163a267db1802464fc39435265a",
+      "subject": "test: add R4 GUI dual-host smoke harness"
+    }
+  ],
+  "git_push_performed": false,
+  "rust_source_modified": false,
+  "modified_files": [
+    "AgoraLink.spec",
+    "app_paths.py",
+    "main_kivy.py",
+    "screen_runtime.py",
+    "tests/test_screen_runtime_r4.py",
+    "scripts/package_r4_portable_20260720.ps1",
+    "scripts/r4_gui_smoke/Prepare-R4GuiSmoke.ps1",
+    "scripts/r4_gui_smoke/Collect-R4GuiSmoke.ps1",
+    "docs/R4_GUI_PORTABLE_BASELINE_20260720.txt",
+    "docs/R4_GUI_DUAL_HOST_SMOKE_20260720.txt",
+    "docs/R4_GUI_PORTABLE_IMPLEMENTATION_REPORT_20260720.md",
+    "docs/R4_GUI_PORTABLE_IMPLEMENTATION_REPORT_20260720.json"
+  ],
+  "native_runtime": {
+    "source_exe": "C:\\Users\\Attic\\Desktop\\U'W\\6.0\\UDP_Project\\app_RUDP\\AgoraLink\\rust-native\\agoralink_media\\target\\release\\agoralink_media.exe",
+    "source_pdb": "C:\\Users\\Attic\\Desktop\\U'W\\6.0\\UDP_Project\\app_RUDP\\AgoraLink\\rust-native\\agoralink_media\\target\\release\\agoralink_media.pdb",
+    "exe_size_bytes": 2143744,
+    "exe_sha256": "D0CEE722185FF1E294894557C008CA96B37FF8C75F909162DB7B658286C8AE9D",
+    "pdb_size_bytes": 7229440,
+    "pdb_sha256": "0761475AD6D852B4A55A02D05C51706FCC838F9F0BBDE2FB5D40135EA32ECC2E",
+    "bundled_exe": "_internal/tools/agoralink_media/agoralink_media.exe",
+    "bundled_pdb": "_internal/tools/agoralink_media/agoralink_media.pdb",
+    "hash_checked_before_capability_probe": true,
+    "hash_checked_before_launch": true,
+    "r3_forbidden_sha256": "55AA6B837D1CA2DFCF6362D8BEE3CFA5A9998DC8F769FD76A415DBE02DB44B05",
+    "r3_binary_found_in_portable": false,
+    "historical_binaries_deleted": false,
+    "historical_binary_policy": "preserved as user evidence; excluded by controlled staging and package scan"
+  },
+  "default_preset": {
+    "id": "r4_default",
+    "width": 1920,
+    "height": 1080,
+    "fps": 60,
+    "bitrate_mbps": 22,
+    "playout_delay_ms": 250,
+    "repair": "nack",
+    "adaptive_quality": "off",
+    "encoder": "auto",
+    "convert_backend": "auto",
+    "render_backend": "d3d11"
+  },
+  "verification": {
+    "fresh_config_default": "PASS",
+    "legacy_config_compatibility": "PASS",
+    "invalid_preset_fallback": "PASS",
+    "invalid_preset_warning_once": "PASS",
+    "invalid_preset_persistence": "PASS_CODE_PATH_VERIFIED",
+    "gui_command_construction": "PASS",
+    "python_py_compile": "PASS",
+    "gui_tests": {
+      "status": "PASS",
+      "passed": 10,
+      "failed": 0
+    },
+    "screen_runtime_self_test": {
+      "status": "PASS",
+      "checks": 44
+    },
+    "portable_native_self_test": "PASS",
+    "extracted_native_self_test": "PASS",
+    "portable_independent_launch": {
+      "status": "PASS",
+      "window_ready": true,
+      "close_main_window_requested": true,
+      "graceful_exit": true,
+      "exit_code": 0,
+      "new_crash_dumps": 0,
+      "residual_processes": 0,
+      "evidence": "_local_artifacts/R4_GUI_PORTABLE_20260720/independent_gui_launch/result.json"
+    }
+  },
+  "dual_host": {
+    "G1_gui_launch_and_defaults": "USER_EXECUTION_REQUIRED",
+    "G2_screen_share_start": "USER_EXECUTION_REQUIRED",
+    "G3_sender_stop": "USER_EXECUTION_REQUIRED",
+    "G4_restart": "USER_EXECUTION_REQUIRED",
+    "G5_receiver_stop": "USER_EXECUTION_REQUIRED",
+    "evidence_expected": [
+      "r4_gui_smoke_sender_R4_GUI_SMOKE_20260720_R1.zip",
+      "r4_gui_smoke_receiver_R4_GUI_SMOKE_20260720_R1.zip"
+    ]
+  },
+  "append_feature": {
+    "definition": "Selecting Send file again while a prior chat file transfer is active creates a separate message, transfer task, card, and worker path.",
+    "call_path": "send_file_to_current_chat -> _send_file_path_to_current_chat -> _start_file_transfer_for_message",
+    "protocol_changed": false,
+    "smoke_status": "USER_EXECUTION_REQUIRED"
+  },
+  "portable": {
+    "status": "PASS",
+    "directory": "C:\\Users\\Attic\\Desktop\\U'W\\6.0\\UDP_Project\\app_RUDP\\AgoraLink\\_local_artifacts\\R4_GUI_PORTABLE_20260720\\AgoraLink_R4_portable_20260720",
+    "zip": "C:\\Users\\Attic\\Desktop\\U'W\\6.0\\UDP_Project\\app_RUDP\\AgoraLink\\_local_artifacts\\R4_GUI_PORTABLE_20260720\\AgoraLink_R4_portable_20260720.zip",
+    "zip_size_bytes": 46120474,
+    "zip_sha256": "41CBAEE0ADC3F0F542811D783A7B84B66F1A011C56FD4F82D39FAEDD8B18E942",
+    "extracted_size_bytes": 102738988,
+    "extracted_file_count": 1486,
+    "manifest_payload_entries": 1484,
+    "gui_exe_sha256": "2FA0CC2C38AA28891D71096342422C4B82D315CEA381054381CA9EC8D54081FB",
+    "build_info_sha256": "23F01450702622010E4C54B34CBBDE54B5B56CAF65601FF9A46FB3D8AA48C36C",
+    "contents_manifest_sha256": "81901F94B88B7D2BF0AA564149C0A0637E12130F14745DC417C750C8867A3D94",
+    "native_entries": 2,
+    "ffmpeg_entries": 0,
+    "forbidden_artifact_count": 0,
+    "contents_manifest": "AgoraLink_R4_portable_20260720/PORTABLE_CONTENTS.json"
+  },
+  "build_environment": {
+    "python": "3.12.10",
+    "python_executable": "C:\\Users\\Attic\\Desktop\\U'W\\6.0\\UDP_Project\\app_RUDP\\.venv\\Scripts\\python.exe",
+    "kivy": "2.3.1",
+    "pyinstaller": "6.20.0",
+    "dependencies_installed_or_upgraded": false,
+    "initial_sandbox_fallback_attempt": "failed before release output because pywin32 .pth paths were unavailable; final project-venv build passed"
+  },
+  "known_non_blocking_items": [
+    "Dual-host G1-G5 requires two real Windows hosts.",
+    "Append transfer smoke and final file hash comparison require two real hosts.",
+    "Live native path/hash log validation occurs when G2 starts screen sharing.",
+    "The fixed R4 hash intentionally rejects an unapproved replacement native runtime."
+  ]
+}
