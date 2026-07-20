@@ -9,6 +9,7 @@ behavior.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -20,7 +21,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, TextIO
 
-from app_paths import debug_log_dir
+from app_paths import NATIVE_MEDIA_EXPECTED_SHA256, debug_log_dir
 from process_utils import popen_ffplay_windowed, popen_no_console, run_no_console
 from screen_control import DEFAULT_SCREEN_PORT
 from screen_profile import PROFILES_BY_NAME, ScreenProfile, profile_id_from_info
@@ -40,7 +41,7 @@ DEFAULT_NATIVE_SCREEN_PRESET = "r4_default"
 NATIVE_SCREEN_PRESETS: Dict[str, Dict[str, object]] = {
     "r4_default": {
         "id": "r4_default",
-        "label": "R4 Default: 1920x1080 60fps 22Mbps playout 250ms repair nack",
+        "label": "R4 Default: 1920x1080 60fps 22Mbps NACK adaptive off",
         "width": 1920,
         "height": 1080,
         "fps": 60,
@@ -48,6 +49,9 @@ NATIVE_SCREEN_PRESETS: Dict[str, Dict[str, object]] = {
         "playout_delay_ms": 250,
         "repair": "nack",
         "adaptive_quality": "off",
+        "encoder": "auto",
+        "convert_backend": "auto",
+        "render_backend": "d3d11",
     },
     "stable": {
         "id": "stable",
@@ -154,6 +158,51 @@ def native_screen_preset_info(value: object = None) -> Dict[str, object]:
     return dict(NATIVE_SCREEN_PRESETS[key])
 
 
+def native_media_file_identity(
+    path: object,
+    *,
+    expected_sha256: str = NATIVE_MEDIA_EXPECTED_SHA256,
+) -> Dict[str, object]:
+    candidate = Path(str(path or "")).expanduser()
+    expected = str(expected_sha256 or "").strip().upper()
+    result: Dict[str, object] = {
+        "path": str(candidate),
+        "exists": False,
+        "size_bytes": 0,
+        "sha256": "",
+        "expected_sha256": expected,
+        "hash_matches": False,
+        "error": "",
+    }
+    if not str(path or "").strip() or not candidate.is_file():
+        result["error"] = RUST_NATIVE_MISSING_MESSAGE
+        return result
+    try:
+        resolved = candidate.resolve()
+        digest = hashlib.sha256()
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        actual = digest.hexdigest().upper()
+        result.update(
+            {
+                "path": str(resolved),
+                "exists": True,
+                "size_bytes": int(resolved.stat().st_size),
+                "sha256": actual,
+                "hash_matches": bool(expected and actual == expected),
+            }
+        )
+        if expected and actual != expected:
+            result["error"] = (
+                "Rust native media executable hash mismatch: "
+                f"expected {expected}, got {actual}"
+            )
+    except Exception as exc:
+        result["error"] = f"Rust native media executable verification failed: {exc}"
+    return result
+
+
 class ScreenRuntime:
     def __init__(
         self,
@@ -194,6 +243,7 @@ class ScreenRuntime:
         self._wasapi_support_cache: Dict[str, bool] = {}
         self._dshow_audio_devices_cache: Dict[str, List[Dict[str, str]]] = {}
         self._native_audio_capabilities_cache: Dict[str, Dict[str, object]] = {}
+        self._native_identity_cache: Dict[tuple[str, int, int], Dict[str, object]] = {}
 
     def start_receiver(
         self,
@@ -468,6 +518,11 @@ class ScreenRuntime:
         self._close_process_log_file()
         log_file = self._open_process_log_file(tool_name)
         try:
+            identity = self._validated_native_media_identity(cmd[0] if cmd else "")
+            if log_file is not None:
+                log_file.write(f"[AgoraLink] native executable: {identity['path']}\n")
+                log_file.write(f"[AgoraLink] native executable sha256: {identity['sha256']}\n")
+                log_file.flush()
             proc = self._popen_factory(
                 cmd,
                 cwd=str(self.script_dir),
@@ -732,6 +787,12 @@ class ScreenRuntime:
         if not exe:
             unavailable["rust_audio_capability_error"] = RUST_NATIVE_MISSING_MESSAGE
             return unavailable
+        identity = self._native_media_identity(exe)
+        if not identity.get("hash_matches"):
+            unavailable["rust_audio_capability_error"] = str(
+                identity.get("error") or "Rust native media executable hash mismatch"
+            )
+            return unavailable
         if os.name != "nt":
             unavailable["rust_audio_capability_error"] = "Rust native system audio is only supported on Windows"
             return unavailable
@@ -776,7 +837,8 @@ class ScreenRuntime:
         package_info = self.screen_package_info()
         ffmpeg_ok = bool(ffmpeg)
         ffplay_ok = bool(ffplay)
-        native_ok = bool(native)
+        native_identity = self._native_media_identity(native)
+        native_ok = bool(native_identity.get("exists") and native_identity.get("hash_matches"))
         missing = []
         if not ffmpeg_ok:
             missing.append("ffmpeg")
@@ -792,6 +854,9 @@ class ScreenRuntime:
             "ffplay_path": str(ffplay or ""),
             "rust_native_path": str(native or ""),
             "native_media_path": str(native or ""),
+            "native_media_sha256": str(native_identity.get("sha256") or ""),
+            "native_media_expected_sha256": NATIVE_MEDIA_EXPECTED_SHA256,
+            "native_media_hash_matches": bool(native_identity.get("hash_matches")),
             "package_flavor": package_info["package_flavor"],
             "native_lite": package_info["native_lite"],
             "bundled_ffmpeg_available": package_info["bundled_ffmpeg_available"],
@@ -802,12 +867,13 @@ class ScreenRuntime:
             "native_screen_av_sync_supported": package_info["native_screen_av_sync_supported"],
             "rust_audio_capability_error": package_info["rust_audio_capability_error"],
             "error": "" if not missing else self._missing_tool_error(missing),
-            "rust_error": "" if native_ok else RUST_NATIVE_MISSING_MESSAGE,
+            "rust_error": "" if native_ok else str(native_identity.get("error") or RUST_NATIVE_MISSING_MESSAGE),
             "install_hint": FFMPEG_INSTALL_HINT,
         }
 
     def screen_package_info(self) -> Dict[str, object]:
         native = self._find_native_media_exe()
+        native_identity = self._native_media_identity(native)
         native_audio = self.native_audio_capabilities(native)
         bundled_ffmpeg = self._find_bundled_media_tool("ffmpeg")
         bundled_ffplay = self._find_bundled_media_tool("ffplay")
@@ -819,9 +885,12 @@ class ScreenRuntime:
         return {
             "package_flavor": package_flavor,
             "native_lite": package_flavor == NATIVE_LITE_FLAVOR,
-            "rust_native_available": bool(native),
-            "native_media_ok": bool(native),
+            "rust_native_available": bool(native_identity.get("exists") and native_identity.get("hash_matches")),
+            "native_media_ok": bool(native_identity.get("exists") and native_identity.get("hash_matches")),
             "rust_native_path": str(native or ""),
+            "rust_native_sha256": str(native_identity.get("sha256") or ""),
+            "rust_native_expected_sha256": NATIVE_MEDIA_EXPECTED_SHA256,
+            "rust_native_hash_matches": bool(native_identity.get("hash_matches")),
             "rust_audio_capture_available": bool(native_audio.get("rust_audio_capture_available")),
             "rust_audio_playback_available": bool(native_audio.get("rust_audio_playback_available")),
             "native_screen_av_sync_supported": bool(native_audio.get("native_screen_av_sync_supported")),
@@ -872,6 +941,8 @@ class ScreenRuntime:
             str(int(preset.get("playout_delay_ms") or 120)),
             "--repair",
             str(preset.get("repair") or "off"),
+            "--render-backend",
+            str(preset.get("render_backend") or "d3d11"),
         ]
         if bool(self._normalize_audio_config(audio, enabled_default=False).get("enabled")):
             cmd.extend(["--audio", "on"])
@@ -909,6 +980,10 @@ class ScreenRuntime:
             str(preset.get("repair") or "nack"),
             "--adaptive-quality",
             str(preset.get("adaptive_quality") or "off"),
+            "--encoder",
+            str(preset.get("encoder") or "auto"),
+            "--convert-backend",
+            str(preset.get("convert_backend") or "auto"),
         ]
         if bool(self._normalize_audio_config(audio, enabled_default=False).get("enabled")):
             cmd.extend(["--audio", "system"])
@@ -1375,17 +1450,40 @@ class ScreenRuntime:
     def _native_media_dirs(self) -> List[Path]:
         dirs: List[Path] = []
         exe_dir = Path(sys.executable).resolve().parent
-        dirs.append(exe_dir / "_internal" / "tools" / "agoralink_media")
-        meipass = str(getattr(sys, "_MEIPASS", "") or "").strip()
-        if meipass:
-            dirs.append(Path(meipass) / "tools" / "agoralink_media")
-        # Source runs should exercise the current Rust release build. Frozen
-        # packages continue to prefer their intentionally bundled executable.
-        if not bool(getattr(sys, "frozen", False)):
+        if bool(getattr(sys, "frozen", False)):
+            dirs.append(exe_dir / "_internal" / "tools" / "agoralink_media")
+            meipass = str(getattr(sys, "_MEIPASS", "") or "").strip()
+            if meipass:
+                dirs.append(Path(meipass) / "tools" / "agoralink_media")
+            dirs.append(exe_dir / "tools" / "agoralink_media")
+        else:
             dirs.append(self.script_dir / "rust-native" / "agoralink_media" / "target" / "release")
-        dirs.append(exe_dir / "tools" / "agoralink_media")
         dirs.append(self.script_dir / "tools" / "agoralink_media")
         return dirs
+
+    def _native_media_identity(self, path: object) -> Dict[str, object]:
+        raw = str(path or "").strip()
+        if not raw:
+            return native_media_file_identity("")
+        candidate = Path(raw)
+        try:
+            stat = candidate.stat()
+            key = (str(candidate.resolve()), int(stat.st_size), int(stat.st_mtime_ns))
+        except Exception:
+            return native_media_file_identity(candidate)
+        cached = self._native_identity_cache.get(key)
+        if cached is None:
+            cached = native_media_file_identity(candidate)
+            self._native_identity_cache = {key: dict(cached)}
+        return dict(cached)
+
+    def _validated_native_media_identity(self, path: object) -> Dict[str, object]:
+        identity = self._native_media_identity(path)
+        if not identity.get("exists"):
+            raise FileNotFoundError(str(identity.get("error") or RUST_NATIVE_MISSING_MESSAGE))
+        if not identity.get("hash_matches"):
+            raise RuntimeError(str(identity.get("error") or "Rust native media executable hash mismatch"))
+        return identity
 
     @staticmethod
     def _tool_executable_names(name: str) -> List[str]:

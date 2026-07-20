@@ -13,6 +13,9 @@ from typing import Dict, Optional
 
 APP_NAME = "AgoraLink"
 APP_VERSION = "v0.0.11"
+BUILD_LABEL = "R4"
+BUILD_DATE = "2026-07-20"
+NATIVE_MEDIA_EXPECTED_SHA256 = "D0CEE722185FF1E294894557C008CA96B37FF8C75F909162DB7B658286C8AE9D"
 IS_WINDOWS = os.name == "nt"
 FROZEN = bool(getattr(sys, "frozen", False))
 APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
@@ -53,6 +56,9 @@ def get_app_info(*, version: str = APP_VERSION, git_commit: Optional[str] = None
     return {
         "app": APP_NAME,
         "version": str(version or APP_VERSION),
+        "build_label": BUILD_LABEL,
+        "build_date": BUILD_DATE,
+        "native_media_expected_sha256": NATIVE_MEDIA_EXPECTED_SHA256,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "python": sys.version,
         "python_executable": sys.executable,

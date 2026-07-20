@@ -6246,6 +6246,8 @@ class RUDPTransferRoot(BoxLayout):
             f"ffmpeg_path: {deps.get('ffmpeg_path') or ''}\n"
             f"ffplay_path: {deps.get('ffplay_path') or ''}\n"
             f"rust_native_path: {deps.get('rust_native_path') or deps.get('native_media_path') or ''}\n"
+            f"rust_native_sha256: {deps.get('native_media_sha256') or ''}\n"
+            f"rust_native_hash_matches: {bool(deps.get('native_media_hash_matches'))}\n"
             f"native_stats: fps={native_stats.get('fps') or native_stats.get('fps_render') or ''} mbps={native_stats.get('mbps') or ''} frames_sent={native_stats.get('frames_sent') or ''} frames_rendered={native_stats.get('frames_rendered') or ''} packets_lost={native_stats.get('packets_lost_estimate') or ''} decoder_errors={native_stats.get('decoder_errors') or ''}\n"
             f"last_error: {state.get('last_error') or ''}\n"
             f"{self._format_udp_port_diagnostics(state)}"
@@ -6377,6 +6379,10 @@ class RUDPTransferRoot(BoxLayout):
             "dependencies": deps,
             "package_flavor": str(package_info.get("package_flavor") or ""),
             "rust_native_available": bool(package_info.get("rust_native_available") or package_info.get("rust_native_ok") or package_info.get("native_media_ok")),
+            "rust_native_path": str(package_info.get("rust_native_path") or ""),
+            "rust_native_sha256": str(package_info.get("rust_native_sha256") or ""),
+            "rust_native_expected_sha256": str(package_info.get("rust_native_expected_sha256") or ""),
+            "rust_native_hash_matches": bool(package_info.get("rust_native_hash_matches")),
             "rust_audio_capture_available": bool(package_info.get("rust_audio_capture_available")),
             "rust_audio_playback_available": bool(package_info.get("rust_audio_playback_available")),
             "native_screen_av_sync_supported": bool(package_info.get("native_screen_av_sync_supported")),
