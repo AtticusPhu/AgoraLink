@@ -218,7 +218,7 @@ function Write-PortableMetadata {
         release = $Release
         build_date = $BuildDate
         app_version = Get-AppVersion
-        package_flavor = "native_lite"
+        package_flavor = "native"
         git_branch = $GitBranch
         git_commit = $GitCommit
         native_exe_sha256 = $ExpectedNativeHash
@@ -309,12 +309,10 @@ $pdbHash = (Get-FileHash -LiteralPath $NativePdbSource -Algorithm SHA256).Hash.T
 Stage-NativeRuntime
 Invoke-PythonChecks -PythonExe $Python
 
-$oldFlavor = $env:AGORALINK_PACKAGE_FLAVOR
 $oldRuntimeDir = $env:AGORALINK_NATIVE_RUNTIME_DIR
 $oldKivyHome = $env:KIVY_HOME
 $oldCachePrefix = $env:PYTHONPYCACHEPREFIX
 try {
-    $env:AGORALINK_PACKAGE_FLAVOR = "native_lite"
     $env:AGORALINK_NATIVE_RUNTIME_DIR = $StageDir
     $env:KIVY_HOME = Join-Path $OutputRoot "kivy_home"
     $env:PYTHONPYCACHEPREFIX = Join-Path $OutputRoot "python_cache"
@@ -328,7 +326,6 @@ try {
     Invoke-Checked -FilePath $pyInstallerCommand.FilePath -Arguments $arguments -Step "PyInstaller R4 portable build"
 }
 finally {
-    $env:AGORALINK_PACKAGE_FLAVOR = $oldFlavor
     $env:AGORALINK_NATIVE_RUNTIME_DIR = $oldRuntimeDir
     $env:KIVY_HOME = $oldKivyHome
     $env:PYTHONPYCACHEPREFIX = $oldCachePrefix

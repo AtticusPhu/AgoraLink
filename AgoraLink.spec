@@ -86,13 +86,6 @@ fonts_dir = project_dir / 'assets' / 'fonts'
 if fonts_dir.exists():
     datas.append((str(fonts_dir), 'assets/fonts'))
 
-package_flavor = str(os.environ.get('AGORALINK_PACKAGE_FLAVOR') or '').strip().lower()
-include_ffmpeg = package_flavor != 'native_lite'
-
-ffmpeg_dir = project_dir / 'tools' / 'ffmpeg'
-if include_ffmpeg and ffmpeg_dir.exists():
-    datas.append((str(ffmpeg_dir), 'tools/ffmpeg'))
-
 rust_media_dir = Path(
     os.environ.get('AGORALINK_NATIVE_RUNTIME_DIR')
     or project_dir / 'rust-native' / 'agoralink_media' / 'target' / 'release'

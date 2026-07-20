@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.0.10",
+    [string]$Version = "0.0.12",
     [string]$Python = $env:PYTHON,
     [string]$PyInstaller = $env:PYINSTALLER,
     [string]$MakeNsis = $env:MAKENSIS
@@ -9,22 +9,20 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$Flavor = "native_lite"
 $ScriptDir = Split-Path -Parent $PSCommandPath
 $RepoRoot = (Resolve-Path -LiteralPath (Join-Path $ScriptDir "..")).Path
 $SpecPath = Join-Path $RepoRoot "AgoraLink.spec"
 $AppPaths = Join-Path $RepoRoot "app_paths.py"
 $InstallerDir = Join-Path $RepoRoot "installer"
-$NsisScript = Join-Path $InstallerDir "AgoraLink_Native_Lite.nsi"
+$NsisScript = Join-Path $InstallerDir "AgoraLink.nsi"
 $DistDir = Join-Path $RepoRoot "dist"
 $DistAppDir = Join-Path $DistDir "AgoraLink"
 $AppExe = Join-Path $DistAppDir "AgoraLink.exe"
 $RustMediaCrateDir = Join-Path $RepoRoot "rust-native\agoralink_media"
 $RustMediaExe = Join-Path $RustMediaCrateDir "target\release\agoralink_media.exe"
 $DistRustMediaExe = Join-Path $DistAppDir "_internal\tools\agoralink_media\agoralink_media.exe"
-$DistFfmpegDir = Join-Path $DistAppDir "_internal\tools\ffmpeg"
-$InstallerExe = Join-Path $DistDir "AgoraLink_Native_Lite_Setup_v$Version.exe"
-$PortableZip = Join-Path $DistDir "AgoraLink_native_lite_v$Version.zip"
+$InstallerExe = Join-Path $DistDir "AgoraLink_Setup_v$Version.exe"
+$PortableZip = Join-Path $DistDir "AgoraLink_v$Version`_portable.zip"
 $ResolvedPyInstallerInvocation = $null
 
 if ($Version -notmatch '^\d+\.\d+\.\d+$') {
@@ -228,7 +226,7 @@ function Invoke-PyInstaller {
     Invoke-Checked `
         -FilePath $script:ResolvedPyInstallerInvocation["FilePath"] `
         -Arguments $arguments `
-        -Step "PyInstaller Native Lite"
+        -Step "PyInstaller native package"
 }
 
 function Invoke-RustMediaBuild {
@@ -256,8 +254,7 @@ function Invoke-PyCompile {
         "main_kivy.py",
         "screen_runtime.py",
         "screen_control.py",
-        "screen_share_presenter.py",
-        "screen_capability.py"
+        "screen_share_presenter.py"
     ) | ForEach-Object { Join-Path $RepoRoot $_ }
 
     foreach ($file in $pyFiles) {
@@ -284,48 +281,6 @@ function Invoke-PyCompile {
     }
 }
 
-function Remove-BundledFfmpeg {
-    if (Test-Path -LiteralPath $DistFfmpegDir) {
-        $resolved = (Resolve-Path -LiteralPath $DistFfmpegDir).Path
-        $distRoot = (Resolve-Path -LiteralPath $DistAppDir).Path
-        if (-not $resolved.StartsWith($distRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "Refusing to remove path outside dist app dir: $resolved"
-        }
-        Remove-Item -LiteralPath $resolved -Recurse -Force
-    }
-}
-
-function Assert-NoFfmpegBinaries {
-    param([string]$Root)
-    $bad = @()
-    foreach ($name in @("ffmpeg.exe", "ffplay.exe", "ffprobe.exe")) {
-        $bad += @(Get-ChildItem -LiteralPath $Root -Recurse -Filter $name -File -ErrorAction SilentlyContinue)
-    }
-    if ($bad.Count -gt 0) {
-        $paths = ($bad | ForEach-Object { $_.FullName }) -join "`n"
-        throw "Native Lite package contains forbidden FFmpeg binaries:`n$paths"
-    }
-}
-
-function Assert-ZipNoFfmpegBinaries {
-    param([string]$ZipPath)
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
-    try {
-        $bad = @($zip.Entries | Where-Object {
-            $name = [System.IO.Path]::GetFileName($_.FullName)
-            $name -in @("ffmpeg.exe", "ffplay.exe", "ffprobe.exe")
-        })
-        if ($bad.Count -gt 0) {
-            $paths = ($bad | ForEach-Object { $_.FullName }) -join "`n"
-            throw "Native Lite portable zip contains forbidden FFmpeg binaries:`n$paths"
-        }
-    }
-    finally {
-        $zip.Dispose()
-    }
-}
-
 function Format-ArtifactSize {
     param([string]$Path)
     $item = Get-Item -LiteralPath $Path
@@ -340,7 +295,7 @@ try {
     Assert-File $NsisScript
     Assert-File (Join-Path $RepoRoot "main_kivy.py")
     Assert-PackageVersionMatchesSource
-    Write-Host "==> Native Lite version: $Version"
+    Write-Host "==> Native package version: $Version"
 
     $Python = Resolve-Python
     $script:ResolvedPyInstallerInvocation = Resolve-PyInstallerInvocation
@@ -356,24 +311,10 @@ try {
         Remove-Item -LiteralPath $resolvedDistApp -Recurse -Force
     }
 
-    $oldFlavor = $env:AGORALINK_PACKAGE_FLAVOR
-    try {
-        $env:AGORALINK_PACKAGE_FLAVOR = $Flavor
-        Invoke-PyInstaller
-    }
-    finally {
-        if ($null -eq $oldFlavor) {
-            Remove-Item Env:\AGORALINK_PACKAGE_FLAVOR -ErrorAction SilentlyContinue
-        }
-        else {
-            $env:AGORALINK_PACKAGE_FLAVOR = $oldFlavor
-        }
-    }
+    Invoke-PyInstaller
 
     Assert-File $AppExe
     Assert-File $DistRustMediaExe
-    Remove-BundledFfmpeg
-    Assert-NoFfmpegBinaries -Root $DistAppDir
 
     $makensisExe = Resolve-MakeNsis -Requested $MakeNsis
     Push-Location $InstallerDir
@@ -382,11 +323,10 @@ try {
             -FilePath $makensisExe `
             -Arguments @(
                 "/DAPP_VERSION=$Version",
-                "/DAPP_DISPLAY_NAME=AgoraLink Native Lite v$Version",
-                "/DNATIVE_LITE_OUTFILE=..\dist\AgoraLink_Native_Lite_Setup_v$Version.exe",
-                "AgoraLink_Native_Lite.nsi"
+                "/DINSTALLER_OUTFILE=..\dist\AgoraLink_Setup_v$Version.exe",
+                "AgoraLink.nsi"
             ) `
-            -Step "NSIS Native Lite"
+            -Step "NSIS native package"
     }
     finally {
         Pop-Location
@@ -399,12 +339,10 @@ try {
     }
     Compress-Archive -Path (Join-Path $DistAppDir "*") -DestinationPath $PortableZip -CompressionLevel Optimal
     Assert-File $PortableZip
-    Assert-ZipNoFfmpegBinaries -ZipPath $PortableZip
 
     Write-Host "==> Final artifact checks"
     Assert-File $AppExe
     Assert-File $DistRustMediaExe
-    Assert-NoFfmpegBinaries -Root $DistAppDir
 
     Write-Host "==> SHA256"
     foreach ($artifact in @($InstallerExe, $PortableZip)) {
@@ -412,7 +350,7 @@ try {
         Write-Output ("{0}  {1}" -f $hash.Hash, $hash.Path)
     }
 
-    Write-Host "==> Native Lite release package complete"
+    Write-Host "==> Native release package complete"
     Write-Host (Format-ArtifactSize $AppExe)
     Write-Host (Format-ArtifactSize $DistRustMediaExe)
     Write-Host (Format-ArtifactSize $InstallerExe)

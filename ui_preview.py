@@ -195,7 +195,7 @@ def build_right_panel(theme: Theme) -> uc.RoundedCard:
         uc.ScreenShareCard(
             title="Screen runtime",
             peer="Watching Ming",
-            detail="ffplay window visible · port 50021",
+            detail="native viewer active · port 55021",
             status_text="Active",
             status="accent",
         )

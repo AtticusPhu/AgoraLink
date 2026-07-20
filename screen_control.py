@@ -2,8 +2,8 @@
 """AgoraLink screen sharing control message format.
 
 This module only builds and validates control messages. Delivery is expected
-to use AgoraLink's existing chat message channel. Video remains FFmpeg/UDP and
-does not enter the RUDP file transfer queue.
+to use AgoraLink's existing chat message channel. Native media remains on its
+dedicated UDP path and does not enter the RUDP file transfer queue.
 """
 
 from __future__ import annotations
@@ -22,10 +22,9 @@ SCREEN_SHARE_STOP = "SCREEN_SHARE_STOP"
 SCREEN_SHARE_STATE = "SCREEN_SHARE_STATE"
 
 SCREEN_CONTROL_VERSION = 1
-DEFAULT_SCREEN_PORT = 50020
-SCREEN_BACKEND_FFMPEG = "ffmpeg"
+DEFAULT_SCREEN_PORT = 55000
 SCREEN_BACKEND_RUST = "rust"
-SCREEN_BACKENDS = frozenset({SCREEN_BACKEND_FFMPEG, SCREEN_BACKEND_RUST})
+SCREEN_BACKENDS = frozenset({SCREEN_BACKEND_RUST})
 
 SCREEN_CONTROL_TYPES = frozenset(
     {
@@ -123,7 +122,7 @@ def _backend_config(value: object) -> str:
         return ""
     backend = str(value or "").strip().lower()
     if backend not in SCREEN_BACKENDS:
-        raise ValueError("backend must be ffmpeg or rust")
+        raise ValueError("backend must be rust")
     return backend
 
 
@@ -401,7 +400,6 @@ __all__ = [
     "SCREEN_SHARE_STATE",
     "SCREEN_CONTROL_VERSION",
     "DEFAULT_SCREEN_PORT",
-    "SCREEN_BACKEND_FFMPEG",
     "SCREEN_BACKEND_RUST",
     "make_offer",
     "make_accept",

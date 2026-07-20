@@ -20,10 +20,10 @@ Degradation follows `Q0 -> Q1 -> Q2 -> Q3 -> Q4`; recovery follows the exact rev
 
 `--encoder auto` prefers Intel Quick Sync Video when available and retains the existing software fallback. `--convert-backend auto` prefers D3D11 and retains the existing CPU conversion fallback. These are preferences, not hardware guarantees.
 
-## v0.0.11 Focus
+## v0.0.12 Focus
 
 - Compact tool-style UI with lightweight About and Diagnostics information.
-- Rust native screen backend support for video-only screen sharing.
+- A single bundled Rust native media backend for screen sharing.
 - Native screen presets:
   - R4 Default: 1920x1080, 60fps, 22Mbps, 250ms playout, NACK repair
   - Legacy stable: 1280x720, 30fps, 20Mbps
@@ -31,13 +31,12 @@ Degradation follows `Q0 -> Q1 -> Q2 -> Q3 -> Q4`; recovery follows the exact rev
   - Experimental: 1920x1080, 60fps, 80Mbps, 300ms playout, NACK repair
 - Diagnostic bundle export with app version, package flavor, screen capability, recent non-sensitive logs, and a safe config snapshot.
 
-## Package Flavors
+## Native Media Runtime
 
-- Native Lite: Rust native video backend, no bundled FFmpeg, video-only screen sharing.
-- Full: includes the FFmpeg backend when packaged with FFmpeg tools.
-- Source: development checkout.
-
-System audio screen sharing requires the Full package with the FFmpeg backend. Native Lite remains video-only.
+Screen sharing uses the bundled `agoralink_media.exe` runtime. Video follows
+the WGC, D3D11, QSV/WMF, AGM1 UDP, WMF decode, and D3D11 render path. System
+audio is enabled only when the native runtime self-test reports capture and
+playback capability; otherwise screen sharing continues video-only.
 
 ## Diagnostics
 

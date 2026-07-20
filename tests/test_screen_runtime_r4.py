@@ -146,9 +146,7 @@ class R4NativeScreenPresetTests(unittest.TestCase):
     def test_missing_native_binary_has_product_error(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             runtime = ScreenRuntime(script_dir=Path(raw_root), tool_finder=lambda _name: "")
-            with mock.patch.object(sys, "frozen", False, create=True), mock.patch(
-                "screen_runtime.shutil.which", return_value=None
-            ):
+            with mock.patch.object(sys, "frozen", False, create=True):
                 with self.assertRaisesRegex(FileNotFoundError, "Rust native media executable not found"):
                     runtime._build_native_sender_command(host="192.0.2.10", port=55134)
 
