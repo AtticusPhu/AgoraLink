@@ -1,0 +1,108 @@
+AgoraLink R4 GUI / Portable baseline
+Captured: 2026-07-20 Asia/Shanghai
+
+branch
+------
+r4-default-adaptive-ladder
+
+head
+----
+ad23a3c2daf08868afd2784fcb4b8e476458ce64
+
+recent commits
+--------------
+ad23a3c test: add R4 regression evidence
+c8f6c8a docs: document R4 screen defaults and adaptive policy
+c0fbdf2 feat: add R4 default screen preset
+0d13bfd feat: apply resolution-first adaptive ladder
+a286f92 refactor: model explicit R4 adaptive profiles
+acf778c feat: set R4 native screen-send defaults
+dede316 test: define R4 default and adaptive ladder policy
+db44ee2 chore: checkpoint verified R3 source baseline
+5315a09 Add Rust native AV code audit
+da38dd2 Show version and package details in settings
+58c5baa Prepare v0.0.10 Native Lite release
+4ddaf7d Clean repository metadata and ignored build outputs
+
+pre-existing worktree state (preserved; excluded from R4 GUI commits/package)
+----------------------------------------------------------------------------
+ M .gitignore
+ D docs/R3_SOURCE_BASELINE_20260717.json
+ D docs/R3_SOURCE_BASELINE_20260717.txt
+ D docs/R4_CLIPPY_BASELINE_COMPARISON_20260717.md
+ D docs/R4_CLIPPY_RAW_20260717.txt
+ D docs/R4_CLIPPY_TEST_RAW_20260717.txt
+ D docs/R4_CODEBASE_AUDIT_20260717.json
+ D docs/R4_CODEBASE_AUDIT_20260717.md
+ D docs/R4_IMPLEMENTATION_REPORT_20260717.json
+ D docs/R4_IMPLEMENTATION_REPORT_20260717.md
+ D docs/RUST_NATIVE_AV_CODE_AUDIT.md
+?? artifacts/
+?? rust-native/agoralink_media/audio_probe.pcm
+?? scripts/wgc_raii_validation/Run-AgoraLink-Stage6-Admin.ps1.before_registry_fix_20260717
+
+tracked diff summary before this task
+-------------------------------------
+.gitignore: 8 inserted lines
+10 R3/R4/audit evidence documents: deleted by existing user worktree state
+RUST_NATIVE_AV_CODE_AUDIT.md: deleted by existing user worktree state
+No product Python or Rust source file had an uncommitted content diff.
+
+untracked files before this task
+--------------------------------
+artifacts/agoralink_media_test_av_core_verified_20260711_v2/**
+artifacts/agoralink_media_test_av_core_verify_20260711/**
+rust-native/agoralink_media/audio_probe.pcm
+scripts/wgc_raii_validation/Run-AgoraLink-Stage6-Admin.ps1.before_registry_fix_20260717
+
+native binary source matrix
+---------------------------
+RELEASE INPUT (unique authoritative source)
+  rust-native/agoralink_media/target/release/agoralink_media.exe
+  size=2143744
+  sha256=D0CEE722185FF1E294894557C008CA96B37FF8C75F909162DB7B658286C8AE9D
+  git_tracked=no
+  release_input=yes
+
+  rust-native/agoralink_media/target/release/agoralink_media.pdb
+  size=7229440
+  sha256=0761475AD6D852B4A55A02D05C51706FCC838F9F0BBDE2FB5D40135EA32ECC2E
+  git_tracked=no
+  release_input=yes
+
+CURRENT STALE COPIES (must be replaced by packaging; never release inputs)
+  dist/AgoraLink/_internal/tools/agoralink_media/agoralink_media.exe
+  size=1432064
+  sha256=C56D71A3D86BE8D46AE45B39D8F77044D92ACDFC38B6CF42522C55377A216408
+  release_input=no
+
+  tools/agoralink_media/agoralink_media.exe
+  size=817664
+  sha256=D8CBDFC911E7D10B6103DDC25F354BE9BA7316ABC232A10D031E91C00D38BB49
+  release_input=no
+
+HISTORICAL / TEST COPIES (excluded from package discovery and release input)
+  artifacts/agoralink_media_test_av_core_verified_20260711_v2/payload/.bin/agoralink_media.exe
+  sha256=BA71AEC423093BE79E958F3E1085A20ADDCEDBE485572B4D7FDCE8A542A72418
+
+  artifacts/agoralink_media_test_av_core_verify_20260711/payload/.bin/agoralink_media.exe
+  sha256=12E35CCB7C767ED160A982610B3B2CC83A28793E794C96BCCFF27DDD2640F4A1
+
+  _local_artifacts/agoralink_media_r4_20260720/agoralink_media.bin
+  sha256=D0CEE722185FF1E294894557C008CA96B37FF8C75F909162DB7B658286C8AE9D
+  release_input=no (manual-transfer artifact only)
+
+  _local_artifacts/agoralink_media_r4_20260720/agoralink_media.pdb
+  sha256=0761475AD6D852B4A55A02D05C51706FCC838F9F0BBDE2FB5D40135EA32ECC2E
+  release_input=no
+
+DEBUG COPIES (excluded)
+  rust-native/agoralink_media/target/debug/agoralink_media.exe
+  sha256=A2E037C47BAD78BD0B451000A8579FC100F2C3A5F05BF531691DFFCAB762FEBF
+
+guardrails
+----------
+- Do not reset, restore, clean, or delete the pre-existing worktree state.
+- Do not use dist/, tools/agoralink_media/, artifacts/, or _local_artifacts history as release input.
+- Do not modify rust-native/agoralink_media/src/**.
+- Do not push or create a remote pull request.
