@@ -1,0 +1,63 @@
+{
+  "type": "V0_0_12_VALIDATION_REPORT",
+  "date": "2026-07-20",
+  "branch": "audit-fixes-v0.0.12",
+  "deterministic_gates": {
+    "rust_fmt": "PASS",
+    "rust_check": "PASS",
+    "rust_test_debug": {"status": "PASS", "passed": 141, "failed": 0},
+    "rust_test_release": {"status": "PASS", "passed": 141, "failed": 0},
+    "rust_clippy_debug": "PASS",
+    "rust_clippy_release": "PASS",
+    "rust_doc": "PASS",
+    "rust_build_release": "PASS",
+    "rust_self_test": "PASS",
+    "python_compileall": "PASS",
+    "python_pip_check": "PASS",
+    "python_test_discovery": {"status": "PASS", "count": 30},
+    "python_tests": {"status": "PASS", "passed": 30, "failed": 0},
+    "python_runtime_self_test": {"status": "PASS", "checks": 18},
+    "powershell_parse": {"status": "PASS", "files": 18},
+    "json_parse": {"status": "PASS", "files": 5}
+  },
+  "toolchains": {
+    "rust": "rustc 1.96.0 stable-x86_64-pc-windows-msvc",
+    "python": "CPython 3.12.10 x64",
+    "dependencies": "exact runtime/build locks"
+  },
+  "clippy_strict_baseline": {
+    "status": "EXISTING_DEBT_UNCHANGED",
+    "binary_diagnostics": 68,
+    "test_diagnostics": 70,
+    "delta": 0
+  },
+  "portable_dry_run": {
+    "status": "PASS",
+    "size_bytes": 43626711,
+    "sha256": "60D4E040379F1DFA00894767A81BE924E3A7C2C33896CF75073DD71053DBF941",
+    "pdb_count": 0,
+    "external_media_file_count": 0,
+    "source_file_count": 0,
+    "privacy_scan": "PASS",
+    "extracted_privacy_scan": "PASS",
+    "native_self_test": "PASS",
+    "third_party_build_path_file_count": 8
+  },
+  "symbols": {
+    "status": "NOT_CREATED_PRIVACY_GATE",
+    "finding": "local_user_path",
+    "publishable": false
+  },
+  "process_and_crash": {
+    "residual_media_processes": 0,
+    "new_dump_candidates": 0
+  },
+  "ci": "CONFIGURED_NOT_RUN_NO_PUSH",
+  "manual_not_run": [
+    "real WGC capture",
+    "real QSV encoding",
+    "real D3D11 window rendering",
+    "dual-host LAN",
+    "live GUI file append"
+  ]
+}

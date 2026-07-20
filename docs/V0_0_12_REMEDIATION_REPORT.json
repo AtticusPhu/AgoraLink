@@ -1,0 +1,49 @@
+{
+  "type": "V0_0_12_REMEDIATION_REPORT",
+  "date": "2026-07-20",
+  "baseline": "c0e7bc5",
+  "branch": "audit-fixes-v0.0.12",
+  "status": "V0_0_12_REMEDIATION_COMPLETE",
+  "batches": [
+    {"batch": 1, "commit": "eab775b", "status": "PASS", "scope": "media control and reassembly input bounds"},
+    {"batch": 2, "commit": "775549d", "status": "PASS", "scope": "native-only media runtime"},
+    {"batch": 3, "commit": "f00f6c1", "status": "PASS", "scope": "graceful native screen shutdown"},
+    {"batch": 4, "commit": "b3783c1", "status": "PASS", "scope": "deterministic Python validation"},
+    {"batch": 5, "commit": "4915c40", "status": "PASS", "scope": "locked Windows CI"},
+    {"batch": 6, "commit": "5817853", "status": "PASS", "scope": "portable and symbols privacy"},
+    {"batch": 7, "commit": null, "status": "PASS", "scope": "release evidence"}
+  ],
+  "controls": {
+    "udp_control_hardening": "PASS",
+    "reassembly_budget": "PASS",
+    "short_datagram_fix": "PASS",
+    "external_media_runtime_removed": "PASS",
+    "legacy_config_migration": "PASS",
+    "graceful_gui_stop": "PASS",
+    "forced_kill_is_last_resort": "PASS",
+    "python_discovery": "PASS",
+    "portable_privacy_gate": "PASS"
+  },
+  "preserved": [
+    "r4_default",
+    "adaptive quality ladder",
+    "AGM1 video wire format",
+    "DATA/FEC/NACK wire format",
+    "MPRF/MPAK profile transition",
+    "STREAM_CLOSE/ACK wire format",
+    "chat/file transfer/discovery/database contracts"
+  ],
+  "not_run": [
+    "dual-host LAN",
+    "real WGC capture",
+    "real QSV encode",
+    "real D3D11 render window",
+    "live GUI file append smoke"
+  ],
+  "deferred": {
+    "architecture_split": "deferred to architecture-cleanup-r5",
+    "license": "USER_DECISION_REQUIRED",
+    "branch_protection": "NOT_APPLIED_NO_PUSH"
+  },
+  "git_push": false
+}

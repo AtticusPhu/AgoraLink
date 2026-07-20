@@ -1,0 +1,35 @@
+{
+  "type": "V0_0_12_PORTABLE_REPORT",
+  "date": "2026-07-20",
+  "branch": "audit-fixes-v0.0.12",
+  "status": "PENDING_FINAL_RELEASE_BUILD",
+  "final_asset": {
+    "path": null,
+    "size_bytes": null,
+    "sha256": null,
+    "source_commit": null
+  },
+  "dry_run": {
+    "status": "PASS",
+    "python": "CPython 3.12.10 x64",
+    "files_scanned": 1441,
+    "zip_entries": 1454,
+    "size_bytes": 43626711,
+    "sha256": "60D4E040379F1DFA00894767A81BE924E3A7C2C33896CF75073DD71053DBF941",
+    "pdb_files": 0,
+    "external_media_files": 0,
+    "source_files": 0,
+    "staging_privacy_scan": "PASS",
+    "extracted_privacy_scan": "PASS",
+    "native_self_test": "PASS",
+    "local_path_findings": 0,
+    "third_party_build_path_file_count": 8
+  },
+  "symbols": {
+    "asset": null,
+    "status": "NOT_CREATED_PRIVACY_GATE",
+    "pdb_publishable": false,
+    "findings": ["local_user_path"]
+  },
+  "license": "USER_DECISION_REQUIRED"
+}

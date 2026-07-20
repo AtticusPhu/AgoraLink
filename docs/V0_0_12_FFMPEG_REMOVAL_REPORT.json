@@ -1,0 +1,41 @@
+{
+  "type": "V0_0_12_FFMPEG_REMOVAL_REPORT",
+  "date": "2026-07-20",
+  "status": "PASS",
+  "removed": {
+    "runtime_paths": true,
+    "ui_options": true,
+    "capability_probe": true,
+    "command_builders": true,
+    "process_lifecycle": true,
+    "packaging_entries": true,
+    "installer_guidance": true,
+    "path_discovery": true
+  },
+  "allowed_legacy_references": [
+    "config_migration.py",
+    "tests",
+    "historical changelog/audit documents",
+    "portable rejection scanner"
+  ],
+  "migration": {
+    "legacy_backends": ["ffmpeg", "external"],
+    "target_backend": "native",
+    "obsolete_keys_removed": true,
+    "warning_once": "legacy_ffmpeg_config_migrated_to_native",
+    "idempotent": true
+  },
+  "portable_dry_run": {
+    "ffmpeg_files": 0,
+    "ffprobe_files": 0,
+    "ffplay_files": 0,
+    "named_external_media_libraries": 0,
+    "external_media_bundle_directories": 0,
+    "staging_scan": "PASS",
+    "extracted_scan": "PASS"
+  },
+  "residual_media_processes_after_tests": 0,
+  "hardware_smoke": "NOT_RUN",
+  "dual_host_smoke": "NOT_RUN"
+}
+
