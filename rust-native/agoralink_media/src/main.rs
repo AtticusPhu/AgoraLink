@@ -341,7 +341,7 @@ fn main() {
                 );
                 process::exit(1);
             }
-            println!(r#"{{"type":"SELF_TEST","ok":true,"packet_format":"AGM1"}}"#);
+            println!("{}", self_test_success_json());
         }
         Ok(Command::Sender {
             host,
@@ -469,6 +469,18 @@ fn main() {
             process::exit(2);
         }
     }
+}
+
+fn self_test_success_json() -> String {
+    format!(
+        concat!(
+            r#"{{"type":"SELF_TEST","ok":true,"version":"{}","#,
+            r#""packet_format":"AGM1","capabilities":{{"#,
+            r#""screen_send":true,"screen_recv":true,"audio_send":true,"#,
+            r#""audio_recv_play":true,"hardware_runtime_probe_required":true}}}}"#
+        ),
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 fn parse_args(args: Vec<String>) -> Result<Command, String> {
@@ -3056,5 +3068,21 @@ mod media_packet_boundary_tests {
         let max_legal = u16::try_from(MAX_VIDEO_PACKET_COUNT).unwrap();
         let packet = MediaPacket::decode(&encoded_packet_with_count(max_legal)).unwrap();
         assert_eq!(packet.packet_count, max_legal);
+    }
+}
+
+#[cfg(test)]
+mod self_test_output_tests {
+    use super::self_test_success_json;
+
+    #[test]
+    fn self_test_success_includes_version_and_capabilities() {
+        let output = self_test_success_json();
+
+        assert!(output.contains(r#""type":"SELF_TEST""#));
+        assert!(output.contains(r#""ok":true"#));
+        assert!(output.contains(concat!(r#""version":""#, env!("CARGO_PKG_VERSION"), r#"""#)));
+        assert!(output.contains(r#""capabilities":{"#));
+        assert!(output.contains(r#""hardware_runtime_probe_required":true"#));
     }
 }
