@@ -1,6 +1,6 @@
 # AgoraLink v0.0.12 Remediation Report
 
-Date: 2026-07-20
+Date: 2026-07-21
 
 Baseline: `c0e7bc5`
 
@@ -24,6 +24,8 @@ The requested source changes are complete. Deterministic Rust/Python/PowerShell 
 | 5 | `4915c40` | PASS | Locked environments and Windows CI definitions |
 | 6 | `5817853` | PASS | PDB separation, privacy gate, portable/symbol scripts |
 | 7 | `6655d75` | PASS | README, changelog, release and evidence reports |
+| 8 | `a54e38c` | PASS | Initial final-asset identity and evidence synchronization |
+| 9 | `163020b` | PASS | Exclude unused Kivy media providers and extend portable rejection rules |
 
 ## Input Boundary Hardening
 
@@ -73,6 +75,7 @@ The requested source changes are complete. Deterministic Rust/Python/PowerShell 
 ## Portable and Symbols
 
 - Public portable contains no PDB.
+- Optional Kivy file-video, ffpyplayer, and GStreamer providers are excluded from analysis/data and rejected by final-asset scanning.
 - Privacy checks run before compression and after independent extraction.
 - Output cleanup is marker-guarded and restricted to a child of `_local_artifacts`.
 - Explicit Python selection fails closed instead of silently using another interpreter.

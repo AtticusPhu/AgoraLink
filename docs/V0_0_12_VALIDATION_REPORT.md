@@ -1,6 +1,6 @@
 # AgoraLink v0.0.12 Validation Report
 
-Date: 2026-07-20
+Date: 2026-07-21
 
 Branch: `audit-fixes-v0.0.12`
 Validation type: deterministic local gates plus portable dry-run.
@@ -26,6 +26,7 @@ Validation type: deterministic local gates plus portable dry-run.
 | PowerShell parse | PASS | 18 tracked scripts/modules |
 | JSON parse | PASS | 5 tracked JSON files |
 | Portable dry-run | PASS | package, scan, extract, scan, self-test |
+| Final provider-hardened portable | PASS | native-only package, scan, extract, scan, self-test |
 | GitHub Actions execution | NOT_RUN | workflow added; branch not pushed |
 | Real WGC/QSV/D3D11 | NOT_RUN | hardware/manual gate |
 | Dual-host LAN | NOT_RUN | requires two real hosts |
@@ -98,17 +99,18 @@ This is dry-run evidence for Batch 6, not the final release asset. Final asset i
 
 ## Final Portable Evidence
 
-- Source commit: `6655d758281b0a7bed95845d83c58163b33350cd`.
-- ZIP size: 43,626,481 bytes.
-- ZIP SHA-256: `E16926EB865A2D9802AABE26B68718ACBFFA19271C4D8EFA838CCCAAA9A8AD6D`.
+- Source commit: `163020b50f071635febb5270983b6d424bbac582`.
+- ZIP size: 41,882,185 bytes.
+- ZIP SHA-256: `A87CDDA5A127BD4B4F57994A2FC5534FD1D122A2C75C9142AC53116D3F364701`.
 - Native executable SHA-256: `F0104BBC8946B6A03F8C7EEF7EB3CE03424C03B05F193989C320E3D509E1A5A6`.
-- Entries: 1,454.
-- PDB, source, and removed external-media named files: 0.
+- Entries: 1,447.
+- Files scanned in staging and extraction: 1,434 each.
+- PDB, source, removed-media, ffpyplayer, and GStreamer/gstplayer named files: 0.
 - Staging/extraction privacy scans and native self-tests: PASS.
 
 ## Privacy Notes
 
-The portable scan found no current user profile or source checkout prefix. Eight prebuilt third-party DLL/PYD files contain their vendors' upstream build-machine paths; these are recorded as provenance and are not local AgoraLink source paths.
+The final portable scan found no current user profile or source checkout prefix. Two prebuilt third-party DLL/PYD files contain their vendors' upstream build-machine paths; these are recorded as provenance and are not local AgoraLink source paths. The earlier Batch 6 dry-run recorded eight before unused Kivy media providers were excluded.
 
 The PDB privacy scan failed on local checkout/toolchain paths. That is expected fail-closed behavior; no public symbols ZIP was produced.
 

@@ -1,6 +1,6 @@
 {
   "type": "V0_0_12_FFMPEG_REMOVAL_REPORT",
-  "date": "2026-07-20",
+  "date": "2026-07-21",
   "status": "PASS",
   "removed": {
     "runtime_paths": true,
@@ -10,7 +10,8 @@
     "process_lifecycle": true,
     "packaging_entries": true,
     "installer_guidance": true,
-    "path_discovery": true
+    "path_discovery": true,
+    "optional_kivy_media_providers": true
   },
   "allowed_legacy_references": [
     "config_migration.py",
@@ -31,6 +32,18 @@
     "ffplay_files": 0,
     "named_external_media_libraries": 0,
     "external_media_bundle_directories": 0,
+    "staging_scan": "PASS",
+    "extracted_scan": "PASS"
+  },
+  "portable_final": {
+    "source_commit": "163020b50f071635febb5270983b6d424bbac582",
+    "size_bytes": 41882185,
+    "sha256": "A87CDDA5A127BD4B4F57994A2FC5534FD1D122A2C75C9142AC53116D3F364701",
+    "zip_entries": 1447,
+    "ffmpeg_files": 0,
+    "ffprobe_files": 0,
+    "ffplay_files": 0,
+    "optional_kivy_media_provider_files": 0,
     "staging_scan": "PASS",
     "extracted_scan": "PASS"
   },

@@ -1,6 +1,6 @@
 {
   "type": "V0_0_12_VALIDATION_REPORT",
-  "date": "2026-07-20",
+  "date": "2026-07-21",
   "branch": "audit-fixes-v0.0.12",
   "deterministic_gates": {
     "rust_fmt": "PASS",
@@ -45,14 +45,17 @@
   },
   "portable_final": {
     "status": "PASS",
-    "source_commit": "6655d758281b0a7bed95845d83c58163b33350cd",
-    "size_bytes": 43626481,
-    "sha256": "E16926EB865A2D9802AABE26B68718ACBFFA19271C4D8EFA838CCCAAA9A8AD6D",
+    "source_commit": "163020b50f071635febb5270983b6d424bbac582",
+    "size_bytes": 41882185,
+    "sha256": "A87CDDA5A127BD4B4F57994A2FC5534FD1D122A2C75C9142AC53116D3F364701",
     "native_exe_sha256": "F0104BBC8946B6A03F8C7EEF7EB3CE03424C03B05F193989C320E3D509E1A5A6",
-    "zip_entries": 1454,
+    "zip_entries": 1447,
+    "files_scanned": 1434,
     "pdb_files": 0,
     "source_files": 0,
     "external_media_files": 0,
+    "optional_kivy_media_provider_files": 0,
+    "third_party_build_path_file_count": 2,
     "privacy_scan": "PASS",
     "extracted_verification": "PASS"
   },

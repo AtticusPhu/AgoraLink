@@ -1,6 +1,6 @@
 {
   "type": "V0_0_12_REMEDIATION_REPORT",
-  "date": "2026-07-20",
+  "date": "2026-07-21",
   "baseline": "c0e7bc5",
   "branch": "audit-fixes-v0.0.12",
   "status": "V0_0_12_REMEDIATION_COMPLETE",
@@ -11,7 +11,9 @@
     {"batch": 4, "commit": "b3783c1", "status": "PASS", "scope": "deterministic Python validation"},
     {"batch": 5, "commit": "4915c40", "status": "PASS", "scope": "locked Windows CI"},
     {"batch": 6, "commit": "5817853", "status": "PASS", "scope": "portable and symbols privacy"},
-    {"batch": 7, "commit": "6655d75", "status": "PASS", "scope": "release evidence"}
+    {"batch": 7, "commit": "6655d75", "status": "PASS", "scope": "release evidence"},
+    {"batch": 8, "commit": "a54e38c", "status": "PASS", "scope": "initial final-asset evidence synchronization"},
+    {"batch": 9, "commit": "163020b", "status": "PASS", "scope": "unused Kivy media provider exclusion"}
   ],
   "controls": {
     "udp_control_hardening": "PASS",
@@ -22,7 +24,8 @@
     "graceful_gui_stop": "PASS",
     "forced_kill_is_last_resort": "PASS",
     "python_discovery": "PASS",
-    "portable_privacy_gate": "PASS"
+    "portable_privacy_gate": "PASS",
+    "optional_kivy_media_providers_excluded": "PASS"
   },
   "preserved": [
     "r4_default",

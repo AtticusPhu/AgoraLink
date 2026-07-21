@@ -1,6 +1,6 @@
 # AgoraLink v0.0.12 FFmpeg Removal Report
 
-Date: 2026-07-20
+Date: 2026-07-21
 
 Decision: all AgoraLink media behavior uses the bundled native Windows runtime.
 
@@ -26,17 +26,21 @@ These migration literals are the only intentional production-code references to 
 ## Packaging
 
 - `AgoraLink.spec` requires and bundles only `agoralink_media.exe` for screen media.
+- Optional Kivy file-video, ffpyplayer, and GStreamer provider modules/data are excluded from PyInstaller analysis and data collection.
+- Post-build cleanup removes any Kivy video/GStreamer provider directories if a future hook reintroduces them.
 - Current v0.0.12 packaging does not inject an external tools directory or PATH entry.
 - Obsolete external-media packaging scripts and installer variant were removed or replaced by a native-only compatibility entry point.
 - The portable scan rejects removed executable/library names and directories.
 
 ## Repository Search
 
-Production search outside docs/history/tests reports only:
+Intentional production/build references outside docs/history/tests are limited to:
 
 ```text
 config_migration.py: legacy names/keys needed to remove old configuration
 scripts/Test-PortablePrivacy.ps1: forbidden artifact name pattern
+AgoraLink.spec: excluded optional media-provider module/data names
+scripts/package_release_v0_0_12.ps1: fail-closed cleanup paths
 ```
 
 No production command builder, runtime branch, UI control, spec data entry, current README instruction, or process lookup remains.
@@ -49,10 +53,13 @@ The v0.0.12 dry-run ZIP contained:
 - ffprobe executable count: 0.
 - ffplay executable count: 0.
 - `avcodec`/`avformat`/`avutil`/`swscale`/`swresample` named artifact count: 0.
+- `ffpyplayer`/`gstplayer`/`gstreamer` named artifact count: 0.
 - External media bundle directory count: 0.
 - PDB count: 0.
 
 Both staging and independently extracted trees passed the same scanner.
+
+The final provider-hardened ZIP contains 1,447 entries, is 41,882,185 bytes, and has SHA-256 `A87CDDA5A127BD4B4F57994A2FC5534FD1D122A2C75C9142AC53116D3F364701`.
 
 ## Process Evidence
 

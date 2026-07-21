@@ -7,7 +7,7 @@ AgoraLink is a Windows-focused LAN productivity tool for chat, file transfer, an
 - Windows 10/11 x64.
 - CPython 3.12 for source and build workflows.
 - The portable package includes the Rust `agoralink_media.exe` runtime.
-- Screen sharing is native-only; the application does not discover or launch an external media backend.
+- Screen sharing uses only the bundled native runtime.
 - Hardware encoding and D3D11 conversion are preferred when available, with the existing WMF/CPU native fallbacks retained.
 
 ## R4 Native Screen Policy
@@ -85,7 +85,7 @@ Build the v0.0.12 portable asset with:
 .\scripts\package_release_v0_0_12.ps1 -Python <locked-python-3.12>
 ```
 
-The public portable excludes PDB files, dumps, logs, user configuration, source files, test data, secrets, and removed external-media artifacts. Symbols are handled by a separate privacy-gated script and are not published when local build paths remain in the PDB.
+The public portable excludes PDB files, dumps, logs, user configuration, source files, test data, secrets, removed media artifacts, and unused Kivy video/GStreamer providers. Symbols are handled by a separate privacy-gated script and are not published when local build paths remain in the PDB.
 
 ## License
 

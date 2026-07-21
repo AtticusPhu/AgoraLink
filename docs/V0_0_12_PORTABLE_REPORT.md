@@ -1,6 +1,6 @@
 # AgoraLink v0.0.12 Portable Report
 
-Date: 2026-07-20
+Date: 2026-07-21
 
 Branch: `audit-fixes-v0.0.12`
 
@@ -8,16 +8,17 @@ Branch: `audit-fixes-v0.0.12`
 
 `PASS`
 
-The final public ZIP was built from clean source commit `6655d758281b0a7bed95845d83c58163b33350cd`. `BUILD_INFO.json` records that commit and CPython 3.12.10.
+The final public ZIP was built from clean source commit `163020b50f071635febb5270983b6d424bbac582`. `BUILD_INFO.json` records that commit and CPython 3.12.10.
 
 Final asset:
 
 - Path: `_local_artifacts/V0_0_12_RELEASE/AgoraLink_v0.0.12_portable.zip`.
-- Size: 43,626,481 bytes.
-- SHA-256: `E16926EB865A2D9802AABE26B68718ACBFFA19271C4D8EFA838CCCAAA9A8AD6D`.
+- Size: 41,882,185 bytes.
+- SHA-256: `A87CDDA5A127BD4B4F57994A2FC5534FD1D122A2C75C9142AC53116D3F364701`.
 - Native executable SHA-256: `F0104BBC8946B6A03F8C7EEF7EB3CE03424C03B05F193989C320E3D509E1A5A6`.
-- ZIP entries: 1,454.
-- PDB, source, and removed external-media named files: 0.
+- ZIP entries: 1,447.
+- Files scanned in staging and extracted trees: 1,434 each.
+- PDB, source, removed-media, ffpyplayer, and GStreamer/gstplayer named files: 0.
 - Staging/extraction privacy scans: PASS.
 - Native self-test before/after extraction: PASS.
 
@@ -51,10 +52,11 @@ Forbidden public contents:
 - Source version must equal v0.0.12.
 - Rust release build is locked/offline and uses path remapping for the public executable.
 - PyInstaller must produce one native runtime and no PDB.
+- PyInstaller excludes unused Kivy video and GStreamer provider modules/data; post-build cleanup and the privacy scanner enforce the same boundary.
 - Privacy scan runs on staging and independently extracted ZIP content.
 - Native `self-test` runs from staging and extracted content.
 
-## Dry-Run Evidence
+## Earlier Dry-Run Evidence
 
 - Python: official CPython 3.12.10 x64.
 - Files scanned: 1,441.
@@ -68,7 +70,7 @@ Forbidden public contents:
 - Extraction privacy scan: PASS.
 - Native self-test: PASS before and after extraction.
 - Local user/source paths: 0 findings.
-- Third-party upstream build-path provenance: 8 files, recorded but not local.
+- Third-party upstream build-path provenance: 8 files, recorded but not local. The final provider-hardened build reduced this to 2 files.
 
 ## Symbols
 

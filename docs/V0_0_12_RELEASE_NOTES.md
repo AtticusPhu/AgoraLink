@@ -1,6 +1,6 @@
 # AgoraLink v0.0.12 Release Notes
 
-Release date: 2026-07-20
+Release evidence finalized: 2026-07-21
 
 ## Summary
 
@@ -34,6 +34,7 @@ v0.0.12 hardens the native media control/reassembly boundaries, removes the exte
 - Runtime and build dependencies are exactly pinned; Rust uses a repository toolchain file.
 - Windows CI definitions cover static Rust, Python core, and PowerShell/schema checks.
 - The public portable excludes PDBs, dumps, logs, user configuration, source, test data, secrets, and removed media artifacts.
+- Unused Kivy file-video, ffpyplayer, and GStreamer provider modules/data are excluded from PyInstaller analysis and portable contents.
 - A separate symbols workflow refuses publication while local paths remain in the PDB.
 
 ## Known Release Gates
