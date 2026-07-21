@@ -17,6 +17,7 @@ import os
 import hashlib
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -24,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from app_paths import APP_DIR, APP_NAME, APP_VERSION, FROZEN, IS_WINDOWS, PACKAGE_FLAVOR, RESOURCE_DIR, debug_log_dir, temp_dir, user_data_dir
+from app_paths import APP_DIR, APP_NAME, APP_VERSION, BUILD_DATE, BUILD_LABEL, FROZEN, IS_WINDOWS, PACKAGE_FLAVOR, RESOURCE_DIR, debug_log_dir, temp_dir, user_data_dir
 from config_migration import MIGRATION_WARNING, migrate_legacy_media_config
 from file_transfer_presenter import (
     file_accepted_text,
@@ -120,6 +121,20 @@ def save_gui_config(data: Dict[str, object]) -> None:
         path.write_text(json.dumps(dict(data or {}), ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+def config_int(config: Dict[str, object], key: str, default: int) -> int:
+    try:
+        return int(config.get(key, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def config_float(config: Dict[str, object], key: str, default: float) -> float:
+    try:
+        return float(config.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def receiver_pin_file(ip: str, port: int) -> Path:
@@ -257,6 +272,7 @@ from kivy.animation import Animation
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.core.text import LabelBase, DEFAULT_FONT
+from kivy.core.clipboard import Clipboard
 from kivy.metrics import dp
 from kivy.properties import StringProperty, BooleanProperty, ObjectProperty
 from kivy.uix.boxlayout import BoxLayout
@@ -338,6 +354,15 @@ from chat_cards import (
     make_card,
     system_card,
 )
+from ui_about import build_about_context
+from ui_device_details import create_contact_details_popup
+from ui_diagnostics import create_diagnostics_popup
+from ui_group_management import create_group_management_popup
+from ui_form_components import ConfirmationDialog, ErrorStateDialog, SecondaryPopup
+from ui_screen_details import create_screen_share_details_popup
+from ui_settings import SettingsCenter
+from ui_settings_schema import merge_legacy_config
+from ui_transfer_details import create_file_transfer_details_popup
 try:
     from ui_components import (
         ConversationItem as UIConversationItem,
@@ -2143,6 +2168,34 @@ class RUDPTransferRoot(BoxLayout):
         self.chat_local_peer_id = os.environ.get("USERNAME") or "local"
         self.chat_nickname = os.environ.get("USERNAME") or "AgoraLinkUser"
         self.gui_config = load_gui_config()
+        saved_language = str(self.gui_config.get("language", self.lang) or self.lang).strip().lower()
+        self.lang = "en" if saved_language.startswith("en") else "zh"
+        self.app.lang = self.lang
+        self.theme_mode = self._normalize_theme_mode(self.gui_config.get("theme_mode", "system"))
+        self.device_display_name = str(
+            self.gui_config.get("device_display_name", self.chat_nickname) or self.chat_nickname
+        ).strip()
+        self.receiver_port_setting = config_int(self.gui_config, "receiver_port", MAIN_UDP_PORT)
+        self.discovery_port_setting = config_int(
+            self.gui_config, "discovery_port", DEFAULT_DISCOVERY_PORT
+        )
+        self.lan_discovery_enabled = bool(self.gui_config.get("lan_discovery_enabled", True))
+        self.start_receiver_on_unlock = bool(self.gui_config.get("start_receiver_on_unlock", True))
+        self.bind_address_setting = str(self.gui_config.get("bind_address", "0.0.0.0") or "0.0.0.0")
+        self.discovery_timeout_sec = config_float(self.gui_config, "discovery_timeout_sec", 20.0)
+        self.save_directory_setting = str(
+            self.gui_config.get("save_directory", user_data_dir() / "received")
+            or (user_data_dir() / "received")
+        )
+        self.file_conflict_policy = str(self.gui_config.get("file_conflict_policy", "auto") or "auto")
+        self.transfer_resume_enabled = bool(self.gui_config.get("transfer_resume_enabled", True))
+        self.transfer_payload_size = config_int(self.gui_config, "transfer_payload_size", 1400)
+        self.transfer_request_timeout_sec = config_float(
+            self.gui_config, "transfer_request_timeout_sec", 300
+        )
+        self.transfer_completion_timeout_sec = config_float(
+            self.gui_config, "transfer_completion_timeout_sec", 180
+        )
         self.auto_package_multi_selection = bool(self.gui_config.get("auto_package_multi_selection", True))
         saved_audio_enabled = bool(self.gui_config.get("screen_share_system_audio", False))
         self.screen_audio_mode = self._normalize_screen_audio_mode(
@@ -2217,6 +2270,8 @@ class RUDPTransferRoot(BoxLayout):
         self._chat_render_generation = 0
         self.pending_outgoing_contact_requests: Dict[str, Dict[str, object]] = {}
         self._build()
+        self._apply_saved_settings_to_widgets()
+        self.apply_theme_mode(self.theme_mode)
         self.refresh_texts()
         self.refresh_local_ips()
         Clock.schedule_interval(self.poll_approval_requests, 0.5)
@@ -2231,6 +2286,37 @@ class RUDPTransferRoot(BoxLayout):
     def cu(self, key: str, **kwargs) -> str:
         text = CHAT_UI_TEXT.get(self.lang, CHAT_UI_TEXT.get("zh", {})).get(key, key)
         return text.format(**kwargs) if kwargs else text
+
+    @staticmethod
+    def _normalize_theme_mode(value: object) -> str:
+        text = str(value or "system").strip().lower()
+        aliases = {
+            "跟随系统": "system",
+            "浅色": "light",
+            "深色": "dark",
+            "follow system": "system",
+        }
+        normalized = aliases.get(text, text)
+        return normalized if normalized in {"system", "light", "dark"} else "system"
+
+    def _apply_saved_settings_to_widgets(self) -> None:
+        widget_values = (
+            ("receiver_port", self.receiver_port_setting),
+            ("recv_port", self.receiver_port_setting),
+            ("discovery_port", self.discovery_port_setting),
+            ("recv_discovery_port", self.discovery_port_setting),
+            ("bind_input", self.bind_address_setting),
+            ("save_dir_input", self.save_directory_setting),
+            ("receiver_name_input", self.device_display_name),
+            ("payload_input", self.transfer_payload_size),
+            ("request_timeout_input", self.transfer_request_timeout_sec),
+            ("complete_timeout_input", self.transfer_completion_timeout_sec),
+            ("approval_timeout_input", self.transfer_request_timeout_sec),
+        )
+        for name, value in widget_values:
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.text = str(value)
 
     def _modern_button_style(self, role: str) -> Dict[str, object]:
         return modern_button_style(role)
@@ -3166,6 +3252,11 @@ class RUDPTransferRoot(BoxLayout):
             add_action(self.cu("ctx_rescan_ip"), lambda: self.search_receivers())
             add_action(self.cu("ctx_delete_friend"), lambda v=value: (self._select_chat_entry(v), self.confirm_delete_contact()), role="danger")
         elif value.startswith("group::"):
+            _tag, group_id, _title = value.split("::", 2)
+            add_action(
+                "管理群组" if self.lang == "zh" else "Manage group",
+                lambda gid=group_id: self.open_group_management_popup(gid),
+            )
             add_action(self.cu("ctx_join_group"), lambda v=value: (self._select_chat_entry(v), self.add_selected_contact_to_current_group()))
             add_action(self.cu("ctx_leave_group"), lambda v=value: (self._select_chat_entry(v), self.confirm_leave_group()), role="danger")
         else:
@@ -3184,21 +3275,49 @@ class RUDPTransferRoot(BoxLayout):
         contact = self.contact_service.find_contact(peer_id)
         if not contact:
             return
-        msg = (
-            f"{self.cu('contact')}: {contact.get('remark_name') or contact.get('display_name') or contact.get('nickname') or contact.get('peer_id')}\n"
-            f"{self.cu('peer_id')}: {contact.get('peer_id')}\n"
-            f"{self.cu('fingerprint')}: {self._short_fp(str(contact.get('fingerprint') or ''))}\n"
-            f"{self.cu('ip')}: {contact.get('peer_ip')}:{contact.get('peer_port')}\n"
-            f"{self.cu('state')}: {contact.get('trust_state')}\n"
+        contact = dict(contact)
+        contact["fingerprint"] = self._short_fp(str(contact.get("fingerprint") or ""))
+        contact["online"] = any(
+            self._device_peer_id(item) == peer_id for item in (self.discovered or [])
         )
-        content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
-        lab = make_label(text=msg, halign="left", valign="top")
-        bind_label_wrap(lab)
-        content.add_widget(lab)
-        btn = make_button("secondary", text="OK", size_hint_y=None, height=dp(38), on_release=lambda *_: popup.dismiss())
-        content.add_widget(btn)
-        popup = style_popup(Popup(title=self.cu("friend_info"), content=content, size_hint=(0.6, 0.5), auto_dismiss=True))
-        apply_ui_font(content)
+        holder: Dict[str, object] = {}
+
+        def _close() -> None:
+            popup = holder.get("popup")
+            if popup is not None:
+                popup.dismiss()
+
+        def _select() -> None:
+            self._select_chat_entry(f"direct::{peer_id}")
+
+        def _message() -> None:
+            _select()
+            _close()
+
+        def _send_file() -> None:
+            _select()
+            _close()
+            Clock.schedule_once(lambda _dt: self.send_file_to_current_chat(), 0)
+
+        def _share_screen() -> None:
+            _select()
+            _close()
+            Clock.schedule_once(lambda _dt: self._on_screen_share_button(), 0)
+
+        def _delete() -> None:
+            self._delete_contact_local(peer_id)
+            _close()
+
+        popup = create_contact_details_popup(
+            lang=self.lang,
+            contact=contact,
+            on_close=_close,
+            on_message=_message,
+            on_send_file=_send_file,
+            on_share_screen=_share_screen,
+            on_delete=_delete,
+        )
+        holder["popup"] = popup
         popup.open()
 
 
@@ -4059,6 +4178,15 @@ class RUDPTransferRoot(BoxLayout):
         detail_text = detail or self._file_size_detail(size)
         if display_name != name:
             detail_text = (detail_text + "  " if detail_text else "") + f"name: {name}"
+        card_actions = list(actions or [])
+        if message_id and len(card_actions) < 3:
+            card_actions.append(
+                {
+                    "label": "详情" if self.lang == "zh" else "Details",
+                    "action": f"file_details:{message_id}",
+                    "style": "secondary",
+                }
+            )
         card = make_card(
             CARD_FILE_OFFER,
             title=self._file_offer_title(),
@@ -4067,9 +4195,16 @@ class RUDPTransferRoot(BoxLayout):
             detail=detail_text,
             direction=direction,
             side=direction,
-            actions=actions or [],
+            actions=card_actions,
             card_id=f"file_transfer:{message_id or name}",
-            meta={"direction": direction, "side": direction},
+            meta={
+                "direction": direction,
+                "side": direction,
+                "file_name": name,
+                "size": int(size or 0),
+                "status": status,
+                "saved_path": file_path,
+            },
         )
         self._add_runtime_chat_card(card, message_id=message_id, peer_id=peer_id, group_id=group_id, conversation_id=conversation_id)
 
@@ -4125,6 +4260,14 @@ class RUDPTransferRoot(BoxLayout):
             card_actions.append({"label": "打开所在文件夹" if self.lang == "zh" else "Open folder", "action": f"open_folder:{saved_path}", "style": "secondary"})
         if direction == "outgoing" and message_id and is_failed_status(status_text, failed_label=self.cu("failed"), lang=self.lang):
             card_actions.append({"label": "继续传输" if self.lang == "zh" else "Resume", "action": f"retry_file:{message_id}", "style": "danger"})
+        if message_id and len(card_actions) < 3:
+            card_actions.append(
+                {
+                    "label": "详情" if self.lang == "zh" else "Details",
+                    "action": f"file_details:{message_id}",
+                    "style": "secondary",
+                }
+            )
         card = make_card(
             CARD_FILE_TRANSFER,
             title=title_text,
@@ -4135,7 +4278,19 @@ class RUDPTransferRoot(BoxLayout):
             side=direction,
             actions=card_actions,
             card_id=f"file_transfer:{message_id}",
-            meta={"direction": direction, "side": direction},
+            meta={
+                "direction": direction,
+                "side": direction,
+                "file_name": name,
+                "size": total,
+                "transferred": int(transferred or 0),
+                "progress": float(pct or 0.0),
+                "speed": f"{float(avg or 0.0):.2f} Mbps",
+                "eta": str(eta or ""),
+                "status": status_text,
+                "error": str(error or ""),
+                "saved_path": str(saved_path or ""),
+            },
         )
         self._add_runtime_chat_card(card, message_id=message_id, peer_id=peer_id, group_id=group_id, conversation_id=conversation_id)
 
@@ -4178,7 +4333,18 @@ class RUDPTransferRoot(BoxLayout):
             "peer_label": str(subtitle or "").strip(),
             "direction": card_direction,
             "side": card_direction,
+            "status": str(status or ""),
+            "detail": str(detail or ""),
         }
+        card_actions = list(actions or [])
+        if len(card_actions) < 3:
+            card_actions.append(
+                {
+                    "label": "详情" if self.lang == "zh" else "Details",
+                    "action": f"screen_details:{sid}",
+                    "style": "secondary",
+                }
+            )
         card = make_card(
             card_type,
             title=title,
@@ -4187,7 +4353,7 @@ class RUDPTransferRoot(BoxLayout):
             detail=detail,
             direction=card_direction,
             side=card_direction,
-            actions=actions or [],
+            actions=card_actions,
             card_id=f"screen_share:{sid}",
             meta=meta,
         )
@@ -4466,6 +4632,85 @@ class RUDPTransferRoot(BoxLayout):
     def _screen_offer_title(self) -> str:
         return screen_offer_title(self.lang)
 
+    def _runtime_chat_card(self, card_id: str) -> Dict[str, object]:
+        target = str(card_id or "")
+        for card in reversed(list(getattr(self, "chat_runtime_cards", []) or [])):
+            if str(card.get("card_id") or "") == target:
+                return dict(card)
+        return {}
+
+    def _open_file_transfer_details(self, message_id: str) -> None:
+        mid = str(message_id or "").strip()
+        card = self._runtime_chat_card(f"file_transfer:{mid}")
+        if not card:
+            return
+        meta = dict(card.get("meta") or {})
+        task = dict(self.file_message_tasks.get(mid, {}) or {})
+        size_value = int(meta.get("size") or task.get("total_bytes") or task.get("file_size") or 0)
+        saved_path = str(meta.get("saved_path") or task.get("saved_path") or task.get("file_path") or "")
+        peer_id = str(meta.get("peer_id") or task.get("peer_id") or "")
+        details = {
+            "file_name": meta.get("file_name") or task.get("file_name") or card.get("subtitle") or "-",
+            "progress": float(meta.get("progress") or 0.0),
+            "status": card.get("status") or meta.get("status") or "-",
+            "size": format_file_size(size_value) if size_value else "-",
+            "peer": self._file_peer_label(peer_id) if peer_id else "-",
+            "speed": meta.get("speed") or "-",
+            "eta": meta.get("eta") or "-",
+            "saved_path": saved_path or "-",
+            "file_id": mid,
+            "task_id": task.get("task_id") or "",
+            "offset": meta.get("transferred") or task.get("transferred_bytes") or "",
+            "hash": task.get("file_hash") or task.get("sha256") or "",
+            "conn_id": task.get("conn_id") or "",
+        }
+        actions: Dict[str, object] = {}
+        status = str(details["status"] or "")
+        direction = str(card.get("direction") or meta.get("direction") or "")
+        if direction == "outgoing" and is_failed_status(status, failed_label=self.cu("failed"), lang=self.lang):
+            actions["retry"] = lambda: self.retry_file_message(mid)
+        if saved_path:
+            actions["open_folder"] = lambda: open_file_location(saved_path)
+        create_file_transfer_details_popup(lang=self.lang, details=details, actions=actions).open()
+
+    def _open_screen_share_details(self, session_id: str) -> None:
+        sid = str(session_id or "").strip()
+        card = self._runtime_chat_card(f"screen_share:{sid}")
+        if not card:
+            return
+        meta = dict(card.get("meta") or {})
+        try:
+            runtime = dict(self._screen_runtime().get_state())
+        except Exception:
+            runtime = {}
+        audio = dict(getattr(self, "screen_share_current_audio", {}) or {})
+        stats = dict(runtime.get("stats") or runtime.get("native_stats") or {})
+        connection_parts = []
+        fps = stats.get("render_output_fps") or stats.get("fps")
+        loss = stats.get("packets_lost_estimate")
+        if fps not in (None, ""):
+            connection_parts.append(f"{float(fps):.1f} FPS")
+        if loss not in (None, ""):
+            connection_parts.append(f"loss {loss}")
+        details = {
+            "peer": meta.get("peer_label") or card.get("subtitle") or "-",
+            "status": card.get("status") or meta.get("status") or runtime.get("state") or "-",
+            "direction": card.get("direction") or meta.get("direction") or "-",
+            "quality": meta.get("profile") or self._native_screen_preset_label(),
+            "audio": "System audio" if audio.get("enabled") else "Video only",
+            "connection": " · ".join(connection_parts) or "-",
+            "session_id": sid,
+            "port": meta.get("port") or runtime.get("port") or "-",
+            "profile": meta.get("profile") or runtime.get("profile") or "-",
+            "runtime_state": runtime.get("state") or "idle",
+        }
+        actions: Dict[str, object] = {"settings": lambda: self.open_settings_popup("screen")}
+        if self._screen_share_button_active():
+            actions["stop"] = self.stop_screen_share_from_chat
+        else:
+            actions["retry"] = self.send_screen_share_offer
+        create_screen_share_details_popup(lang=self.lang, details=details, actions=actions).open()
+
     def handle_chat_card_action(self, card_id: str, action_id: str) -> None:
         try:
             action = str(action_id or "")
@@ -4499,6 +4744,12 @@ class RUDPTransferRoot(BoxLayout):
             if action.startswith("retry_file:"):
                 self.retry_file_message(action.split(":", 1)[1])
                 return
+            if action.startswith("file_details:"):
+                self._open_file_transfer_details(action.split(":", 1)[1])
+                return
+            if action.startswith("screen_details:"):
+                self._open_screen_share_details(action.split(":", 1)[1])
+                return
             if action.startswith("file_accept:"):
                 self._decide_transfer_request(action.split(":", 1)[1], True)
                 return
@@ -4516,9 +4767,14 @@ class RUDPTransferRoot(BoxLayout):
                 pass
 
     def _default_transfer_policy(self, req: Dict[str, object]) -> str:
-        if bool((req or {}).get("resume_available")):
+        if bool((req or {}).get("resume_available")) and bool(
+            getattr(self, "transfer_resume_enabled", True)
+        ):
             return "resume"
         if bool((req or {}).get("conflict")):
+            policy = str(getattr(self, "file_conflict_policy", "auto") or "auto")
+            if policy in {"rename", "overwrite", "cancel"}:
+                return policy
             return "rename"
         return "overwrite"
 
@@ -5307,6 +5563,8 @@ class RUDPTransferRoot(BoxLayout):
     def toggle_lang(self) -> None:
         self.lang = "en" if self.lang == "zh" else "zh"
         self.app.lang = self.lang
+        self.gui_config["language"] = self.lang
+        save_gui_config(self.gui_config)
         self.refresh_texts()
         self.refresh_local_ips()
 
@@ -5608,7 +5866,8 @@ class RUDPTransferRoot(BoxLayout):
             pass
         self.show_page("agora_chat")
         self.refresh_chat_main()
-        self.start_receiver(auto=True)
+        if bool(getattr(self, "start_receiver_on_unlock", True)):
+            self.start_receiver(auto=True)
 
     def toggle_online(self) -> None:
         if self.receiver_worker.is_running():
@@ -5619,7 +5878,336 @@ class RUDPTransferRoot(BoxLayout):
         else:
             self.start_receiver(auto=True)
 
-    def open_settings_popup(self) -> None:
+    @staticmethod
+    def _format_storage_size(value: int) -> str:
+        size = max(0.0, float(value or 0))
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024.0 or unit == "TB":
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return "0 B"
+
+    def _directory_size(self, directory: Path) -> int:
+        total = 0
+        try:
+            for path in Path(directory).rglob("*"):
+                if path.is_file():
+                    total += int(path.stat().st_size)
+        except Exception:
+            pass
+        return total
+
+    def _confirm_clear_temp_files(self) -> None:
+        def _clear() -> None:
+            try:
+                target = temp_dir().resolve()
+                root = user_data_dir().resolve()
+                if target == root or root not in target.parents:
+                    raise RuntimeError("temporary directory is outside the application data folder")
+                for child in list(target.iterdir()):
+                    try:
+                        if child.is_dir():
+                            shutil.rmtree(child)
+                        else:
+                            child.unlink()
+                    except FileNotFoundError:
+                        continue
+                self.sender_log_box.append("Temporary files cleared.\n")
+            except Exception as exc:
+                self._show_product_error(
+                    title="无法清理临时文件" if self.lang == "zh" else "Temporary files could not be cleared",
+                    reason="部分临时文件仍在使用。" if self.lang == "zh" else "Some temporary files are still in use.",
+                    suggestion="关闭相关任务后重试。" if self.lang == "zh" else "Close related tasks and try again.",
+                    technical_details=str(exc),
+                    on_retry=self._confirm_clear_temp_files,
+                    settings_section="storage",
+                )
+
+        ConfirmationDialog(
+            lang=self.lang,
+            title="清理临时文件" if self.lang == "zh" else "Clear temporary files",
+            message=(
+                "将删除 AgoraLink 临时目录中的打包和运行时临时文件，不会删除聊天或已接收文件。"
+                if self.lang == "zh"
+                else "This removes packaging and runtime files from AgoraLink's temporary folder. Chats and received files are not removed."
+            ),
+            on_confirm=_clear,
+            confirm_text="清理" if self.lang == "zh" else "Clear",
+            danger=False,
+        ).open()
+
+    def _build_commit_text(self) -> str:
+        for candidate in (RESOURCE_DIR / "BUILD_INFO.json", APP_DIR / "BUILD_INFO.json"):
+            try:
+                if not candidate.is_file():
+                    continue
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    value = payload.get("git_commit") or payload.get("commit") or payload.get("sha")
+                    if str(value or "").strip():
+                        return str(value).strip()
+            except Exception:
+                continue
+        return str(os.environ.get("AGORALINK_GIT_COMMIT") or "").strip()
+
+    def _settings_preset_details(self) -> Dict[str, Dict[str, object]]:
+        details: Dict[str, Dict[str, object]] = {}
+        for key, item in NATIVE_SCREEN_PRESETS.items():
+            preset = dict(item or {})
+            width = int(preset.get("width") or 0)
+            height = int(preset.get("height") or 0)
+            fps = int(preset.get("fps") or 0)
+            bitrate = float(preset.get("bitrate_mbps") or 0)
+            bitrate_text = f"{bitrate:g}"
+            details[str(key)] = {
+                "summary": f"{width} x {height} · {fps} FPS · {bitrate_text} Mbps",
+                "repair": str(preset.get("repair") or "off").upper(),
+                "playout_delay_ms": int(preset.get("playout_delay_ms") or 0),
+                "detail": " · ".join(
+                    (
+                        str(preset.get("encoder") or "auto"),
+                        str(preset.get("convert_backend") or "auto"),
+                        str(preset.get("render_backend") or "d3d11"),
+                    )
+                ),
+            }
+        return details
+
+    def _settings_initial_values(self) -> Dict[str, object]:
+        values = merge_legacy_config(self.gui_config)
+        values.update(
+            {
+                "language": self.lang,
+                "theme_mode": self._normalize_theme_mode(getattr(self, "theme_mode", "system")),
+                "device_display_name": str(getattr(self, "device_display_name", "") or self.chat_nickname),
+                "receiver_port": int(getattr(self, "receiver_port_setting", MAIN_UDP_PORT)),
+                "discovery_port": int(getattr(self, "discovery_port_setting", DEFAULT_DISCOVERY_PORT)),
+                "lan_discovery_enabled": bool(getattr(self, "lan_discovery_enabled", True)),
+                "start_receiver_on_unlock": bool(getattr(self, "start_receiver_on_unlock", True)),
+                "bind_address": str(getattr(self, "bind_address_setting", "0.0.0.0")),
+                "discovery_timeout_sec": float(getattr(self, "discovery_timeout_sec", 20.0)),
+                "save_directory": str(getattr(self, "save_directory_setting", user_data_dir() / "received")),
+                "file_conflict_policy": str(getattr(self, "file_conflict_policy", "auto")),
+                "transfer_resume_enabled": bool(getattr(self, "transfer_resume_enabled", True)),
+                "auto_package_multi_selection": bool(getattr(self, "auto_package_multi_selection", True)),
+                "transfer_payload_size": int(getattr(self, "transfer_payload_size", 1400)),
+                "transfer_request_timeout_sec": float(getattr(self, "transfer_request_timeout_sec", 300)),
+                "transfer_completion_timeout_sec": float(getattr(self, "transfer_completion_timeout_sec", 180)),
+                "screen_native_preset": self._native_screen_preset(),
+                "screen_share_system_audio": bool(getattr(self, "share_system_audio", False)),
+            }
+        )
+        return values
+
+    def _settings_context(self) -> Dict[str, object]:
+        package = self._screen_package_snapshot()
+        preset_details = self._settings_preset_details()
+        preset = preset_details.get(self._native_screen_preset(), {})
+        addresses = get_local_ip_candidates()
+        receiver_running = bool(self.receiver_worker.is_running())
+        try:
+            port_state = udp_port_status(int(getattr(self, "receiver_port_setting", MAIN_UDP_PORT)))
+        except Exception as exc:
+            port_state = {"available": False, "occupied": False, "error": str(exc)}
+        if receiver_running and port_state.get("occupied"):
+            firewall_status = "Ready" if self.lang == "en" else "可用"
+            firewall_kind = "success"
+        elif port_state.get("available"):
+            firewall_status = "Port available" if self.lang == "en" else "端口可用"
+            firewall_kind = "neutral"
+        else:
+            firewall_status = "Check required" if self.lang == "en" else "需要检查"
+            firewall_kind = "warning"
+        save_dir = Path(str(getattr(self, "save_directory_setting", user_data_dir() / "received")))
+        try:
+            free_space = shutil.disk_usage(save_dir if save_dir.exists() else save_dir.parent).free
+            disk_status = self._format_storage_size(free_space)
+        except Exception:
+            disk_status = "-"
+        contacts = []
+        if self.contact_service is not None:
+            try:
+                contacts = list(self.contact_service.list_contacts(trusted_only=False) or [])
+            except Exception:
+                contacts = []
+        trusted = [item for item in contacts if str(item.get("trust_state") or "") == "trusted"]
+        recent = self.selected_contact or (trusted[0] if trusted else None) or {}
+        fingerprint = str(getattr(self, "chat_fingerprint", "") or "")
+        if fingerprint:
+            fingerprint = shorten_middle(fingerprint, 28)
+        native_available = bool(package.get("rust_native_available"))
+        audio_capture = bool(package.get("rust_audio_capture_available"))
+        audio_playback = bool(package.get("rust_audio_playback_available"))
+        av_sync = bool(package.get("native_screen_av_sync_supported"))
+        runtime_state = {}
+        try:
+            runtime_state = dict(self._screen_runtime().get_state())
+        except Exception:
+            runtime_state = {}
+        about = build_about_context(
+            app_version=APP_VERSION,
+            build_label=BUILD_LABEL,
+            build_date=BUILD_DATE,
+            package_flavor=package.get("package_flavor") or PACKAGE_FLAVOR,
+            capabilities=package,
+            app_dir=APP_DIR,
+            user_data_dir=user_data_dir(),
+            debug_log_dir=debug_log_dir(),
+            git_commit=self._build_commit_text(),
+            lang=self.lang,
+        )
+        context: Dict[str, object] = {
+            "rust_audio_capture_available": audio_capture,
+            "current_lan_address": ", ".join(addresses) if addresses else "-",
+            "receiver_status": ("Running" if self.lang == "en" else "运行中") if receiver_running else ("Stopped" if self.lang == "en" else "未运行"),
+            "receiver_status_kind": "success" if receiver_running else "warning",
+            "firewall_status": firewall_status,
+            "firewall_status_kind": firewall_kind,
+            "disk_space_status": disk_status,
+            "screen_preset_details": preset_details,
+            "screen_preset_summary": preset.get("summary") or "-",
+            "screen_adaptive_quality": str(NATIVE_SCREEN_PRESETS.get(self._native_screen_preset(), {}).get("adaptive_quality") or "off"),
+            "screen_adaptive_quality_kind": "neutral",
+            "screen_audio_status": (
+                "Capture and playback available"
+                if self.lang == "en" and audio_capture and audio_playback
+                else "采集与播放可用"
+                if audio_capture and audio_playback
+                else "Unavailable"
+                if self.lang == "en"
+                else "不可用"
+            ),
+            "screen_audio_status_kind": "success" if audio_capture and audio_playback else "warning",
+            "screen_port": "55000-55999 · automatic" if self.lang == "en" else "55000-55999 · 自动选择",
+            "screen_receiver_status": str(runtime_state.get("state") or "idle"),
+            "screen_receiver_status_kind": "success" if runtime_state.get("running") else "neutral",
+            "screen_engine_status": (
+                f"Rust native {'available' if native_available else 'unavailable'} · "
+                f"audio {'available' if audio_capture and audio_playback else 'unavailable'} · "
+                f"A/V sync {'supported' if av_sync else 'unavailable'}"
+            ),
+            "screen_repair_mode": preset.get("repair") or "NACK",
+            "screen_playout_delay_ms": preset.get("playout_delay_ms") or 250,
+            "screen_native_detail": preset.get("detail") or "-",
+            "trusted_devices_summary": str(len(trusted)),
+            "recent_connection": str(recent.get("remark_name") or recent.get("nickname") or recent.get("peer_id") or "-"),
+            "fingerprint_summary": fingerprint or "-",
+            "chat_database_status": ("Unlocked" if self.lang == "en" else "已解锁") if self.chat_unlocked else ("Locked" if self.lang == "en" else "已锁定"),
+            "chat_database_status_kind": "success" if self.chat_unlocked else "neutral",
+            "chat_data_location": str(Path(self.chat_db_path).parent),
+            "confirm_file_requests": "Enabled" if self.lang == "en" else "已启用",
+            "confirm_screen_requests": "Enabled" if self.lang == "en" else "已启用",
+            "app_data_dir": str(user_data_dir()),
+            "downloads_dir": str(save_dir),
+            "temp_dir": str(temp_dir()),
+            "log_size": self._format_storage_size(self._directory_size(debug_log_dir())),
+            "application_status": ("Ready" if self.lang == "en" else "就绪") if self.chat_unlocked else ("Chat locked" if self.lang == "en" else "聊天未解锁"),
+            "application_status_kind": "success" if self.chat_unlocked else "neutral",
+            "network_status": firewall_status,
+            "network_status_kind": firewall_kind,
+            "native_media_status": "Available" if native_available else "Unavailable",
+            "native_media_status_kind": "success" if native_available else "danger",
+            "diagnostic_technical_summary": self._about_detail_text(),
+            "technical_details_visible": False,
+        }
+        context.update(about)
+        return context
+
+    def _save_settings_center_values(self, values: Dict[str, object]) -> bool:
+        previous_lang = self.lang
+        self.lang = "en" if str(values.get("language") or "zh").startswith("en") else "zh"
+        self.app.lang = self.lang
+        self.theme_mode = self._normalize_theme_mode(values.get("theme_mode"))
+        self.device_display_name = str(values.get("device_display_name") or self.device_display_name).strip()
+        self.receiver_port_setting = int(values.get("receiver_port") or MAIN_UDP_PORT)
+        self.discovery_port_setting = int(values.get("discovery_port") or DEFAULT_DISCOVERY_PORT)
+        self.lan_discovery_enabled = bool(values.get("lan_discovery_enabled"))
+        self.start_receiver_on_unlock = bool(values.get("start_receiver_on_unlock"))
+        self.bind_address_setting = str(values.get("bind_address") or "0.0.0.0").strip()
+        self.discovery_timeout_sec = float(values.get("discovery_timeout_sec") or 20.0)
+        self.save_directory_setting = str(values.get("save_directory") or user_data_dir() / "received").strip()
+        self.file_conflict_policy = str(values.get("file_conflict_policy") or "auto")
+        self.transfer_resume_enabled = bool(values.get("transfer_resume_enabled"))
+        self.auto_package_multi_selection = bool(values.get("auto_package_multi_selection"))
+        self.transfer_payload_size = int(values.get("transfer_payload_size") or 1400)
+        self.transfer_request_timeout_sec = float(values.get("transfer_request_timeout_sec") or 300)
+        self.transfer_completion_timeout_sec = float(values.get("transfer_completion_timeout_sec") or 180)
+        self.screen_native_preset, _invalid = resolve_native_screen_preset_id(values.get("screen_native_preset"))
+        audio_available = self._screen_audio_available_for_backend(SCREEN_BACKEND_RUST, "capture")
+        self.share_system_audio = bool(values.get("screen_share_system_audio")) and audio_available
+        self.screen_audio_mode = "system" if self.share_system_audio else "off"
+        self.screen_backend = SCREEN_BACKEND_RUST
+        persisted = dict(values)
+        persisted.update(
+            {
+                "language": self.lang,
+                "theme_mode": self.theme_mode,
+                "screen_backend": SCREEN_BACKEND_RUST,
+                "screen_share_system_audio": self.share_system_audio,
+                "screen_share_audio_mode": self.screen_audio_mode,
+                "screen_native_preset": self.screen_native_preset,
+            }
+        )
+        self.gui_config.update(persisted)
+        save_gui_config(self.gui_config)
+        self._apply_saved_settings_to_widgets()
+        self.apply_theme_mode(self.theme_mode)
+        if previous_lang != self.lang:
+            self.refresh_texts()
+        self._refresh_app_identity_labels()
+        return True
+
+    def _refresh_settings_context(self, page: SettingsCenter) -> None:
+        try:
+            self.screen_package_info = self._screen_package_capabilities()
+        except Exception:
+            pass
+        page.context.clear()
+        page.context.update(self._settings_context())
+        page.model.context.clear()
+        page.model.context.update(page.context)
+        page.show_section(page.current_section)
+
+    def open_settings_popup(self, initial_section: str = "general") -> None:
+        holder: Dict[str, object] = {}
+
+        def _close() -> None:
+            popup = holder.get("popup")
+            if popup is not None:
+                popup.dismiss()
+
+        actions = {
+            "recheck_network": lambda: self._refresh_settings_context(holder["page"]),
+            "firewall": self.allow_firewall,
+            "export_diagnostics": lambda: self.export_diagnostic_logs_async(log_box=self.sender_log_box),
+            "open_logs": lambda: open_file_location(str(debug_log_dir())),
+            "clean_temp": self._confirm_clear_temp_files,
+            "copy_technical_info": lambda: Clipboard.copy(str(self._settings_context().get("about_full_technical_info") or "")),
+        }
+        page = SettingsCenter(
+            lang=self.lang,
+            initial_values=self._settings_initial_values(),
+            context=self._settings_context(),
+            on_save=self._save_settings_center_values,
+            on_close=_close,
+            on_browse_directory=lambda callback: self._native_file_dialog(select_dir=True, callback=callback),
+            actions=actions,
+            initial_section=initial_section,
+        )
+        holder["page"] = page
+        popup = SecondaryPopup(
+            title="",
+            content=page,
+            size_hint=(0.94, 0.92),
+            auto_dismiss=False,
+            separator_height=0,
+            background="",
+            background_color=(0.035, 0.043, 0.055, 1),
+        )
+        holder["popup"] = popup
+        popup.open()
+
+    def _open_settings_popup_legacy(self) -> None:
         content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
         app_info_box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(254), spacing=dp(4))
         app_info_title = make_label(
@@ -6448,6 +7036,27 @@ class RUDPTransferRoot(BoxLayout):
         except Exception:
             return ui_state in self._screen_share_active_states()
 
+    def _show_product_error(
+        self,
+        *,
+        title: str,
+        reason: str,
+        suggestion: str,
+        technical_details: str = "",
+        on_retry=None,
+        settings_section: str = "",
+    ) -> None:
+        ErrorStateDialog(
+            lang=self.lang,
+            title=title,
+            reason=reason,
+            suggestion=suggestion,
+            technical_details=technical_details,
+            on_retry=on_retry,
+            on_settings=(lambda: self.open_settings_popup(settings_section or "general")),
+            on_export=lambda: self.export_diagnostic_logs_async(log_box=self.sender_log_box),
+        ).open()
+
     def _refresh_screen_share_button(self) -> None:
         if not hasattr(self, "main_screen_btn"):
             return
@@ -6492,6 +7101,14 @@ class RUDPTransferRoot(BoxLayout):
             self._set_screen_share_status(f"Screen button failed: {exc}")
             self._clear_current_screen_context()
             self._set_screen_share_ui_state("idle")
+            self._show_product_error(
+                title="无法开始屏幕共享" if self.lang == "zh" else "Screen sharing could not start",
+                reason=("未能启动内置屏幕共享。" if self.lang == "zh" else "The built-in screen sharing engine did not start."),
+                suggestion=("请检查目标设备和屏幕共享设置，然后重试。" if self.lang == "zh" else "Check the target device and screen sharing settings, then try again."),
+                technical_details=str(exc),
+                on_retry=self._on_screen_share_button,
+                settings_section="screen",
+            )
 
     def _screen_debug_start_receiver(self, status_label: Label) -> None:
         try:
@@ -7498,6 +8115,71 @@ class RUDPTransferRoot(BoxLayout):
         self._stop_screen_runtime_nonblocking(on_done=_finish_stop)
 
     def open_debug_popup(self) -> None:
+        snapshot = self._diagnostic_snapshot()
+        status_builders = (
+            (("Package" if self.lang == "en" else "软件包"), self._diagnostic_package_summary),
+            (("Receive service" if self.lang == "en" else "接收服务"), self._diagnostic_receiver_summary),
+            ("UDP 9999", self._diagnostic_udp_9999_summary),
+            (("Screen ports" if self.lang == "en" else "屏幕共享端口"), self._diagnostic_screen_ports_summary),
+            (("Native media" if self.lang == "en" else "内置媒体组件"), self._diagnostic_dependencies_summary),
+            (("Screen runtime" if self.lang == "en" else "屏幕共享运行状态"), self._diagnostic_runtime_summary),
+        )
+        summary_items = []
+        for title, builder in status_builders:
+            status, detail, kind = builder(snapshot)
+            summary_items.append({"title": title, "status": status, "detail": detail, "kind": kind})
+        recent_errors = str(snapshot.get("recent_errors") or "").strip()
+        no_recent_errors = (
+            not recent_errors
+            or recent_errors.startswith("暂无")
+            or recent_errors.lower().startswith("no recent")
+        )
+        summary_items.append(
+            {
+                "title": "Recent errors" if self.lang == "en" else "最近错误",
+                "status": ("None" if self.lang == "en" else "暂无") if no_recent_errors else ("Review" if self.lang == "en" else "需查看"),
+                "detail": recent_errors or ("No recent errors." if self.lang == "en" else "暂无最近错误。"),
+                "kind": "neutral" if no_recent_errors else "warning",
+            }
+        )
+        runtime = dict(snapshot.get("runtime_state") or {})
+        technical = {
+            "Version": APP_VERSION,
+            "Package": snapshot.get("package_flavor") or PACKAGE_FLAVOR,
+            "Native executable": snapshot.get("rust_native_path") or "-",
+            "Native SHA-256": snapshot.get("rust_native_sha256") or "-",
+            "Audio capture": snapshot.get("rust_audio_capture_available"),
+            "Audio playback": snapshot.get("rust_audio_playback_available"),
+            "A/V sync": snapshot.get("native_screen_av_sync_supported"),
+            "Runtime state": runtime.get("state") or "idle",
+            "Runtime port": runtime.get("port") or runtime.get("screen_port") or "-",
+            "Application data": user_data_dir(),
+            "Log directory": debug_log_dir(),
+        }
+        holder: Dict[str, object] = {}
+
+        def _close() -> None:
+            popup = holder.get("popup")
+            if popup is not None:
+                popup.dismiss()
+
+        def _recheck() -> None:
+            _close()
+            Clock.schedule_once(lambda _dt: self.open_debug_popup(), 0)
+
+        popup = create_diagnostics_popup(
+            lang=self.lang,
+            summary_items=summary_items,
+            technical_sections=technical,
+            recent_errors=recent_errors,
+            on_close=_close,
+            on_export=lambda: self.export_diagnostic_logs_async(log_box=self.sender_log_box),
+            on_recheck=_recheck,
+        )
+        holder["popup"] = popup
+        popup.open()
+        return
+
         content = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(14))
         header = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(54), spacing=dp(2))
         title = make_label(
@@ -7638,8 +8320,8 @@ class RUDPTransferRoot(BoxLayout):
         popup.open()
 
     def apply_theme_mode(self, mode: str) -> None:
-        self.theme_mode = str(mode or "跟随系统")
-        if self.theme_mode == "深色":
+        self.theme_mode = self._normalize_theme_mode(mode)
+        if self.theme_mode == "dark":
             Window.clearcolor = (0.08, 0.09, 0.11, 1)
         else:
             Window.clearcolor = THEME["window_bg"]
@@ -7690,6 +8372,14 @@ class RUDPTransferRoot(BoxLayout):
     def search_receivers(self) -> None:
         """Search LAN receivers without blocking the Kivy UI thread."""
         if getattr(self, "search_in_progress", False):
+            return
+        if not bool(getattr(self, "lan_discovery_enabled", True)):
+            message = (
+                "局域网发现已在设置中关闭。"
+                if self.lang == "zh"
+                else "LAN discovery is disabled in Settings."
+            )
+            self.sender_log_box.append(message + "\n")
             return
 
         self.search_in_progress = True
@@ -7757,7 +8447,7 @@ class RUDPTransferRoot(BoxLayout):
                 manual_ip = self.receiver_ip.text.strip()
                 found = discover_receivers(
                     discovery_port=discovery_port,
-                    timeout=20.0,
+                    timeout=max(0.5, min(60.0, float(getattr(self, "discovery_timeout_sec", 20.0)))),
                     extra_ports=[transfer_port],
                     manual_targets=[manual_ip] if manual_ip else None,
                     max_probe_hosts=2048,
@@ -8111,6 +8801,80 @@ class RUDPTransferRoot(BoxLayout):
         apply_ui_font(content)
         popup.open()
 
+    def open_group_management_popup(self, group_id: str = "") -> None:
+        gid = str(group_id or self.current_group_id or "").strip()
+        if self.group_service is None or not gid:
+            return
+        group = self._group_record(gid)
+        if not group:
+            return
+        members = list(self.group_service.members(gid, include_inactive=True) or [])
+        contacts_by_id: Dict[str, Dict[str, object]] = {}
+        if self.contact_service is not None:
+            try:
+                contacts_by_id = {
+                    str(item.get("peer_id") or ""): dict(item)
+                    for item in self.contact_service.list_contacts(trusted_only=False)
+                }
+            except Exception:
+                contacts_by_id = {}
+        normalized_members = []
+        for item in members:
+            member = dict(item or {})
+            contact = contacts_by_id.get(str(member.get("peer_id") or ""), {})
+            member.setdefault(
+                "display_name",
+                contact.get("remark_name") or contact.get("display_name") or contact.get("nickname"),
+            )
+            normalized_members.append(member)
+        can_manage = self._is_local_group_owner(gid)
+        holder: Dict[str, object] = {}
+
+        def _close() -> None:
+            popup = holder.get("popup")
+            if popup is not None:
+                popup.dismiss()
+
+        def _select_group() -> None:
+            title = str(group.get("title") or gid)
+            self._select_chat_entry(f"group::{gid}::{title}")
+
+        def _add_member() -> None:
+            _select_group()
+            _close()
+            Clock.schedule_once(lambda _dt: self.add_selected_contact_to_current_group(), 0)
+
+        def _remove_member(peer_id: str) -> None:
+            def _remove() -> None:
+                self.group_service.remove_member(gid, peer_id, removed=True)
+                _close()
+                self.refresh_chat_main()
+                self.render_current_chat(reason="group_manage")
+
+            self._confirm_action(
+                "移除成员" if self.lang == "zh" else "Remove member",
+                (f"确认移除成员 {peer_id}？" if self.lang == "zh" else f"Remove member {peer_id}?"),
+                _remove,
+            )
+
+        def _leave() -> None:
+            self._leave_group_local(gid)
+            _close()
+
+        popup = create_group_management_popup(
+            lang=self.lang,
+            group=group,
+            members=normalized_members,
+            local_peer_id=self.chat_local_peer_id,
+            can_manage=can_manage,
+            on_close=_close,
+            on_add_member=_add_member,
+            on_remove_member=_remove_member,
+            on_leave=_leave,
+        )
+        holder["popup"] = popup
+        popup.open()
+
 
     def add_selected_contact_to_current_group(self) -> None:
         if self.contact_service is None or self.group_service is None or not self.current_group_id:
@@ -8180,19 +8944,38 @@ class RUDPTransferRoot(BoxLayout):
         self._confirm_action("移除成员", f"确认移除成员 {pid}？", lambda: (self.group_service.remove_member(self.current_group_id, pid, removed=True), self.render_current_chat(reason="group_manage")))
 
 
+    def _leave_group_local(self, group_id: str) -> None:
+        gid = str(group_id or "").strip()
+        if self.group_service is None or not gid:
+            return
+        self.group_service.delete_group_data(gid)
+        if self.current_group_id == gid:
+            self.current_group_id = ""
+            self.current_chat_mode = ""
+            self.current_chat_title.text = ""
+        self.refresh_chat_main()
+        self.render_current_chat(reason="group_manage")
+
     def confirm_leave_group(self) -> None:
         if self.group_service is None or not self.current_group_id:
             return
         gid = self.current_group_id
         def _do():
-            self.group_service.delete_group_data(gid)
-            self.current_group_id = ""
-            self.current_chat_mode = ""
-            self.current_chat_title.text = ""
-            self.refresh_chat_main()
-            self.render_current_chat(reason="group_manage")
+            self._leave_group_local(gid)
         self._confirm_action("退出群组", f"确认退出群组 {gid}？\n该群相关成员、消息、回执都会从本机删除。", _do)
 
+
+    def _delete_contact_local(self, peer_id: str) -> None:
+        pid = str(peer_id or "").strip()
+        if self.contact_service is None or not pid:
+            return
+        self.contact_service.delete_contact_local(pid)
+        if self.current_peer_id == pid:
+            self.current_peer_id = ""
+            self.current_chat_mode = ""
+            self.current_chat_title.text = ""
+        self.refresh_chat_main()
+        self.render_current_chat(reason="contact_manage")
 
     def confirm_delete_contact(self) -> None:
         if self.contact_service is None or self.current_chat_mode != "direct" or not self.current_peer_id:
@@ -8200,12 +8983,7 @@ class RUDPTransferRoot(BoxLayout):
             return
         pid = self.current_peer_id
         def _do():
-            self.contact_service.delete_contact_local(pid)
-            self.current_peer_id = ""
-            self.current_chat_mode = ""
-            self.current_chat_title.text = ""
-            self.refresh_chat_main()
-            self.render_current_chat(reason="contact_manage")
+            self._delete_contact_local(pid)
         self._confirm_action("删除联系人", f"确认删除联系人 {pid}？\n该联系人、一对一聊天记录和相关回执都会从本机删除。", _do)
 
 
