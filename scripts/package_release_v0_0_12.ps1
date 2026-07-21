@@ -298,7 +298,9 @@ Assert-File (Join-Path $PyDistApp "AgoraLink.exe")
 Assert-File (Join-Path $PyDistApp "_internal\tools\agoralink_media\agoralink_media.exe")
 $unusedKivyData = @(
     (Join-Path $PyDistApp "_internal\kivy\tests"),
-    (Join-Path $PyDistApp "_internal\kivy_install\modules")
+    (Join-Path $PyDistApp "_internal\kivy_install\modules"),
+    (Join-Path $PyDistApp "_internal\kivy\core\video"),
+    (Join-Path $PyDistApp "_internal\kivy\lib\gstplayer")
 )
 foreach ($path in $unusedKivyData) {
     if (Test-Path -LiteralPath $path) {

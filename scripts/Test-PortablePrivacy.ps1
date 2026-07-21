@@ -45,7 +45,7 @@ $forbiddenDirectoryNames = @(
     "_local_artifacts", "target", "tests", "test_data", "logs", "chat", "pins", "received"
 )
 $sensitiveNamePattern = '(?i)(^|[._-])(token|password|secret|private[_-]?key|pin)([._-]|$)'
-$mediaNamePattern = '(?i)(ffmpeg|ffprobe|ffplay|avcodec|avformat|avutil|swscale|swresample)'
+$mediaNamePattern = '(?i)(ffmpeg|ffprobe|ffplay|ffpyplayer|gstplayer|gstreamer|avcodec|avformat|avutil|swscale|swresample)'
 
 foreach ($file in $files) {
     $relative = $file.FullName.Substring($rootPrefix.Length)

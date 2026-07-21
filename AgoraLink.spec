@@ -57,11 +57,25 @@ excludes += [
     'pandas',
     'scipy',
     'PIL.ImageQt',
+    # AgoraLink does not use Kivy's optional file-video/media providers. Keep
+    # the native screen runtime as the only packaged media implementation.
+    'ffpyplayer',
+    'kivy.core.video',
+    'kivy.core.video.video_ffmpeg',
+    'kivy.core.video.video_ffpyplayer',
+    'kivy.core.video.video_gstplayer',
+    'kivy.lib.gstplayer',
 ]
 
 # Data files. collect_data_files('kivy') is safe; it does not scan kivy.garden submodules.
 datas = []
-datas += collect_data_files('kivy')
+datas += collect_data_files(
+    'kivy',
+    excludes=[
+        '**/core/video/**',
+        '**/lib/gstplayer/**',
+    ],
+)
 
 # cryptography is usually handled by PyInstaller hooks, but package metadata/data makes
 # the folder build less sensitive to hook-version differences.
