@@ -4264,13 +4264,20 @@ mod platform {
             local
                 .set_read_timeout(Some(Duration::from_millis(5)))
                 .unwrap();
+            remote
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
             let remote_address = remote.local_addr().unwrap();
             let close = test_close(101);
             let peer = thread::spawn(move || {
                 let mut bytes = [0u8; 256];
                 let (length, source) = remote.recv_from(&mut bytes).unwrap();
                 let observed = crate::media_control::StreamClose::decode(&bytes[..length]).unwrap();
-                thread::sleep(Duration::from_millis(35));
+                let (retry_length, retry_source) = remote.recv_from(&mut bytes).unwrap();
+                let retried =
+                    crate::media_control::StreamClose::decode(&bytes[..retry_length]).unwrap();
+                assert_eq!(retry_source, source);
+                assert_eq!(retried, observed);
                 let ack = observed.ack().encode().unwrap();
                 remote.send_to(&ack, source).unwrap();
             });
