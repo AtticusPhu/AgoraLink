@@ -3,123 +3,114 @@
 Date: 2026-07-21
 
 Branch: `audit-fixes-v0.0.12`
-Validation type: deterministic local gates plus portable dry-run.
 
-## Status Summary
+Source commit: `ba4369dfffc0d3efdba622050586f39c0c16404d`
 
-| Area | Status | Evidence |
+PR: https://github.com/AtticusPhu/AgoraLink/pull/2
+
+## Final Status
+
+`V0_0_12_FINAL_VALIDATION_BLOCKED`
+
+All deterministic local gates and configured GitHub checks pass. The release is not ready because real GUI active-share, dual-host GUI, and live append-file validation remain `MANUAL_REQUIRED`.
+
+## Gate Summary
+
+| Gate | Result | Detail |
 |---|---|---|
-| Rust formatting | PASS | `cargo fmt -- --check` |
-| Rust check | PASS | locked/offline, one job |
-| Rust debug tests | PASS | 141 passed, 0 failed |
-| Rust release tests | PASS | 141 passed, 0 failed |
-| Rust Clippy debug | PASS | required command completed |
-| Rust Clippy release | PASS | required command completed |
-| Rust documentation | PASS | locked/offline/no-deps |
-| Rust release build | PASS | Rust 1.96.0 MSVC x64 |
-| Rust self-test | PASS | `{"type":"SELF_TEST","ok":true}` |
-| Python compileall | PASS | generated/build trees excluded |
-| Python dependency check | PASS | no broken requirements |
-| Python discovery guard | PASS | 30 tests discovered |
-| Python tests | PASS | 30 passed, 0 failed |
-| Python runtime self-test | PASS | 18/18 checks |
-| PowerShell parse | PASS | 18 tracked scripts/modules |
-| JSON parse | PASS | 5 tracked JSON files |
-| Portable dry-run | PASS | package, scan, extract, scan, self-test |
-| Final provider-hardened portable | PASS | native-only package, scan, extract, scan, self-test |
-| GitHub Actions execution | NOT_RUN | workflow added; branch not pushed |
-| Real WGC/QSV/D3D11 | NOT_RUN | hardware/manual gate |
-| Dual-host LAN | NOT_RUN | requires two real hosts |
-| Live file-append smoke | NOT_RUN | deterministic append tests passed |
+| Rust fmt/check | PASS | locked/offline, one job |
+| Rust debug tests | PASS | 142 passed, 0 failed |
+| Rust release tests | PASS | 142 passed, 0 failed |
+| Rust Clippy debug/release | PASS | all targets/features |
+| Rust doc/build release | PASS | locked/offline |
+| Native self-test | PASS | structured JSON with version and capabilities |
+| Validation runner | PASS | single execution, split logs, bounded timeout |
+| Cargo help contamination | PASS | not present |
+| Python compile/dependencies | PASS | CPython 3.12.10, `pip check` clean |
+| Python discovery/tests | PASS | 30 discovered, 30 passed |
+| Screen runtime self-test | PASS | 18/18 checks |
+| PowerShell parse | PASS | 22 tracked/unignored files |
+| PSScriptAnalyzer | TOOL_NOT_INSTALLED | not installed automatically |
+| GitHub Actions | PASS | three Windows jobs |
+| Portable build/scans | PASS | native-only, staging and extraction |
+| Portable independent GUI launch | PASS | real window, WM_CLOSE, exit 0, no force cleanup |
+| Native runtime graceful stop harness | PASS | 3/3 receiver cycles, no terminate/kill |
+| GUI active-share stop/restart | MANUAL_REQUIRED | interactive authenticated UI not exercised |
+| Dual-host GUI matrix | MANUAL_REQUIRED | requires two real Windows hosts |
+| Live append-file smoke | MANUAL_REQUIRED | requires two active application peers |
 
-## Rust Evidence
+## Local Evidence
 
-Toolchain:
+Primary complete run:
 
-```text
-rustc 1.96.0 (stable-x86_64-pc-windows-msvc)
-```
+`_local_artifacts/V0_0_12_FINAL_VALIDATION/run_20260721_101111`
 
-Executed:
+Results:
 
-```powershell
-cargo fmt -- --check
-cargo check --locked --offline --jobs 1
-cargo test --locked --offline --jobs 1
-cargo test --release --locked --offline --jobs 1
-cargo clippy --locked --offline --all-targets --all-features --jobs 1
-cargo clippy --release --locked --offline --all-targets --all-features --jobs 1
-cargo doc --locked --offline --no-deps --jobs 1
-cargo build --release --locked --offline --jobs 1
-cargo run --locked --offline -- self-test
-```
+- 22 structured commands completed in 163,262ms.
+- Rust debug: 142/142.
+- Rust release: 142/142.
+- Python: 30/30.
+- Runtime self-test: 18/18.
+- PowerShell parse: 22 files, zero parse errors.
+- New crash dumps: 0.
+- Residual `agoralink_media`, FFmpeg-family, or viewer processes: 0.
 
-Debug and release each ran 141 tests. The required Clippy commands completed. A separate strict `-D warnings` comparison reports 68 binary and 70 test diagnostics, exactly matching the existing R4 baseline (delta 0); the historical lint debt was not mixed into this remediation.
+The first attempt at `run_20260721_101027` failed before code validation because the restricted execution sandbox could not spawn the venv's official Python base executable in `AppData`. The same script then ran outside that restriction and passed. This environment failure is retained as evidence and is not counted as a product failure.
 
-## Python Evidence
+Validation runner smoke:
 
-Build interpreter: official CPython 3.12.10 x64 in a fresh venv populated from `requirements.lock` and `build-requirements.lock`.
+`_local_artifacts/validation_runner_smoke/20260721_094738_268`
 
-Executed:
+- Three commands recorded exactly once.
+- Space, Chinese, and apostrophe arguments round-tripped correctly.
+- Timeout returned 124 and left no child process.
+- No cargo help output contaminated logs.
 
-```powershell
-python -B -m compileall -q <tracked source tree>
-python -m pip check
-python -B scripts/check_python_test_count.py
-python -B -m unittest discover -s tests -p "test_*.py" -v
-python -B screen_runtime.py --self-test
-```
+The close-retry test that failed once in CI used `sleep(35ms)` and was sensitive to Windows runner scheduling. Commit `ba4369d` makes the peer wait for and validate the second close datagram before ACK. The corrected test passed 20/20 targeted repetitions and both complete suites.
 
-Results: 30 discovered tests, 30 passed, dependency check clean, and all 18 runtime self-test checks true. Compilation excluded ignored venv, artifact, target, build, and dist trees so generated dependencies were not treated as project source.
+## GitHub Actions
 
-## Regression Coverage Added
+Workflow run: https://github.com/AtticusPhu/AgoraLink/actions/runs/29795347977
 
-- Pre-session/zero/foreign/stale/invalid/replayed close handling.
-- Maximum legal and over-limit packet counts.
-- Aggregate slot/payload budgets and budget release.
-- FEC packet-count consistency and short/reused datagrams.
-- Legacy external backend/path migration and idempotence.
-- Native-only command construction and portable path selection.
-- Graceful stop first, stopped-event wait, double stop, app close, start/stop race, reader join, and bounded escalation.
-- File hash/header, append queue independence, resume metadata, unusual Windows paths, and diagnostic export privacy.
+- `rust-static-windows`: PASS (4m02s).
+- `python-core-windows`: PASS (51s).
+- `powershell-parse-windows`: PASS (45s).
 
-## Portable Dry-Run
+PR #2 is open and mergeable. Commit `ba4369dfffc0d3efdba622050586f39c0c16404d` is resolvable on GitHub.
 
-- Python: 3.12.10.
-- ZIP size: 43,626,711 bytes.
-- ZIP SHA-256: `60D4E040379F1DFA00894767A81BE924E3A7C2C33896CF75073DD71053DBF941`.
-- PDB count: 0.
-- Removed external-media file-name count: 0.
-- Source-file count: 0.
-- Pre-compression privacy scan: PASS.
-- Independent extraction privacy scan: PASS.
-- Bundled native self-test before and after compression: PASS.
+## Graceful Stop Evidence
 
-This is dry-run evidence for Batch 6, not the final release asset. Final asset identity is written after the documentation commit and recorded in the portable report/build result.
+Runtime evidence:
 
-## Final Portable Evidence
+`_local_artifacts/V0_0_12_FINAL_VALIDATION/runtime_graceful_stop_v2`
 
-- Source commit: `163020b50f071635febb5270983b6d424bbac582`.
-- ZIP size: 41,882,185 bytes.
-- ZIP SHA-256: `A87CDDA5A127BD4B4F57994A2FC5534FD1D122A2C75C9142AC53116D3F364701`.
-- Native executable SHA-256: `F0104BBC8946B6A03F8C7EEF7EB3CE03424C03B05F193989C320E3D509E1A5A6`.
-- Entries: 1,447.
-- Files scanned in staging and extraction: 1,434 each.
-- PDB, source, removed-media, ffpyplayer, and GStreamer/gstplayer named files: 0.
-- Staging/extraction privacy scans and native self-tests: PASS.
+Three real native `screen-recv` processes were started through `ScreenRuntime`, stopped with production reason `gui_stop`, emitted `NATIVE_SCREEN_STOPPED`, exited with code 0, joined reader threads, and required neither terminate nor force kill. Stop times were 32ms, 47ms, and 31ms.
 
-## Privacy Notes
+Portable GUI launch evidence:
 
-The final portable scan found no current user profile or source checkout prefix. Two prebuilt third-party DLL/PYD files contain their vendors' upstream build-machine paths; these are recorded as provenance and are not local AgoraLink source paths. The earlier Batch 6 dry-run recorded eight before unused Kivy media providers were excluded.
+`_local_artifacts/V0_0_12_FINAL_VALIDATION/portable_gui_launch_ba4369d`
 
-The PDB privacy scan failed on local checkout/toolchain paths. That is expected fail-closed behavior; no public symbols ZIP was produced.
+The extracted `AgoraLink.exe` created a real top-level window. The harness posted `WM_CLOSE`; the process exited with code 0 in 3,430ms, without forced cleanup or residual processes.
 
-## Process and Crash Checks
+These checks validate process lifecycle and independent launch. They do not prove the pending sequence of logging in, starting an active screen share from the GUI, clicking Stop, and restarting it three times.
 
-- Residual `agoralink_media`, removed-media, or viewer processes after deterministic tests: 0.
-- Crash dump candidates created after the validation start: 0.
-- No real capture/encoder/renderer session was claimed by these checks.
+## Portable Candidate
 
-## Limitations
+- Path: `_local_artifacts/V0_0_12_RELEASE_FINAL_ba4369d/AgoraLink_v0.0.12_portable.zip`.
+- Size: 41,881,098 bytes.
+- SHA-256: `9927AE652064670E9CE771B4BA93D0F13B38BA33DDCE697E60F7ECFAB4CCF479`.
+- Native SHA-256: `DFA7A6F4B4F3D4C71CD9F7B76E754F4D0C7EAB8D0F24963DCACCA8BE15A70A17`.
+- BUILD_INFO source commit: `ba4369dfffc0d3efdba622050586f39c0c16404d`.
+- ZIP entries: 1,447; files scanned: 1,434.
+- FFmpeg/PDB/DMP/source counts: 0.
+- Staging and extracted privacy scans: PASS.
+- Native self-test before and after extraction: PASS.
 
-`NOT_RUN` is intentional for WGC, QSV, D3D11 window rendering, dual-host network behavior, peer stop, and live GUI smoke. Those require the manual Windows release matrix and cannot be inferred from unit tests or loopback-free self-tests.
+## Manual Blockers
+
+1. Authenticated GUI active-share stop/restart, 3/3 cycles.
+2. Dual-host GUI sender stop, restart, receiver stop, and app-close behavior.
+3. Append a second file while the first is actively transferring and verify independent IDs/cards/workers and both hashes.
+
+No WGC, QSV, D3D11, WASAPI, LAN, or file-transfer results are inferred or fabricated. Until the three matrices above pass, release readiness is `BLOCKED`.

@@ -2,78 +2,90 @@
   "type": "V0_0_12_VALIDATION_REPORT",
   "date": "2026-07-21",
   "branch": "audit-fixes-v0.0.12",
+  "source_commit": "ba4369dfffc0d3efdba622050586f39c0c16404d",
+  "source_commit_resolvable": true,
+  "pull_request": "https://github.com/AtticusPhu/AgoraLink/pull/2",
+  "status": "V0_0_12_FINAL_VALIDATION_BLOCKED",
+  "release_readiness": "BLOCKED",
   "deterministic_gates": {
     "rust_fmt": "PASS",
     "rust_check": "PASS",
-    "rust_test_debug": {"status": "PASS", "passed": 141, "failed": 0},
-    "rust_test_release": {"status": "PASS", "passed": 141, "failed": 0},
+    "rust_test_debug": {"status": "PASS", "passed": 142, "failed": 0},
+    "rust_test_release": {"status": "PASS", "passed": 142, "failed": 0},
     "rust_clippy_debug": "PASS",
     "rust_clippy_release": "PASS",
     "rust_doc": "PASS",
     "rust_build_release": "PASS",
     "rust_self_test": "PASS",
+    "validation_runner": "PASS",
+    "cargo_help_contamination": false,
     "python_compileall": "PASS",
     "python_pip_check": "PASS",
     "python_test_discovery": {"status": "PASS", "count": 30},
     "python_tests": {"status": "PASS", "passed": 30, "failed": 0},
     "python_runtime_self_test": {"status": "PASS", "checks": 18},
-    "powershell_parse": {"status": "PASS", "files": 18},
-    "json_parse": {"status": "PASS", "files": 5}
+    "powershell_parse": {"status": "PASS", "files": 22},
+    "psscriptanalyzer": "TOOL_NOT_INSTALLED"
   },
-  "toolchains": {
-    "rust": "rustc 1.96.0 stable-x86_64-pc-windows-msvc",
-    "python": "CPython 3.12.10 x64",
-    "dependencies": "exact runtime/build locks"
+  "evidence": {
+    "full_local_run": "_local_artifacts/V0_0_12_FINAL_VALIDATION/run_20260721_101111",
+    "validation_runner_smoke": "_local_artifacts/validation_runner_smoke/20260721_094738_268",
+    "native_runtime_stop": "_local_artifacts/V0_0_12_FINAL_VALIDATION/runtime_graceful_stop_v2",
+    "portable_gui_launch": "_local_artifacts/V0_0_12_FINAL_VALIDATION/portable_gui_launch_ba4369d"
   },
-  "clippy_strict_baseline": {
-    "status": "EXISTING_DEBT_UNCHANGED",
-    "binary_diagnostics": 68,
-    "test_diagnostics": 70,
-    "delta": 0
-  },
-  "portable_dry_run": {
+  "github_ci": {
     "status": "PASS",
-    "size_bytes": 43626711,
-    "sha256": "60D4E040379F1DFA00894767A81BE924E3A7C2C33896CF75073DD71053DBF941",
-    "pdb_count": 0,
-    "external_media_file_count": 0,
-    "source_file_count": 0,
-    "privacy_scan": "PASS",
-    "extracted_privacy_scan": "PASS",
-    "native_self_test": "PASS",
-    "third_party_build_path_file_count": 8
+    "run": "https://github.com/AtticusPhu/AgoraLink/actions/runs/29795347977",
+    "jobs": {
+      "rust-static-windows": "PASS",
+      "python-core-windows": "PASS",
+      "powershell-parse-windows": "PASS"
+    }
   },
-  "portable_final": {
+  "local_runtime_stop": {
     "status": "PASS",
-    "source_commit": "163020b50f071635febb5270983b6d424bbac582",
-    "size_bytes": 41882185,
-    "sha256": "A87CDDA5A127BD4B4F57994A2FC5534FD1D122A2C75C9142AC53116D3F364701",
-    "native_exe_sha256": "F0104BBC8946B6A03F8C7EEF7EB3CE03424C03B05F193989C320E3D509E1A5A6",
+    "cycles": 3,
+    "native_stopped_received": 3,
+    "forced_terminate_used": 0,
+    "forced_kill_used": 0,
+    "reader_threads_joined": 3,
+    "stop_elapsed_ms": [32, 47, 31],
+    "scope": "runtime harness; not interactive GUI active-share"
+  },
+  "portable_gui_launch": {
+    "status": "PASS",
+    "window_handle_found": true,
+    "wm_close_posted": true,
+    "exit_code": 0,
+    "forced_cleanup_used": false,
+    "residual_processes": 0,
+    "elapsed_ms": 3430
+  },
+  "portable": {
+    "status": "PASS",
+    "path": "_local_artifacts/V0_0_12_RELEASE_FINAL_ba4369d/AgoraLink_v0.0.12_portable.zip",
+    "size_bytes": 41881098,
+    "sha256": "9927AE652064670E9CE771B4BA93D0F13B38BA33DDCE697E60F7ECFAB4CCF479",
+    "native_exe_sha256": "DFA7A6F4B4F3D4C71CD9F7B76E754F4D0C7EAB8D0F24963DCACCA8BE15A70A17",
+    "build_info_commit": "ba4369dfffc0d3efdba622050586f39c0c16404d",
     "zip_entries": 1447,
     "files_scanned": 1434,
+    "ffmpeg_files": 0,
     "pdb_files": 0,
+    "dmp_files": 0,
     "source_files": 0,
-    "external_media_files": 0,
-    "optional_kivy_media_provider_files": 0,
-    "third_party_build_path_file_count": 2,
     "privacy_scan": "PASS",
     "extracted_verification": "PASS"
   },
-  "symbols": {
-    "status": "NOT_CREATED_PRIVACY_GATE",
-    "finding": "local_user_path",
-    "publishable": false
-  },
   "process_and_crash": {
     "residual_media_processes": 0,
+    "residual_ffmpeg_processes": 0,
     "new_dump_candidates": 0
   },
-  "ci": "CONFIGURED_NOT_RUN_NO_PUSH",
-  "manual_not_run": [
-    "real WGC capture",
-    "real QSV encoding",
-    "real D3D11 window rendering",
-    "dual-host LAN",
-    "live GUI file append"
-  ]
+  "manual_required": {
+    "gui_active_share_stop_restart": "NOT_RUN",
+    "dual_host_gui": "NOT_RUN",
+    "live_append_file": "NOT_RUN"
+  },
+  "hardware_results_claimed": false
 }
