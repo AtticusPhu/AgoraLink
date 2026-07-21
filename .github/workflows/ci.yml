@@ -99,6 +99,39 @@ jobs:
               throw "Invalid JSON in $file`: $($_.Exception.Message)"
             }
           }
+      - name: Validate native-only portable definition
+        shell: pwsh
+        run: |
+          $requiredFiles = @(
+            "AgoraLink.spec",
+            "scripts/package_release_v0_0_12.ps1",
+            "scripts/Test-PortablePrivacy.ps1"
+          )
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "Portable definition is missing required file: $file"
+            }
+          }
+
+          $spec = Get-Content -LiteralPath "AgoraLink.spec" -Raw -Encoding UTF8
+          $packageScript = Get-Content -LiteralPath "scripts/package_release_v0_0_12.ps1" -Raw -Encoding UTF8
+          $privacyScript = Get-Content -LiteralPath "scripts/Test-PortablePrivacy.ps1" -Raw -Encoding UTF8
+          if ($spec -notmatch "agoralink_media") {
+            throw "AgoraLink.spec does not bundle the Rust native media runtime."
+          }
+          if ($spec -match "(?i)tools[\\/]+ffmpeg|ffmpeg\.exe|ffplay\.exe|ffprobe\.exe") {
+            throw "AgoraLink.spec bundles a removed FFmpeg-family runtime."
+          }
+          foreach ($marker in @("BUILD_INFO.json", "Test-PortablePrivacy.ps1", "agoralink_media.exe")) {
+            if ($packageScript.IndexOf($marker, [StringComparison]::Ordinal) -lt 0) {
+              throw "Packaging script is missing required marker: $marker"
+            }
+          }
+          foreach ($marker in @(".pdb", ".dmp", ".py", ".rs", "ffmpeg|ffprobe|ffplay")) {
+            if ($privacyScript.IndexOf($marker, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+              throw "Portable privacy gate is missing forbidden marker: $marker"
+            }
+          }
       - name: Validate Cargo metadata schema
         working-directory: rust-native/agoralink_media
         run: cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json | Out-Null
