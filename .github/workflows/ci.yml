@@ -85,6 +85,9 @@ jobs:
           if ($parseFailures -ne 0) {
             throw "$parseFailures PowerShell parse error(s) found"
           }
+      - name: Validation runner smoke
+        shell: pwsh
+        run: ./scripts/Test-ValidationRunner.ps1 -Python python
       - name: Parse tracked JSON metadata
         shell: pwsh
         run: |
