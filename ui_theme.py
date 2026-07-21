@@ -207,6 +207,51 @@ GRAPHITE_BLUE_THEME = _variant(
     },
 )
 
+
+# Secondary windows intentionally use a darker graphite surface.  Keeping these
+# tokens separate lets the settings redesign match the selected Windows desktop
+# direction without changing the established chat, transfer, or screen cards.
+SECONDARY_DARK_THEME = Theme(
+    name="Secondary Graphite",
+    colors={
+        "background": hex_to_rgba("#14181C"),
+        "surface": hex_to_rgba("#191E23"),
+        "surface_muted": hex_to_rgba("#20262C"),
+        "surface_blue": hex_to_rgba("#1D2D3B"),
+        "text_primary": hex_to_rgba("#F0F3F6"),
+        "text_secondary": hex_to_rgba("#B5BEC8"),
+        "text_muted": hex_to_rgba("#84909C"),
+        "border": hex_to_rgba("#313943"),
+        "border_soft": hex_to_rgba("#282F36"),
+        "accent": hex_to_rgba("#2E78BE"),
+        "accent_hover": hex_to_rgba("#3788D2"),
+        "accent_soft": hex_to_rgba("#203A50"),
+        "success": hex_to_rgba("#45A06A"),
+        "success_soft": hex_to_rgba("#1D3829"),
+        "warning": hex_to_rgba("#C18D3D"),
+        "warning_soft": hex_to_rgba("#3A2D1D"),
+        "danger": hex_to_rgba("#E15B5B"),
+        "danger_soft": hex_to_rgba("#3A2326"),
+        "white": hex_to_rgba("#FFFFFF"),
+        "transparent": (0, 0, 0, 0),
+    },
+    radius={
+        "small": 4,
+        "medium": 6,
+        "card": 8,
+        "large": 10,
+        "page": 10,
+        "pill": 999,
+    },
+    spacing=LIGHT_THEME.spacing,
+    font_size=LIGHT_THEME.font_size,
+    fonts=LIGHT_THEME.fonts,
+    shadow={
+        "card": (0.0, 0.0, 0.0, 0.18),
+        "button": (0.0, 0.0, 0.0, 0.12),
+    },
+)
+
 THEME_VARIANTS: Dict[str, Theme] = {
     "current": LIGHT_THEME,
     "default": LIGHT_THEME,
@@ -214,6 +259,7 @@ THEME_VARIANTS: Dict[str, Theme] = {
     "mist": MIST_BLUE_THEME,
     "porcelain": PORCELAIN_GRAY_BLUE_THEME,
     "graphite": GRAPHITE_BLUE_THEME,
+    "secondary-dark": SECONDARY_DARK_THEME,
 }
 
 
