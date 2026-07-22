@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gc
 import math
+import os
 import sys
 import threading
 import unittest
@@ -17,12 +18,18 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from ui_components import FileTransferCard, MessageBubble, RoundedButton, ScreenShareCard
-from ui_device_details import ContactDetailsPage
-from ui_form_components import ConfirmationDialog, ThemedTextInput, ThemeSegmentedControl
-from ui_settings import SettingsCenter
 from ui_theme import PRODUCT_DARK_THEME, PRODUCT_LIGHT_THEME, REQUIRED_SEMANTIC_TOKENS
 from ui_theme_controller import ThemeController, normalize_theme_mode, theme_controller
+
+RUN_KIVY_WIDGET_TESTS = os.environ.get("CI", "").strip().lower() not in {"1", "true", "yes"}
+if os.environ.get("AGORALINK_RUN_KIVY_WIDGET_TESTS", "").strip() == "1":
+    RUN_KIVY_WIDGET_TESTS = True
+
+if RUN_KIVY_WIDGET_TESTS:
+    from ui_components import FileTransferCard, MessageBubble, RoundedButton, ScreenShareCard
+    from ui_device_details import ContactDetailsPage
+    from ui_form_components import ConfirmationDialog, ThemedTextInput, ThemeSegmentedControl
+    from ui_settings import SettingsCenter
 
 
 class DummyWidget:
@@ -185,6 +192,7 @@ class ThemeTokenTests(unittest.TestCase):
             self.assertNotIn("DARK_THEME_PLACEHOLDER", path.read_text(encoding="utf-8"), path.name)
 
 
+@unittest.skipUnless(RUN_KIVY_WIDGET_TESTS, "requires an interactive Kivy window provider")
 class ExistingWidgetThemeTests(unittest.TestCase):
     def setUp(self) -> None:
         theme_controller.set_mode("light", persist=False)
