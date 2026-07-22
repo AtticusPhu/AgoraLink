@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Design tokens for the AgoraLink UI preview.
-
-The first theme is intentionally light-only.  The object shape leaves room for
-dark mode later without making the current UI migration larger than needed.
-"""
+"""Semantic light and dark design tokens for AgoraLink."""
 
 from __future__ import annotations
 
@@ -36,106 +32,221 @@ class Theme:
     shadow: Dict[str, Color]
 
 
-LIGHT_THEME = Theme(
-    name="Variant C - Graphite Blue",
-    colors={
-        "background": hex_to_rgba("#F5F7FA"),
-        "surface": hex_to_rgba("#FFFFFF"),
-        "surface_muted": hex_to_rgba("#EEF2F6"),
-        "surface_blue": hex_to_rgba("#EAF1F7"),
-        "text_primary": hex_to_rgba("#20242A"),
-        "text_secondary": hex_to_rgba("#5F6B7A"),
-        "text_muted": hex_to_rgba("#93A0AD"),
-        "border": hex_to_rgba("#D8E0EA"),
-        "border_soft": hex_to_rgba("#E4E9F0"),
-        "accent": hex_to_rgba("#3F7FA8"),
-        "accent_hover": hex_to_rgba("#356C8F"),
-        "accent_soft": hex_to_rgba("#D7E6F2"),
-        "success": hex_to_rgba("#4C9362"),
-        "success_soft": hex_to_rgba("#EDF6F0"),
-        "warning": hex_to_rgba("#A9772B"),
-        "warning_soft": hex_to_rgba("#FFF4E2"),
-        "danger": hex_to_rgba("#B64B4B"),
-        "danger_soft": hex_to_rgba("#FAECEB"),
-        "white": hex_to_rgba("#FFFFFF"),
-        "transparent": (0, 0, 0, 0),
-    },
-    radius={
-        "small": 8,
-        "medium": 12,
-        "card": 16,
-        "large": 20,
-        "page": 24,
-        "pill": 999,
-    },
-    spacing={
-        "xxs": 4,
-        "xs": 8,
-        "sm": 12,
-        "md": 16,
-        "lg": 24,
-        "xl": 32,
-    },
-    font_size={
-        "caption": 11,
-        "body": 14,
-        "body_strong": 15,
-        "title": 18,
-        "headline": 22,
-        "display": 28,
-        "log": 12,
-    },
-    fonts={
-        "ui": ("Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "Arial"),
-        "latin": ("Segoe UI", "Arial"),
-        "mono": ("Consolas", "Cascadia Mono", "Courier New"),
-    },
-    shadow={
-        "card": (0.08, 0.18, 0.32, 0.045),
-        "button": (0.08, 0.18, 0.32, 0.035),
-    },
+REQUIRED_SEMANTIC_TOKENS = frozenset(
+    {
+        "window_bg",
+        "background",
+        "surface",
+        "surface_elevated",
+        "surface_muted",
+        "surface_selected",
+        "input_bg",
+        "input_bg_active",
+        "menu_bg",
+        "overlay",
+        "text_primary",
+        "text_secondary",
+        "text_muted",
+        "text_disabled",
+        "border",
+        "border_soft",
+        "focus_ring",
+        "accent",
+        "accent_hover",
+        "accent_pressed",
+        "accent_soft",
+        "on_accent",
+        "success",
+        "success_soft",
+        "warning",
+        "warning_soft",
+        "danger",
+        "danger_soft",
+        "bubble_incoming",
+        "bubble_outgoing",
+        "card_file",
+        "card_screen",
+        "scrollbar",
+        "selection",
+        "shadow_card",
+        "shadow_button",
+    }
 )
 
-DARK_THEME_PLACEHOLDER = None
+_RADIUS = {
+    "small": 8,
+    "medium": 12,
+    "card": 16,
+    "large": 20,
+    "page": 24,
+    "pill": 999,
+}
+_SPACING = {"xxs": 4, "xs": 8, "sm": 12, "md": 16, "lg": 24, "xl": 32}
+_FONT_SIZE = {
+    "caption": 11,
+    "body": 14,
+    "body_strong": 15,
+    "title": 18,
+    "headline": 22,
+    "display": 28,
+    "log": 12,
+}
+_FONTS = {
+    "ui": ("Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "Arial"),
+    "latin": ("Segoe UI", "Arial"),
+    "mono": ("Consolas", "Cascadia Mono", "Courier New"),
+}
 
 
-def _variant(name: str, colors: Dict[str, str]) -> Theme:
-    base = dict(LIGHT_THEME.colors)
-    base.update(
+def _with_compatibility_aliases(colors: Dict[str, Color]) -> Dict[str, Color]:
+    result = dict(colors)
+    result.update(
         {
-            "background": hex_to_rgba(colors["background"]),
-            "surface": hex_to_rgba(colors["surface"]),
-            "surface_muted": hex_to_rgba(colors["surface_muted"]),
-            "surface_blue": hex_to_rgba(colors["surface_blue"]),
-            "border": hex_to_rgba(colors["border"]),
-            "border_soft": hex_to_rgba(colors["border_soft"]),
-            "accent": hex_to_rgba(colors["accent"]),
-            "accent_hover": hex_to_rgba(colors["accent_hover"]),
-            "accent_soft": hex_to_rgba(colors["accent_soft"]),
-            "text_primary": hex_to_rgba(colors["text_primary"]),
-            "text_secondary": hex_to_rgba(colors["text_secondary"]),
-            "text_muted": hex_to_rgba(colors["text_muted"]),
-            # State colors are intentionally muted for the preview variants.
-            "success": hex_to_rgba(colors.get("success", "#4FA66A")),
-            "success_soft": hex_to_rgba(colors.get("success_soft", "#EDF7F0")),
-            "warning": hex_to_rgba(colors.get("warning", "#B7791F")),
-            "warning_soft": hex_to_rgba(colors.get("warning_soft", "#FFF4E0")),
-            "danger": hex_to_rgba(colors.get("danger", "#C44B4B")),
-            "danger_soft": hex_to_rgba(colors.get("danger_soft", "#FBEAEA")),
+            "surface_blue": result["card_screen"],
+            "white": hex_to_rgba("#FFFFFF"),
+            "transparent": (0.0, 0.0, 0.0, 0.0),
         }
     )
+    return result
+
+
+PRODUCT_LIGHT_THEME = Theme(
+    name="AgoraLink Light - Graphite Blue",
+    colors=_with_compatibility_aliases(
+        {
+            "window_bg": hex_to_rgba("#F5F7FA"),
+            "background": hex_to_rgba("#F5F7FA"),
+            "surface": hex_to_rgba("#FFFFFF"),
+            "surface_elevated": hex_to_rgba("#FFFFFF"),
+            "surface_muted": hex_to_rgba("#EEF2F6"),
+            "surface_selected": hex_to_rgba("#E2ECF4"),
+            "input_bg": hex_to_rgba("#EEF2F6"),
+            "input_bg_active": hex_to_rgba("#FFFFFF"),
+            "menu_bg": hex_to_rgba("#FFFFFF"),
+            "overlay": hex_to_rgba("#20242A", 0.42),
+            "text_primary": hex_to_rgba("#20242A"),
+            "text_secondary": hex_to_rgba("#5F6B7A"),
+            "text_muted": hex_to_rgba("#667482"),
+            "text_disabled": hex_to_rgba("#9AA6B2"),
+            "border": hex_to_rgba("#D8E0EA"),
+            "border_soft": hex_to_rgba("#E4E9F0"),
+            "focus_ring": hex_to_rgba("#3F7FA8"),
+            "accent": hex_to_rgba("#3F7FA8"),
+            "accent_hover": hex_to_rgba("#356C8F"),
+            "accent_pressed": hex_to_rgba("#2F607F"),
+            "accent_soft": hex_to_rgba("#D7E6F2"),
+            "on_accent": hex_to_rgba("#FFFFFF"),
+            "success": hex_to_rgba("#4C9362"),
+            "success_soft": hex_to_rgba("#EDF6F0"),
+            "warning": hex_to_rgba("#95681F"),
+            "warning_soft": hex_to_rgba("#FFF4E2"),
+            "danger": hex_to_rgba("#B64B4B"),
+            "danger_soft": hex_to_rgba("#FAECEB"),
+            "bubble_incoming": hex_to_rgba("#FFFFFF"),
+            "bubble_outgoing": hex_to_rgba("#EAF1F7"),
+            "card_file": hex_to_rgba("#F1F5F8"),
+            "card_screen": hex_to_rgba("#EAF1F7"),
+            "scrollbar": hex_to_rgba("#AAB7C4"),
+            "selection": hex_to_rgba("#3F7FA8", 0.32),
+            "shadow_card": hex_to_rgba("#142E52", 0.045),
+            "shadow_button": hex_to_rgba("#142E52", 0.035),
+        }
+    ),
+    radius=_RADIUS,
+    spacing=_SPACING,
+    font_size=_FONT_SIZE,
+    fonts=_FONTS,
+    shadow={"card": hex_to_rgba("#142E52", 0.045), "button": hex_to_rgba("#142E52", 0.035)},
+)
+
+PRODUCT_DARK_THEME = Theme(
+    name="AgoraLink Dark - Graphite",
+    colors=_with_compatibility_aliases(
+        {
+            "window_bg": hex_to_rgba("#111519"),
+            "background": hex_to_rgba("#14181C"),
+            "surface": hex_to_rgba("#191E23"),
+            "surface_elevated": hex_to_rgba("#20262C"),
+            "surface_muted": hex_to_rgba("#20262C"),
+            "surface_selected": hex_to_rgba("#203A50"),
+            "input_bg": hex_to_rgba("#20262C"),
+            "input_bg_active": hex_to_rgba("#252D35"),
+            "menu_bg": hex_to_rgba("#20262C"),
+            "overlay": hex_to_rgba("#000000", 0.62),
+            "text_primary": hex_to_rgba("#F0F3F6"),
+            "text_secondary": hex_to_rgba("#C2CBD4"),
+            "text_muted": hex_to_rgba("#A3AFBA"),
+            "text_disabled": hex_to_rgba("#77838E"),
+            "border": hex_to_rgba("#343D46"),
+            "border_soft": hex_to_rgba("#2B333B"),
+            "focus_ring": hex_to_rgba("#579BD7"),
+            "accent": hex_to_rgba("#3A82C3"),
+            "accent_hover": hex_to_rgba("#4892D2"),
+            "accent_pressed": hex_to_rgba("#2F6FA8"),
+            "accent_soft": hex_to_rgba("#203A50"),
+            "on_accent": hex_to_rgba("#FFFFFF"),
+            "success": hex_to_rgba("#5CB779"),
+            "success_soft": hex_to_rgba("#1D3829"),
+            "warning": hex_to_rgba("#D3A356"),
+            "warning_soft": hex_to_rgba("#3A2D1D"),
+            "danger": hex_to_rgba("#E66D6D"),
+            "danger_soft": hex_to_rgba("#3A2326"),
+            "bubble_incoming": hex_to_rgba("#20262C"),
+            "bubble_outgoing": hex_to_rgba("#203A50"),
+            "card_file": hex_to_rgba("#202A32"),
+            "card_screen": hex_to_rgba("#1D2D3B"),
+            "scrollbar": hex_to_rgba("#596571"),
+            "selection": hex_to_rgba("#579BD7", 0.38),
+            "shadow_card": hex_to_rgba("#000000", 0.18),
+            "shadow_button": hex_to_rgba("#000000", 0.12),
+        }
+    ),
+    radius=_RADIUS,
+    spacing=_SPACING,
+    font_size=_FONT_SIZE,
+    fonts=_FONTS,
+    shadow={"card": hex_to_rgba("#000000", 0.18), "button": hex_to_rgba("#000000", 0.12)},
+)
+
+# Compatibility aliases for preview code and older imports. Product modules use
+# ThemeController and must not capture either alias at import time.
+LIGHT_THEME = PRODUCT_LIGHT_THEME
+SECONDARY_DARK_THEME = PRODUCT_DARK_THEME
+
+
+def _preview_variant(name: str, values: Dict[str, str]) -> Theme:
+    colors = dict(PRODUCT_LIGHT_THEME.colors)
+    mapping = {
+        "background": "background",
+        "surface": "surface",
+        "surface_muted": "surface_muted",
+        "surface_blue": "card_screen",
+        "border": "border",
+        "border_soft": "border_soft",
+        "accent": "accent",
+        "accent_hover": "accent_hover",
+        "accent_soft": "accent_soft",
+        "text_primary": "text_primary",
+        "text_secondary": "text_secondary",
+        "text_muted": "text_muted",
+    }
+    for source, target in mapping.items():
+        if source in values:
+            colors[target] = hex_to_rgba(values[source])
+    colors["window_bg"] = colors["background"]
+    colors["surface_blue"] = colors["card_screen"]
     return Theme(
         name=name,
-        colors=base,
-        radius=LIGHT_THEME.radius,
-        spacing=LIGHT_THEME.spacing,
-        font_size=LIGHT_THEME.font_size,
-        fonts=LIGHT_THEME.fonts,
-        shadow=LIGHT_THEME.shadow,
+        colors=colors,
+        radius=_RADIUS,
+        spacing=_SPACING,
+        font_size=_FONT_SIZE,
+        fonts=_FONTS,
+        shadow=PRODUCT_LIGHT_THEME.shadow,
     )
 
 
-MIST_BLUE_THEME = _variant(
+MIST_BLUE_THEME = _preview_variant(
     "Variant A - Mist Blue",
     {
         "background": "#F7FAFD",
@@ -149,17 +260,11 @@ MIST_BLUE_THEME = _variant(
         "accent_soft": "#DCEAF6",
         "text_primary": "#20242A",
         "text_secondary": "#667085",
-        "text_muted": "#98A2B3",
-        "success": "#4FA66A",
-        "success_soft": "#EDF7F0",
-        "warning": "#B7791F",
-        "warning_soft": "#FFF5E5",
-        "danger": "#C44B4B",
-        "danger_soft": "#FBEAEA",
+        "text_muted": "#778595",
     },
 )
 
-PORCELAIN_GRAY_BLUE_THEME = _variant(
+PORCELAIN_GRAY_BLUE_THEME = _preview_variant(
     "Variant B - Porcelain Gray Blue",
     {
         "background": "#F7F8FA",
@@ -173,99 +278,23 @@ PORCELAIN_GRAY_BLUE_THEME = _variant(
         "accent_soft": "#DDEAF5",
         "text_primary": "#1F2933",
         "text_secondary": "#667085",
-        "text_muted": "#98A2B3",
-        "success": "#4D9F65",
-        "success_soft": "#EEF7F1",
-        "warning": "#AE7A28",
-        "warning_soft": "#FFF4E4",
-        "danger": "#BA4A4A",
-        "danger_soft": "#FAECEB",
+        "text_muted": "#778595",
     },
 )
 
-GRAPHITE_BLUE_THEME = _variant(
-    "Variant C - Graphite Blue",
-    {
-        "background": "#F5F7FA",
-        "surface": "#FFFFFF",
-        "surface_muted": "#EEF2F6",
-        "surface_blue": "#EAF1F7",
-        "border": "#D8E0EA",
-        "border_soft": "#E4E9F0",
-        "accent": "#3F7FA8",
-        "accent_hover": "#356C8F",
-        "accent_soft": "#D7E6F2",
-        "text_primary": "#20242A",
-        "text_secondary": "#5F6B7A",
-        "text_muted": "#93A0AD",
-        "success": "#4C9362",
-        "success_soft": "#EDF6F0",
-        "warning": "#A9772B",
-        "warning_soft": "#FFF4E2",
-        "danger": "#B64B4B",
-        "danger_soft": "#FAECEB",
-    },
-)
+GRAPHITE_BLUE_THEME = PRODUCT_LIGHT_THEME
 
-
-# Secondary windows intentionally use a darker graphite surface.  Keeping these
-# tokens separate lets the settings redesign match the selected Windows desktop
-# direction without changing the established chat, transfer, or screen cards.
-SECONDARY_DARK_THEME = Theme(
-    name="Secondary Graphite",
-    colors={
-        "background": hex_to_rgba("#14181C"),
-        "surface": hex_to_rgba("#191E23"),
-        "surface_muted": hex_to_rgba("#20262C"),
-        "surface_blue": hex_to_rgba("#1D2D3B"),
-        "text_primary": hex_to_rgba("#F0F3F6"),
-        "text_secondary": hex_to_rgba("#B5BEC8"),
-        "text_muted": hex_to_rgba("#84909C"),
-        "border": hex_to_rgba("#313943"),
-        "border_soft": hex_to_rgba("#282F36"),
-        "accent": hex_to_rgba("#2E78BE"),
-        "accent_hover": hex_to_rgba("#3788D2"),
-        "accent_soft": hex_to_rgba("#203A50"),
-        "success": hex_to_rgba("#45A06A"),
-        "success_soft": hex_to_rgba("#1D3829"),
-        "warning": hex_to_rgba("#C18D3D"),
-        "warning_soft": hex_to_rgba("#3A2D1D"),
-        "danger": hex_to_rgba("#E15B5B"),
-        "danger_soft": hex_to_rgba("#3A2326"),
-        "white": hex_to_rgba("#FFFFFF"),
-        "transparent": (0, 0, 0, 0),
-    },
-    radius={
-        "small": 4,
-        "medium": 6,
-        "card": 8,
-        "large": 10,
-        "page": 10,
-        "pill": 999,
-    },
-    spacing=LIGHT_THEME.spacing,
-    font_size=LIGHT_THEME.font_size,
-    fonts=LIGHT_THEME.fonts,
-    shadow={
-        "card": (0.0, 0.0, 0.0, 0.18),
-        "button": (0.0, 0.0, 0.0, 0.12),
-    },
-)
-
-THEME_VARIANTS: Dict[str, Theme] = {
-    "current": LIGHT_THEME,
-    "default": LIGHT_THEME,
-    "light": LIGHT_THEME,
+PREVIEW_THEME_VARIANTS: Dict[str, Theme] = {
     "mist": MIST_BLUE_THEME,
     "porcelain": PORCELAIN_GRAY_BLUE_THEME,
     "graphite": GRAPHITE_BLUE_THEME,
-    "secondary-dark": SECONDARY_DARK_THEME,
 }
 
 
 def get_theme(mode: str = "light") -> Theme:
-    """Return a named preview theme; Graphite Blue is the default."""
     key = str(mode or "light").strip().lower()
-    if key in THEME_VARIANTS:
-        return THEME_VARIANTS[key]
-    return LIGHT_THEME
+    if key == "dark":
+        return PRODUCT_DARK_THEME
+    if key in {"light", "current", "default"}:
+        return PRODUCT_LIGHT_THEME
+    return PREVIEW_THEME_VARIANTS.get(key, PRODUCT_LIGHT_THEME)
