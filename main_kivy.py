@@ -22,6 +22,8 @@ import subprocess
 import sys
 import threading
 import time
+from types import MethodType
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -363,6 +365,7 @@ from ui_screen_details import create_screen_share_details_popup
 from ui_settings import SettingsCenter
 from ui_settings_schema import merge_legacy_config
 from ui_transfer_details import create_file_transfer_details_popup
+from ui_theme_controller import ThemableMixin, normalize_theme_mode, theme_color, theme_controller
 try:
     from ui_components import (
         ConversationItem as UIConversationItem,
@@ -842,36 +845,50 @@ def register_ui_font() -> str:
 UI_FONT = register_ui_font()
 
 
-# Centralized UI theme. Kivy color values are RGBA floats in the range 0..1.
-# Change these values if you want a different visual style.
-THEME = {
-    # Graphite Blue: restrained blue-gray UI with small-area accent color.
-    "window_bg": (0.961, 0.969, 0.980, 1),
-    "panel_bg": (1.000, 1.000, 1.000, 1),
-    "primary": (0.247, 0.498, 0.659, 1),
-    "primary_active": (0.208, 0.424, 0.561, 1),
-    "secondary": (0.933, 0.949, 0.965, 1),
-    "secondary_active": (0.843, 0.902, 0.949, 1),
-    "success": (0.298, 0.576, 0.384, 1),
-    "success_active": (0.247, 0.490, 0.325, 1),
-    "danger": (0.714, 0.294, 0.294, 1),
-    "danger_active": (0.624, 0.247, 0.247, 1),
-    "text": (0.125, 0.141, 0.165, 1),
-    "muted_text": (0.373, 0.420, 0.478, 1),
-    "on_primary": (1.000, 1.000, 1.000, 1),
-    "on_secondary": (0.125, 0.141, 0.165, 1),
-    "input_bg": (0.933, 0.949, 0.965, 1),
-    "input_text": (0.125, 0.141, 0.165, 1),
-    "input_cursor": (0.247, 0.498, 0.659, 1),
-    "log_bg": (0.933, 0.949, 0.965, 1),
-    "log_text": (0.125, 0.141, 0.165, 1),
-    "disabled": (0.576, 0.627, 0.678, 1),
-    "bubble_mine": (0.918, 0.945, 0.969, 1),
-    "bubble_other": (1.000, 1.000, 1.000, 1),
-    "menu_bg": (1.000, 1.000, 1.000, 1),
-    "menu_hover": (0.933, 0.949, 0.965, 1),
-    "menu_danger_text": (0.714, 0.294, 0.294, 1),
+# Compatibility access for legacy primary-view code. Values are resolved from
+# the observable controller on every access; this is not an import-time palette.
+_PRIMARY_TOKEN_ALIASES = {
+    "window_bg": "window_bg",
+    "panel_bg": "surface",
+    "primary": "accent",
+    "primary_active": "accent_pressed",
+    "secondary": "surface_muted",
+    "secondary_active": "accent_soft",
+    "success": "success",
+    "success_active": "success",
+    "danger": "danger",
+    "danger_active": "danger",
+    "text": "text_primary",
+    "muted_text": "text_muted",
+    "on_primary": "on_accent",
+    "on_secondary": "text_primary",
+    "input_bg": "input_bg",
+    "input_text": "text_primary",
+    "input_cursor": "focus_ring",
+    "log_bg": "surface_muted",
+    "log_text": "text_primary",
+    "disabled": "text_disabled",
+    "bubble_mine": "bubble_outgoing",
+    "bubble_other": "bubble_incoming",
+    "menu_bg": "menu_bg",
+    "menu_hover": "surface_selected",
+    "menu_danger_text": "danger",
 }
+
+
+class _LegacyThemeProxy(Mapping):
+    def __getitem__(self, key: str):
+        token = _PRIMARY_TOKEN_ALIASES.get(str(key), str(key))
+        return theme_color(token)
+
+    def __iter__(self):
+        return iter(_PRIMARY_TOKEN_ALIASES)
+
+    def __len__(self) -> int:
+        return len(_PRIMARY_TOKEN_ALIASES)
+
+
+THEME = _LegacyThemeProxy()
 
 _BUTTON_ROLES = {
     "primary": ("primary", "on_primary"),
@@ -891,9 +908,9 @@ def modern_button_style(role: str) -> Dict[str, object]:
         return {
             "bg_normal": ui_component_color("accent"),
             "bg_hover": ui_component_color("accent_hover"),
-            "bg_down": ui_component_color("accent_hover"),
-            "text_normal": ui_component_color("white"),
-            "text_down": ui_component_color("white"),
+            "bg_down": ui_component_color("accent_pressed"),
+            "text_normal": ui_component_color("on_accent"),
+            "text_down": ui_component_color("on_accent"),
             "border_color": ui_component_color("accent"),
         }
     if role_name in ("danger", "destructive"):
@@ -924,6 +941,87 @@ def modern_button_style(role: str) -> Dict[str, object]:
     }
 
 
+def _infer_theme_token(value, default: str) -> str:
+    try:
+        rgba = tuple(round(float(item), 6) for item in value)
+    except Exception:
+        return default
+    active = theme_controller.current_theme().colors
+    for token, token_value in active.items():
+        try:
+            if rgba == tuple(round(float(item), 6) for item in token_value):
+                return str(token)
+        except Exception:
+            continue
+    for legacy_name, token in _PRIMARY_TOKEN_ALIASES.items():
+        try:
+            if rgba == tuple(round(float(item), 6) for item in THEME[legacy_name]):
+                return token
+        except Exception:
+            continue
+    return default
+
+
+def _attach_theme_callback(widget, callback) -> None:
+    """Attach one weakly registered live-theme callback to a legacy widget."""
+    if getattr(widget, "_agoralink_theme_callback_attached", False):
+        return
+
+    def _apply(instance, active_theme) -> None:
+        callback(instance, active_theme)
+
+    widget.apply_theme = MethodType(_apply, widget)
+    widget._agoralink_theme_callback_attached = True
+    theme_controller.register(widget)
+
+    if hasattr(widget, "bind") and hasattr(widget, "parent"):
+        def _parent_changed(instance, parent) -> None:
+            if parent is None:
+                theme_controller.unregister(instance)
+            else:
+                theme_controller.register(instance)
+
+        widget.bind(parent=_parent_changed)
+
+
+class PrimaryThemedLabel(ThemableMixin, Label):
+    def __init__(self, *, theme_token: str = "text_primary", **kwargs) -> None:
+        self.theme_token = str(theme_token or "text_primary")
+        kwargs.setdefault("color", theme_color(self.theme_token))
+        super().__init__(**kwargs)
+        self.attach_theme_controller()
+
+    def apply_theme(self, _theme) -> None:
+        self.color = theme_color(self.theme_token)
+
+
+class PrimaryThemedTextInput(ThemableMixin, TextInput):
+    def __init__(
+        self,
+        *,
+        background_token: str = "input_bg",
+        foreground_token: str = "text_primary",
+        cursor_token: str = "focus_ring",
+        **kwargs,
+    ) -> None:
+        self.background_token = str(background_token)
+        self.foreground_token = str(foreground_token)
+        self.cursor_token = str(cursor_token)
+        kwargs.setdefault("background_color", theme_color(self.background_token))
+        kwargs.setdefault("foreground_color", theme_color(self.foreground_token))
+        kwargs.setdefault("cursor_color", theme_color(self.cursor_token))
+        kwargs.setdefault("selection_color", theme_color("selection"))
+        super().__init__(**kwargs)
+        self.bind(focus=self.apply_theme)
+        self.attach_theme_controller()
+
+    def apply_theme(self, *_args) -> None:
+        self.background_color = theme_color("input_bg_active" if self.focus else self.background_token)
+        self.foreground_color = theme_color(self.foreground_token)
+        self.cursor_color = theme_color(self.cursor_token)
+        self.selection_color = theme_color("selection")
+
+
 def style_button(button: Button, role: str = "secondary") -> Button:
     if UIRoundedButton is not None and isinstance(button, UIRoundedButton):
         try:
@@ -940,6 +1038,15 @@ def style_button(button: Button, role: str = "secondary") -> Button:
     button.background_disabled_normal = ""
     button.background_color = THEME[bg_key]
     button.color = THEME[fg_key]
+    button._agoralink_button_role = str(role or "secondary")
+
+    def _apply_legacy_button(instance, _theme) -> None:
+        current_role = str(getattr(instance, "_agoralink_button_role", "secondary"))
+        current_bg, current_fg = _BUTTON_ROLES.get(current_role, _BUTTON_ROLES["secondary"])
+        instance.background_color = THEME[current_bg]
+        instance.color = THEME[current_fg]
+
+    _attach_theme_callback(button, _apply_legacy_button)
     return button
 
 
@@ -951,20 +1058,25 @@ def make_button(role: str = "secondary", **kwargs) -> Button:
 
 def make_input(**kwargs) -> TextInput:
     kwargs.setdefault("font_name", UI_FONT)
-    kwargs.setdefault("background_color", THEME["input_bg"])
-    kwargs.setdefault("foreground_color", THEME["input_text"])
-    kwargs.setdefault("cursor_color", THEME["input_cursor"])
-    kwargs.setdefault("selection_color", (0.10, 0.35, 0.72, 0.24))
-    return TextInput(**kwargs)
+    background_token = _infer_theme_token(kwargs.get("background_color", THEME["input_bg"]), "input_bg")
+    foreground_token = _infer_theme_token(kwargs.get("foreground_color", THEME["input_text"]), "text_primary")
+    cursor_token = _infer_theme_token(kwargs.get("cursor_color", THEME["input_cursor"]), "focus_ring")
+    return PrimaryThemedTextInput(
+        background_token=background_token,
+        foreground_token=foreground_token,
+        cursor_token=cursor_token,
+        **kwargs,
+    )
 
 
 def make_label(**kwargs) -> Label:
     kwargs.setdefault("font_name", UI_FONT)
-    kwargs.setdefault("color", THEME["text"])
-    return Label(**kwargs)
+    explicit = kwargs.get("color", THEME["text"])
+    token = str(kwargs.pop("theme_token", "") or _infer_theme_token(explicit, "text_primary"))
+    return PrimaryThemedLabel(theme_token=token, **kwargs)
 
 
-class ThemedSpinnerOption(SpinnerOption):
+class ThemedSpinnerOption(ThemableMixin, SpinnerOption):
     """Low-noise Spinner dropdown row that follows the active UI theme."""
 
     def __init__(self, **kwargs):
@@ -978,6 +1090,10 @@ class ThemedSpinnerOption(SpinnerOption):
         self.color = ui_component_color("text_primary") if ui_component_color is not None else THEME["text"]
         self.background_color = ui_component_color("surface") if ui_component_color is not None else THEME["panel_bg"]
         self.bind(state=lambda *_: self._sync_theme_state())
+        self.attach_theme_controller()
+        self._sync_theme_state()
+
+    def apply_theme(self, _theme) -> None:
         self._sync_theme_state()
 
     def _sync_theme_state(self) -> None:
@@ -1003,6 +1119,19 @@ def style_spinner(spinner: Spinner) -> Spinner:
     spinner.background_disabled_normal = ""
     spinner.background_color = ui_component_color("surface_muted") if ui_component_color is not None else THEME["input_bg"]
     spinner.color = ui_component_color("text_primary") if ui_component_color is not None else THEME["input_text"]
+
+    def _apply_spinner(instance, _theme) -> None:
+        instance.background_color = theme_color("surface_selected" if instance.state == "down" else "input_bg")
+        instance.color = theme_color("text_primary" if not instance.disabled else "text_disabled")
+        dropdown = getattr(instance, "_dropdown", None)
+        if dropdown is not None and getattr(dropdown, "attach_to", None) is not None:
+            try:
+                dropdown.dismiss()
+            except Exception:
+                pass
+
+    _attach_theme_callback(spinner, _apply_spinner)
+    spinner.bind(state=lambda instance, _state: _apply_spinner(instance, theme_controller.current_theme()))
     return spinner
 
 
@@ -1043,6 +1172,17 @@ def style_popup(popup: Popup) -> Popup:
         popup.separator_height = dp(1)
     except Exception:
         pass
+
+    def _apply_popup(instance, _theme) -> None:
+        instance.background_color = theme_color("background")
+        instance.separator_color = theme_color("border_soft")
+        instance.title_color = theme_color("text_primary")
+
+    _attach_theme_callback(popup, _apply_popup)
+    try:
+        popup.bind(on_dismiss=lambda instance: theme_controller.unregister(instance))
+    except Exception:
+        pass
     return popup
 
 
@@ -1059,6 +1199,11 @@ def apply_card_background(widget, bg_key: str = "panel_bg", radius: int = 18) ->
             except Exception:
                 pass
         widget.bind(pos=_sync, size=_sync)
+
+        def _apply_surface(instance, _theme) -> None:
+            instance._bg_instr.rgba = THEME.get(bg_key, THEME["panel_bg"])
+
+        _attach_theme_callback(widget, _apply_surface)
     except Exception:
         pass
 
@@ -1084,6 +1229,11 @@ def apply_bubble_background(widget, bg_key: str, mine: bool, radius: int = 16) -
             except Exception:
                 pass
         widget.bind(pos=_sync, size=_sync)
+
+        def _apply_bubble(instance, _theme) -> None:
+            instance._bg_instr.rgba = THEME.get(bg_key, THEME["panel_bg"])
+
+        _attach_theme_callback(widget, _apply_bubble)
     except Exception:
         apply_card_background(widget, bg_key, radius=radius)
 
@@ -1095,7 +1245,7 @@ def bind_label_wrap(label: Label) -> Label:
 
 def row(label: str, widget, label_width: int = 150) -> BoxLayout:
     box = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(8))
-    lab = Label(
+    lab = make_label(
         text=label,
         font_name=UI_FONT,
         color=THEME["muted_text"],
@@ -1278,6 +1428,13 @@ class CircularProgressButton(Button):
         self.bold = True
         self._draw()
         self.bind(pos=lambda *_: self._draw(), size=lambda *_: self._draw())
+        _attach_theme_callback(self, lambda instance, _theme: instance._apply_theme_colors())
+
+    def _apply_theme_colors(self) -> None:
+        self.color = THEME["danger"] if self.failed else (
+            THEME["primary_active"] if self.complete or self.pct > 0 else THEME["muted_text"]
+        )
+        self._draw()
 
     def _draw(self) -> None:
         try:
@@ -2171,7 +2328,11 @@ class RUDPTransferRoot(BoxLayout):
         saved_language = str(self.gui_config.get("language", self.lang) or self.lang).strip().lower()
         self.lang = "en" if saved_language.startswith("en") else "zh"
         self.app.lang = self.lang
-        self.theme_mode = self._normalize_theme_mode(self.gui_config.get("theme_mode", "system"))
+        self.theme_mode = theme_controller.configure(
+            self.gui_config,
+            persist_callback=save_gui_config,
+            initial_mode=self.gui_config.get("theme_mode"),
+        )
         self.device_display_name = str(
             self.gui_config.get("device_display_name", self.chat_nickname) or self.chat_nickname
         ).strip()
@@ -2270,6 +2431,7 @@ class RUDPTransferRoot(BoxLayout):
         self._chat_render_generation = 0
         self.pending_outgoing_contact_requests: Dict[str, Dict[str, object]] = {}
         self._build()
+        theme_controller.bind(mode=self._on_global_theme_mode)
         self._apply_saved_settings_to_widgets()
         self.apply_theme_mode(self.theme_mode)
         self.refresh_texts()
@@ -2289,15 +2451,13 @@ class RUDPTransferRoot(BoxLayout):
 
     @staticmethod
     def _normalize_theme_mode(value: object) -> str:
-        text = str(value or "system").strip().lower()
-        aliases = {
-            "跟随系统": "system",
-            "浅色": "light",
-            "深色": "dark",
-            "follow system": "system",
-        }
-        normalized = aliases.get(text, text)
-        return normalized if normalized in {"system", "light", "dark"} else "system"
+        return normalize_theme_mode(value)
+
+    def _on_global_theme_mode(self, _controller, mode: str) -> None:
+        self.theme_mode = normalize_theme_mode(mode)
+        self._close_chat_context_menu()
+        self._dismiss_open_spinner_dropdowns()
+        self._refresh_theme_toggle_text()
 
     def _apply_saved_settings_to_widgets(self) -> None:
         widget_values = (
@@ -2324,6 +2484,7 @@ class RUDPTransferRoot(BoxLayout):
     def _style_modern_or_legacy_button(self, button, role: str) -> None:
         if UIRoundedButton is not None and isinstance(button, UIRoundedButton):
             try:
+                button.variant = "primary" if role in {"primary", "active", "success"} else role
                 for name, value in self._modern_button_style(role).items():
                     setattr(button, name, value)
                 button._refresh_button_state(animated=False)
@@ -2354,6 +2515,7 @@ class RUDPTransferRoot(BoxLayout):
                     "text": text,
                     "height": dp(height),
                     "compact": bool(compact),
+                    "variant": "primary" if role in {"primary", "active", "success"} else role,
                     **self._modern_button_style(role),
                 }
                 if width is not None:
@@ -2517,6 +2679,12 @@ class RUDPTransferRoot(BoxLayout):
         top.add_widget(self.online_btn)
         self.enter_chat_btn = self._make_modern_or_legacy_button("primary", text="进入聊天", width=110, on_release=lambda *_: self.show_startup_unlock_popup())
         top.add_widget(self.enter_chat_btn)
+        self.theme_btn = self._make_modern_or_legacy_button(
+            "secondary",
+            width=82,
+            on_release=lambda *_: self._toggle_theme_from_toolbar(),
+        )
+        top.add_widget(self.theme_btn)
         self.settings_btn = self._make_modern_or_legacy_button("secondary", text="设置", width=96, on_release=lambda *_: self.open_settings_popup())
         top.add_widget(self.settings_btn)
         self.debug_btn = self._make_modern_or_legacy_button("secondary", text="诊断", width=112, on_release=lambda *_: self.open_debug_popup())
@@ -3120,11 +3288,34 @@ class RUDPTransferRoot(BoxLayout):
     def _close_chat_context_menu(self, *_args) -> None:
         overlay = getattr(self, "_chat_context_overlay", None)
         if overlay is not None:
+            resize_callback = getattr(overlay, "_context_resize_cb", None)
+            if resize_callback is not None:
+                try:
+                    Window.unbind(on_resize=resize_callback)
+                except Exception:
+                    pass
             try:
                 Window.remove_widget(overlay)
             except Exception:
                 pass
         self._chat_context_overlay = None
+
+    def _dismiss_open_spinner_dropdowns(self) -> None:
+        """Close transient dropdowns so they cannot retain the previous theme."""
+        try:
+            widgets = self.walk()
+        except Exception:
+            widgets = ()
+        for widget in widgets:
+            if not isinstance(widget, Spinner):
+                continue
+            dropdown = getattr(widget, "_dropdown", None)
+            if dropdown is None:
+                continue
+            try:
+                dropdown.dismiss()
+            except Exception:
+                pass
 
     def _build_context_menu_button(self, label: str, role: str, callback) -> Button:
         btn = Button(
@@ -5526,6 +5717,7 @@ class RUDPTransferRoot(BoxLayout):
                 self._schedule_screen_share_button_refresh()
             if hasattr(self, "settings_btn"):
                 self.settings_btn.text = "设置" if self.lang == "zh" else "Settings"
+            self._refresh_theme_toggle_text()
             if hasattr(self, "debug_btn"):
                 self.debug_btn.text = "诊断" if self.lang == "zh" else "Diagnostics"
             if hasattr(self, "right_title"):
@@ -5978,7 +6170,7 @@ class RUDPTransferRoot(BoxLayout):
         values.update(
             {
                 "language": self.lang,
-                "theme_mode": self._normalize_theme_mode(getattr(self, "theme_mode", "system")),
+                "theme_mode": self._normalize_theme_mode(getattr(self, "theme_mode", "light")),
                 "device_display_name": str(getattr(self, "device_display_name", "") or self.chat_nickname),
                 "receiver_port": int(getattr(self, "receiver_port_setting", MAIN_UDP_PORT)),
                 "discovery_port": int(getattr(self, "discovery_port_setting", DEFAULT_DISCOVERY_PORT)),
@@ -6189,6 +6381,7 @@ class RUDPTransferRoot(BoxLayout):
             initial_values=self._settings_initial_values(),
             context=self._settings_context(),
             on_save=self._save_settings_center_values,
+            on_theme_change=self.apply_theme_mode,
             on_close=_close,
             on_browse_directory=lambda callback: self._native_file_dialog(select_dir=True, callback=callback),
             actions=actions,
@@ -6202,7 +6395,7 @@ class RUDPTransferRoot(BoxLayout):
             auto_dismiss=False,
             separator_height=0,
             background="",
-            background_color=(0.035, 0.043, 0.055, 1),
+            background_color=theme_color("background"),
         )
         holder["popup"] = popup
         popup.open()
@@ -6234,7 +6427,9 @@ class RUDPTransferRoot(BoxLayout):
         content.add_widget(app_info_box)
         theme_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(8))
         theme_line.add_widget(make_label(text="主题", size_hint_x=None, width=dp(90), color=THEME["muted_text"]))
-        theme_spinner = style_spinner(Spinner(text=getattr(self, "theme_mode", "跟随系统"), values=["跟随系统", "浅色", "深色"], font_name=UI_FONT))
+        theme_labels = ["浅色", "深色"] if self.lang == "zh" else ["Light", "Dark"]
+        current_theme_label = theme_labels[1] if self._normalize_theme_mode(getattr(self, "theme_mode", "light")) == "dark" else theme_labels[0]
+        theme_spinner = style_spinner(Spinner(text=current_theme_label, values=theme_labels, font_name=UI_FONT))
         theme_line.add_widget(theme_spinner)
         content.add_widget(theme_line)
         package_line = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(8))
@@ -8319,12 +8514,32 @@ class RUDPTransferRoot(BoxLayout):
         apply_ui_font(content)
         popup.open()
 
-    def apply_theme_mode(self, mode: str) -> None:
-        self.theme_mode = self._normalize_theme_mode(mode)
-        if self.theme_mode == "dark":
-            Window.clearcolor = (0.08, 0.09, 0.11, 1)
+    def _refresh_theme_toggle_text(self) -> None:
+        button = getattr(self, "theme_btn", None)
+        if button is None:
+            return
+        target_is_dark = theme_controller.mode == "light"
+        if self.lang == "zh":
+            button.text = "深色" if target_is_dark else "浅色"
         else:
-            Window.clearcolor = THEME["window_bg"]
+            button.text = "Dark" if target_is_dark else "Light"
+
+    def _toggle_theme_from_toolbar(self) -> None:
+        button = getattr(self, "theme_btn", None)
+        if button is not None and button.disabled:
+            return
+        if button is not None:
+            button.disabled = True
+        theme_controller.toggle(persist=True)
+        self.theme_mode = theme_controller.mode
+        Clock.schedule_once(
+            lambda _dt: setattr(button, "disabled", False) if button is not None else None,
+            0,
+        )
+
+    def apply_theme_mode(self, mode: str) -> None:
+        self.theme_mode = theme_controller.set_mode(self._normalize_theme_mode(mode), persist=True)
+        self._refresh_theme_toggle_text()
 
     def _receiver_endpoint(self, rec: Dict[str, object]) -> tuple[str, int]:
         ip = str(rec.get("endpoint_ip") or rec.get("ip") or "").strip()
@@ -9761,12 +9976,12 @@ class RUDPTransferRoot(BoxLayout):
 
     def _multi_file_popup(self, callback) -> None:
         chooser = FileChooserListView(path=str(Path.home()), multiselect=True)
-        popup = Popup(title=self.cu("choose_files_multi"), content=BoxLayout(orientation="vertical"), size_hint=(0.9, 0.9))
+        popup = style_popup(Popup(title=self.cu("choose_files_multi"), content=BoxLayout(orientation="vertical"), size_hint=(0.9, 0.9)))
         box = popup.content
         box.add_widget(chooser)
         row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8), padding=dp(8))
-        ok = Button(text="OK")
-        cancel = Button(text=self.cu("cancel"))
+        ok = make_button("primary", text="OK")
+        cancel = make_button("secondary", text=self.cu("cancel"))
         row.add_widget(ok)
         row.add_widget(cancel)
         box.add_widget(row)
@@ -9847,12 +10062,12 @@ class RUDPTransferRoot(BoxLayout):
 
     def _multi_folder_popup(self, callback) -> None:
         chooser = FileChooserListView(path=str(Path.home()), dirselect=True, multiselect=True)
-        popup = Popup(title=self.cu("choose_folder_package"), content=BoxLayout(orientation="vertical"), size_hint=(0.9, 0.9))
+        popup = style_popup(Popup(title=self.cu("choose_folder_package"), content=BoxLayout(orientation="vertical"), size_hint=(0.9, 0.9)))
         box = popup.content
         box.add_widget(chooser)
         row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8), padding=dp(8))
-        ok = Button(text="OK")
-        cancel = Button(text=self.cu("cancel"))
+        ok = make_button("primary", text="OK")
+        cancel = make_button("secondary", text=self.cu("cancel"))
         row.add_widget(ok)
         row.add_widget(cancel)
         box.add_widget(row)
@@ -11491,6 +11706,10 @@ class RUDPTransferRoot(BoxLayout):
         self.speed_label.text = self.t("speed", speed=f"{avg:.2f} Mbps") + "    " + self.t("size", size=format_file_size(total))
 
     def on_stop(self) -> None:
+        try:
+            theme_controller.unbind(mode=self._on_global_theme_mode)
+        except Exception:
+            pass
         self.sender_worker.stop()
         self.receiver_worker.stop()
         if self.chat_store is not None:
