@@ -19,9 +19,10 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 
-from ui_theme import LIGHT_THEME, Color as ThemeColor, Theme
+from ui_theme import PRODUCT_LIGHT_THEME, Color as ThemeColor, Theme
+from ui_theme_controller import ThemableMixin, theme_controller
 
-THEME = LIGHT_THEME
+_PREVIEW_THEME_OVERRIDE: Optional[Theme] = None
 UI_ANIMATION_SECONDS = 0.14
 PROGRESS_UI_INTERVAL_SECONDS = 0.15
 TERMINAL_STATUSES = {"success", "failed", "danger", "rejected", "stopped", "complete", "completed"}
@@ -49,23 +50,37 @@ def _register_font_alias(alias: str, candidates: Iterable[str]) -> str:
     return "Roboto"
 
 
-UI_FONT = _register_font_alias("AgoraLinkPreviewUI", THEME.fonts["ui"])
-MONO_FONT = _register_font_alias("AgoraLinkPreviewMono", THEME.fonts["mono"])
+UI_FONT = _register_font_alias("AgoraLinkPreviewUI", PRODUCT_LIGHT_THEME.fonts["ui"])
+MONO_FONT = _register_font_alias("AgoraLinkPreviewMono", PRODUCT_LIGHT_THEME.fonts["mono"])
 
 
 def set_theme(theme: Theme) -> None:
-    """Set the active theme for newly created preview widgets."""
-    global THEME
-    if isinstance(theme, Theme):
-        THEME = theme
+    """Set a theme override for the standalone A/B/C preview process."""
+    global _PREVIEW_THEME_OVERRIDE
+    _PREVIEW_THEME_OVERRIDE = theme if isinstance(theme, Theme) else None
+
+
+def _theme() -> Theme:
+    return _PREVIEW_THEME_OVERRIDE or theme_controller.current_theme()
 
 
 def color(name: str, alpha: Optional[float] = None, theme: Optional[Theme] = None) -> List[float]:
-    active = theme or THEME
+    active = theme or _theme()
     rgba = list(active.colors.get(name, active.colors["text_primary"]))
     if alpha is not None:
         rgba[3] = float(alpha)
     return rgba
+
+
+class _ThemedLabel(ThemableMixin, Label):
+    def __init__(self, *, theme_token: str = "text_primary", **kwargs) -> None:
+        self.theme_token = str(theme_token or "text_primary")
+        kwargs.setdefault("color", color(self.theme_token))
+        super().__init__(**kwargs)
+        self.attach_theme_controller()
+
+    def apply_theme(self, _theme_value) -> None:
+        self.color = color(self.theme_token)
 
 
 def _mix(a: List[float], b: List[float], amount: float) -> List[float]:
@@ -156,8 +171,8 @@ def _button_style_kwargs(style: str) -> Dict[str, object]:
             "bg_normal": color("accent"),
             "bg_hover": color("accent_hover"),
             "bg_down": color("accent_hover"),
-            "text_normal": color("white"),
-            "text_down": color("white"),
+            "text_normal": color("on_accent"),
+            "text_down": color("on_accent"),
             "border_color": color("accent"),
         }
     if style_name in ("danger", "destructive", "reject"):
@@ -204,6 +219,7 @@ class _CardActionsMixin:
             action_id = str(action.get("action") or "")
             button = PillButton(
                 text=label,
+                variant=str(action.get("style") or "secondary"),
                 size_hint_x=None,
                 width=_action_button_width(label),
                 disabled=not bool(action_id),
@@ -227,7 +243,7 @@ class _RoundedCanvasMixin:
     bg_color = ListProperty(color("surface"))
     border_color = ListProperty(color("border"))
     border_width = NumericProperty(1)
-    radius = NumericProperty(THEME.radius["card"])
+    radius = NumericProperty(PRODUCT_LIGHT_THEME.radius["card"])
 
     def _init_rounded_canvas(self) -> None:
         with self.canvas.before:
@@ -250,7 +266,7 @@ class _RoundedCanvasMixin:
     def _update_rounded_canvas(self, *_args) -> None:
         try:
             r = float(self.radius)
-            self._shadow_color.rgba = THEME.shadow["card"]
+            self._shadow_color.rgba = color("shadow_card")
             self._shadow_rect.pos = (self.x, self.y - dp(1))
             self._shadow_rect.size = self.size
             self._shadow_rect.radius = [r]
@@ -265,20 +281,27 @@ class _RoundedCanvasMixin:
             pass
 
 
-class RoundedCard(_RoundedCanvasMixin, BoxLayout):
+class RoundedCard(ThemableMixin, _RoundedCanvasMixin, BoxLayout):
     """A low-noise surface with rounded corners and a subtle border."""
 
     def __init__(self, **kwargs):
         kwargs.setdefault("orientation", "vertical")
-        kwargs.setdefault("spacing", dp(THEME.spacing["sm"]))
-        kwargs.setdefault("padding", [dp(THEME.spacing["md"])] * 4)
+        self.theme_bg_token = str(kwargs.pop("theme_bg_token", "surface"))
+        self.theme_border_token = str(kwargs.pop("theme_border_token", "border"))
+        kwargs.setdefault("spacing", dp(_theme().spacing["sm"]))
+        kwargs.setdefault("padding", [dp(_theme().spacing["md"])] * 4)
         kwargs.setdefault("bg_color", color("surface"))
         kwargs.setdefault("border_color", color("border"))
         super().__init__(**kwargs)
         self._init_rounded_canvas()
 
+    def apply_theme(self, _theme_value) -> None:
+        self.bg_color = color(self.theme_bg_token)
+        self.border_color = color(self.theme_border_token)
+        self._update_rounded_canvas()
 
-class RoundedButton(ButtonBehavior, Label):
+
+class RoundedButton(ThemableMixin, ButtonBehavior, Label):
     """Rounded text button with subtle hover and press feedback."""
 
     variant = StringProperty("")
@@ -287,16 +310,16 @@ class RoundedButton(ButtonBehavior, Label):
     bg_hover = ListProperty(color("accent_soft"))
     bg_down = ListProperty(color("accent"))
     text_normal = ListProperty(color("text_primary"))
-    text_down = ListProperty(color("white"))
+    text_down = ListProperty(color("on_accent"))
     border_color = ListProperty(color("border"))
-    radius = NumericProperty(THEME.radius["medium"])
+    radius = NumericProperty(PRODUCT_LIGHT_THEME.radius["medium"])
     fill_color = ListProperty(color("surface_muted"))
     hovered = BooleanProperty(False)
 
     def __init__(self, **kwargs):
         is_compact = bool(kwargs.get("compact", False))
         kwargs.setdefault("font_name", UI_FONT)
-        kwargs.setdefault("font_size", sp(THEME.font_size["caption"] if is_compact else THEME.font_size["body"]))
+        kwargs.setdefault("font_size", sp(_theme().font_size["caption"] if is_compact else _theme().font_size["body"]))
         kwargs.setdefault("halign", "center")
         kwargs.setdefault("valign", "middle")
         kwargs.setdefault("shorten", True)
@@ -328,6 +351,7 @@ class RoundedButton(ButtonBehavior, Label):
         Window.bind(mouse_pos=self._on_mouse_pos)
         self.bind(parent=self._on_parent)
         self._update_button_canvas()
+        self.attach_theme_controller()
 
     def _disable_default_button_background(self) -> None:
         for name, value in (
@@ -346,7 +370,7 @@ class RoundedButton(ButtonBehavior, Label):
             max_radius = max(0.0, min(float(self.width or 0), float(self.height or 0)) / 2.0)
             return max(0.0, min(float(self.radius), max_radius))
         except Exception:
-            return float(THEME.radius["medium"])
+            return float(_theme().radius["medium"])
 
     def _on_mouse_pos(self, _window, pos) -> None:
         if not self.get_root_window():
@@ -355,7 +379,9 @@ class RoundedButton(ButtonBehavior, Label):
 
     def _on_parent(self, _instance, parent) -> None:
         if parent is not None:
+            self.attach_theme_controller()
             return
+        self.detach_theme_controller()
         try:
             Window.unbind(mouse_pos=self._on_mouse_pos)
         except Exception:
@@ -366,9 +392,9 @@ class RoundedButton(ButtonBehavior, Label):
         if variant in ("primary", "active", "success", "accent"):
             self.bg_normal = color("accent")
             self.bg_hover = color("accent_hover")
-            self.bg_down = color("accent_hover")
-            self.text_normal = color("white")
-            self.text_down = color("white")
+            self.bg_down = color("accent_pressed")
+            self.text_normal = color("on_accent")
+            self.text_down = color("on_accent")
             self.border_color = color("accent")
         elif variant in ("danger", "destructive", "reject"):
             self.bg_normal = color("danger_soft")
@@ -392,6 +418,10 @@ class RoundedButton(ButtonBehavior, Label):
             self.text_down = color("text_primary")
             self.border_color = color("border")
         self._refresh_button_state(animated=False)
+
+    def apply_theme(self, _theme_value) -> None:
+        self._apply_variant()
+        self._update_button_canvas()
 
     def _refresh_button_state(self, animated: bool = False) -> None:
         if self.disabled:
@@ -420,23 +450,23 @@ class RoundedButton(ButtonBehavior, Label):
 
 class PillButton(RoundedButton):
     def __init__(self, **kwargs):
-        kwargs.setdefault("radius", THEME.radius["pill"])
+        kwargs.setdefault("radius", _theme().radius["pill"])
         kwargs.setdefault("height", dp(34))
         kwargs.setdefault("padding", [dp(16), 0])
         super().__init__(**kwargs)
 
 
-class StatusBadge(Label):
+class StatusBadge(ThemableMixin, Label):
     status = StringProperty("neutral")
     fill_color = ListProperty(color("surface_muted"))
     border_color = ListProperty(color("border"))
-    radius = NumericProperty(THEME.radius["small"])
+    radius = NumericProperty(PRODUCT_LIGHT_THEME.radius["small"])
     min_width = NumericProperty(dp(52))
     max_width = NumericProperty(dp(118))
 
     def __init__(self, **kwargs):
         kwargs.setdefault("font_name", UI_FONT)
-        kwargs.setdefault("font_size", sp(THEME.font_size["caption"]))
+        kwargs.setdefault("font_size", sp(_theme().font_size["caption"]))
         kwargs.setdefault("bold", True)
         kwargs.setdefault("halign", "center")
         kwargs.setdefault("valign", "middle")
@@ -458,6 +488,12 @@ class StatusBadge(Label):
         self.bind(texture_size=lambda *_: self._fit_width(), text=lambda *_: self._fit_width(), max_width=lambda *_: self._fit_width())
         self._apply_status()
         self._fit_width()
+        self.attach_theme_controller()
+
+    def apply_theme(self, _theme_value) -> None:
+        self.border_color = color("border")
+        self._status_initialized = False
+        self._apply_status()
 
     def _apply_status(self, *_args) -> None:
         mapping = {
@@ -509,28 +545,28 @@ class ConversationItem(ButtonBehavior, RoundedCard):
         kwargs.setdefault("height", dp(60))
         kwargs.setdefault("padding", [dp(12), dp(8), dp(12), dp(8)])
         kwargs.setdefault("spacing", dp(4))
-        kwargs.setdefault("radius", THEME.radius["medium"])
+        kwargs.setdefault("radius", _theme().radius["medium"])
         kwargs.setdefault("bg_color", color("surface"))
         kwargs.setdefault("border_color", color("border_soft"))
         super().__init__(**kwargs)
         self._disable_default_button_background()
 
         top = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(24))
-        self.title_label = Label(
+        self.title_label = _ThemedLabel(
+            theme_token="text_primary",
             font_name=UI_FONT,
-            font_size=sp(THEME.font_size["body_strong"]),
+            font_size=sp(_theme().font_size["body_strong"]),
             bold=True,
-            color=color("text_primary"),
             halign="left",
             valign="middle",
             shorten=True,
             shorten_from="right",
             size_hint_x=1,
         )
-        self.meta_label = Label(
+        self.meta_label = _ThemedLabel(
+            theme_token="text_muted",
             font_name=UI_FONT,
-            font_size=sp(THEME.font_size["caption"]),
-            color=color("text_muted"),
+            font_size=sp(_theme().font_size["caption"]),
             halign="right",
             valign="middle",
             shorten=True,
@@ -544,20 +580,20 @@ class ConversationItem(ButtonBehavior, RoundedCard):
         top.add_widget(self.meta_label)
 
         bottom = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(20))
-        self.preview_label = Label(
+        self.preview_label = _ThemedLabel(
+            theme_token="text_secondary",
             font_name=UI_FONT,
-            font_size=sp(THEME.font_size["caption"]),
-            color=color("text_secondary"),
+            font_size=sp(_theme().font_size["caption"]),
             halign="left",
             valign="middle",
             shorten=True,
             shorten_from="right",
             size_hint_x=1,
         )
-        self.status_label = Label(
+        self.status_label = _ThemedLabel(
+            theme_token="text_muted",
             font_name=UI_FONT,
-            font_size=sp(THEME.font_size["caption"]),
-            color=color("text_muted"),
+            font_size=sp(_theme().font_size["caption"]),
             halign="right",
             valign="middle",
             shorten=True,
@@ -589,6 +625,7 @@ class ConversationItem(ButtonBehavior, RoundedCard):
         self.bind(parent=self._on_parent)
         self._sync_text()
         self._sync_style()
+        self.attach_theme_controller()
 
     def _disable_default_button_background(self) -> None:
         for name, value in (
@@ -608,7 +645,9 @@ class ConversationItem(ButtonBehavior, RoundedCard):
 
     def _on_parent(self, _instance, parent) -> None:
         if parent is not None:
+            self.attach_theme_controller()
             return
+        self.detach_theme_controller()
         try:
             Window.unbind(mouse_pos=self._on_mouse_pos)
         except Exception:
@@ -655,7 +694,7 @@ class ConversationItem(ButtonBehavior, RoundedCard):
                 self.bg_color = color("accent_soft")
                 self.border_color = color("accent")
             elif self.active:
-                self.bg_color = color("surface_blue")
+                self.bg_color = color("surface_selected")
                 self.border_color = color("accent_soft")
             elif self.hovered:
                 self.bg_color = color("surface_muted")
@@ -665,6 +704,10 @@ class ConversationItem(ButtonBehavior, RoundedCard):
                 self.border_color = color("border_soft")
         except Exception:
             pass
+
+    def apply_theme(self, theme_value) -> None:
+        self._sync_style()
+        self._update_rounded_canvas()
 
 
 class MessageBubble(RoundedCard):
@@ -677,10 +720,11 @@ class MessageBubble(RoundedCard):
         kwargs.setdefault("spacing", dp(4))
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("size_hint_x", 0.78)
-        kwargs.setdefault("radius", THEME.radius["card"])
+        kwargs.setdefault("radius", _theme().radius["card"])
+        kwargs.setdefault("theme_bg_token", "bubble_incoming")
         super().__init__(**kwargs)
-        self.sender_label = Label(font_name=UI_FONT, font_size=sp(THEME.font_size["caption"]), color=color("text_secondary"), halign="left", valign="middle", size_hint_y=None, height=0, shorten=True)
-        self.message_label = Label(font_name=UI_FONT, font_size=sp(THEME.font_size["body"]), color=color("text_primary"), halign="left", valign="top", shorten=False, size_hint_y=None)
+        self.sender_label = _ThemedLabel(theme_token="text_secondary", font_name=UI_FONT, font_size=sp(_theme().font_size["caption"]), halign="left", valign="middle", size_hint_y=None, height=0, shorten=True)
+        self.message_label = _ThemedLabel(theme_token="text_primary", font_name=UI_FONT, font_size=sp(_theme().font_size["body"]), halign="left", valign="top", shorten=False, size_hint_y=None)
         _bind_single_line_label(self.sender_label)
         self.message_label.bind(width=lambda inst, _value: setattr(inst, "text_size", (max(1, inst.width), None)))
         self.message_label.bind(texture_size=lambda inst, value: setattr(inst, "height", max(dp(24), float(value[1]) + dp(2))))
@@ -692,6 +736,7 @@ class MessageBubble(RoundedCard):
         self.bind(sender=self._sync_text, message=self._sync_text, direction=self._sync_style)
         self._sync_text()
         self._sync_style()
+        self.attach_theme_controller()
 
     def _sync_text(self, *_args) -> None:
         sender = str(self.sender or "").strip()
@@ -703,10 +748,10 @@ class MessageBubble(RoundedCard):
 
     def _sync_style(self, *_args) -> None:
         if str(self.direction or "") == "outgoing":
-            self.bg_color = color("surface_blue")
+            self.bg_color = color("bubble_outgoing")
             self.border_color = color("border")
         else:
-            self.bg_color = color("surface")
+            self.bg_color = color("bubble_incoming")
             self.border_color = color("border")
 
     def _sync_text_size(self) -> None:
@@ -720,14 +765,18 @@ class MessageBubble(RoundedCard):
         except Exception:
             pass
 
+    def apply_theme(self, theme_value) -> None:
+        self._sync_style()
+        self._update_rounded_canvas()
 
-class RoundedProgressBar(Widget):
+
+class RoundedProgressBar(ThemableMixin, Widget):
     value = NumericProperty(0)
     display_value = NumericProperty(0)
     max = NumericProperty(100)
     track_color = ListProperty(color("surface_muted"))
     fill_color = ListProperty(color("accent"))
-    radius = NumericProperty(THEME.radius["small"])
+    radius = NumericProperty(PRODUCT_LIGHT_THEME.radius["small"])
 
     def __init__(self, **kwargs):
         kwargs.setdefault("size_hint_y", None)
@@ -747,6 +796,11 @@ class RoundedProgressBar(Widget):
         self.bind(pos=self._update_bar, size=self._update_bar, display_value=self._update_bar, max=self._update_bar, track_color=self._update_bar, fill_color=self._update_bar)
         self.bind(value=self._schedule_display_value)
         self._update_bar()
+        self.attach_theme_controller()
+
+    def apply_theme(self, _theme_value) -> None:
+        self.track_color = color("surface_muted")
+        self.fill_color = color("accent")
 
     def set_value(self, value: float, *, immediate: bool = False) -> None:
         if immediate:
@@ -829,17 +883,18 @@ class FileTransferCard(_CardActionsMixin, RoundedCard):
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("padding", [dp(14), dp(12), dp(14), dp(12)])
         kwargs.setdefault("spacing", dp(8))
-        kwargs.setdefault("bg_color", color("surface_blue"))
+        kwargs.setdefault("bg_color", color("card_file"))
+        kwargs.setdefault("theme_bg_token", "card_file")
         kwargs.setdefault("border_color", color("border"))
         super().__init__(**kwargs)
         header = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(26))
-        self.title_label = Label(font_name=UI_FONT, font_size=sp(THEME.font_size["body_strong"]), bold=True, color=color("text_primary"), halign="left", valign="middle", shorten=True, size_hint_x=1)
+        self.title_label = _ThemedLabel(theme_token="text_primary", font_name=UI_FONT, font_size=sp(_theme().font_size["body_strong"]), bold=True, halign="left", valign="middle", shorten=True, size_hint_x=1)
         self.badge = StatusBadge(text=self.status_text, status=self.status)
         _bind_single_line_label(self.title_label)
         header.add_widget(self.title_label)
         header.add_widget(self.badge)
-        self.file_label = Label(font_name=UI_FONT, font_size=sp(THEME.font_size["body"]), color=color("text_primary"), halign="left", valign="middle", shorten=True, shorten_from="center", size_hint_x=1, size_hint_y=None, height=dp(24))
-        self.detail_label = Label(font_name=UI_FONT, font_size=sp(THEME.font_size["caption"]), color=color("text_secondary"), halign="left", valign="middle", shorten=True, shorten_from="right", size_hint_x=1, size_hint_y=None, height=dp(22))
+        self.file_label = _ThemedLabel(theme_token="text_primary", font_name=UI_FONT, font_size=sp(_theme().font_size["body"]), halign="left", valign="middle", shorten=True, shorten_from="center", size_hint_x=1, size_hint_y=None, height=dp(24))
+        self.detail_label = _ThemedLabel(theme_token="text_secondary", font_name=UI_FONT, font_size=sp(_theme().font_size["caption"]), halign="left", valign="middle", shorten=True, shorten_from="right", size_hint_x=1, size_hint_y=None, height=dp(22))
         _bind_single_line_label(self.file_label)
         _bind_single_line_label(self.detail_label)
         self.progress_bar = RoundedProgressBar(value=self.progress, size_hint_x=1)
@@ -852,6 +907,7 @@ class FileTransferCard(_CardActionsMixin, RoundedCard):
         self._init_action_support(actions, on_action)
         self.bind(title=self._sync, filename=self._sync, detail=self._sync, status_text=self._sync, status=self._sync, progress=self._sync)
         self._sync()
+        self.attach_theme_controller()
 
     def _sync(self, *_args) -> None:
         self.title_label.text = str(self.title or "")
@@ -863,6 +919,12 @@ class FileTransferCard(_CardActionsMixin, RoundedCard):
         terminal = bool(str(self.status or "").lower() in TERMINAL_STATUSES or any(token in status_text for token in ("complete", "completed", "failed", "rejected", "saved", "已完成", "失败", "拒绝")))
         self.progress_bar.set_value(float(self.progress or 0), immediate=terminal)
         _animate_list_property(self, "border_color", _status_border_color(status_text), animated=True)
+
+    def apply_theme(self, theme_value) -> None:
+        self.bg_color = color("card_file")
+        if hasattr(self, "badge"):
+            self._sync()
+        self._update_rounded_canvas()
 
 
 class ScreenShareCard(_CardActionsMixin, RoundedCard):
@@ -878,17 +940,18 @@ class ScreenShareCard(_CardActionsMixin, RoundedCard):
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("padding", [dp(14), dp(12), dp(14), dp(12)])
         kwargs.setdefault("spacing", dp(8))
-        kwargs.setdefault("bg_color", color("surface_blue"))
+        kwargs.setdefault("bg_color", color("card_screen"))
+        kwargs.setdefault("theme_bg_token", "card_screen")
         kwargs.setdefault("border_color", color("border"))
         super().__init__(**kwargs)
         header = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(28))
-        self.title_label = Label(font_name=UI_FONT, font_size=sp(THEME.font_size["body_strong"]), bold=True, color=color("text_primary"), halign="left", valign="middle", shorten=True, size_hint_x=1)
+        self.title_label = _ThemedLabel(theme_token="text_primary", font_name=UI_FONT, font_size=sp(_theme().font_size["body_strong"]), bold=True, halign="left", valign="middle", shorten=True, size_hint_x=1)
         self.badge = StatusBadge(text=self.status_text, status=self.status)
         _bind_single_line_label(self.title_label)
         header.add_widget(self.title_label)
         header.add_widget(self.badge)
-        self.peer_label = Label(font_name=UI_FONT, font_size=sp(THEME.font_size["body"]), color=color("text_primary"), halign="left", valign="middle", shorten=True, shorten_from="right", size_hint_x=1, size_hint_y=None, height=dp(24))
-        self.detail_label = Label(font_name=UI_FONT, font_size=sp(THEME.font_size["caption"]), color=color("text_secondary"), halign="left", valign="middle", shorten=True, shorten_from="right", size_hint_x=1, size_hint_y=None, height=dp(22))
+        self.peer_label = _ThemedLabel(theme_token="text_primary", font_name=UI_FONT, font_size=sp(_theme().font_size["body"]), halign="left", valign="middle", shorten=True, shorten_from="right", size_hint_x=1, size_hint_y=None, height=dp(24))
+        self.detail_label = _ThemedLabel(theme_token="text_secondary", font_name=UI_FONT, font_size=sp(_theme().font_size["caption"]), halign="left", valign="middle", shorten=True, shorten_from="right", size_hint_x=1, size_hint_y=None, height=dp(22))
         _bind_single_line_label(self.peer_label)
         _bind_single_line_label(self.detail_label)
         self.add_widget(header)
@@ -899,6 +962,7 @@ class ScreenShareCard(_CardActionsMixin, RoundedCard):
         self._init_action_support(actions, on_action)
         self.bind(title=self._sync, peer=self._sync, detail=self._sync, status_text=self._sync, status=self._sync)
         self._sync()
+        self.attach_theme_controller()
 
     def _sync(self, *_args) -> None:
         self.title_label.text = str(self.title or "")
@@ -909,6 +973,12 @@ class ScreenShareCard(_CardActionsMixin, RoundedCard):
         status_text = f"{self.status} {self.status_text}".lower()
         _animate_list_property(self, "border_color", _status_border_color(status_text), animated=True)
 
+    def apply_theme(self, theme_value) -> None:
+        self.bg_color = color("card_screen")
+        if hasattr(self, "badge"):
+            self._sync()
+        self._update_rounded_canvas()
+
 
 class EmptyState(RoundedCard):
     def __init__(self, title: str = "Nothing here", subtitle: str = "", **kwargs):
@@ -916,8 +986,8 @@ class EmptyState(RoundedCard):
         kwargs.setdefault("spacing", dp(8))
         kwargs.setdefault("size_hint_y", None)
         super().__init__(**kwargs)
-        title_label = Label(text=title, font_name=UI_FONT, font_size=sp(THEME.font_size["title"]), bold=True, color=color("text_primary"), halign="center", valign="middle", shorten=True, size_hint_y=None, height=dp(32))
-        sub = Label(text=subtitle, font_name=UI_FONT, font_size=sp(THEME.font_size["body"]), color=color("text_secondary"), halign="center", valign="middle", shorten=True, size_hint_y=None, height=dp(24))
+        title_label = _ThemedLabel(text=title, theme_token="text_primary", font_name=UI_FONT, font_size=sp(_theme().font_size["title"]), bold=True, halign="center", valign="middle", shorten=True, size_hint_y=None, height=dp(32))
+        sub = _ThemedLabel(text=subtitle, theme_token="text_secondary", font_name=UI_FONT, font_size=sp(_theme().font_size["body"]), halign="center", valign="middle", shorten=True, size_hint_y=None, height=dp(24))
         _bind_single_line_label(title_label)
         _bind_single_line_label(sub)
         self.add_widget(title_label)
@@ -932,11 +1002,11 @@ class SectionHeader(BoxLayout):
         kwargs.setdefault("spacing", dp(2))
         kwargs.setdefault("size_hint_y", None)
         super().__init__(**kwargs)
-        title_label = Label(text=title, font_name=UI_FONT, font_size=sp(THEME.font_size["title"]), bold=True, color=color("text_primary"), halign="left", valign="middle", shorten=True, size_hint_x=1, size_hint_y=None, height=dp(26))
+        title_label = _ThemedLabel(text=title, theme_token="text_primary", font_name=UI_FONT, font_size=sp(_theme().font_size["title"]), bold=True, halign="left", valign="middle", shorten=True, size_hint_x=1, size_hint_y=None, height=dp(26))
         _bind_single_line_label(title_label)
         self.add_widget(title_label)
         if subtitle:
-            sub = Label(text=subtitle, font_name=UI_FONT, font_size=sp(THEME.font_size["caption"]), color=color("text_secondary"), halign="left", valign="middle", shorten=True, size_hint_x=1, size_hint_y=None, height=dp(18))
+            sub = _ThemedLabel(text=subtitle, theme_token="text_secondary", font_name=UI_FONT, font_size=sp(_theme().font_size["caption"]), halign="left", valign="middle", shorten=True, size_hint_x=1, size_hint_y=None, height=dp(18))
             _bind_single_line_label(sub)
             self.add_widget(sub)
         self.bind(minimum_height=self.setter("height"))
