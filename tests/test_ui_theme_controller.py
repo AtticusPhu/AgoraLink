@@ -57,6 +57,12 @@ def _contrast(first, second) -> float:
 
 
 class ThemeControllerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if not RUN_KIVY_WIDGET_TESTS:
+            window_patch = patch.object(ThemeController, "_apply_window_theme", return_value=None)
+            window_patch.start()
+            self.addCleanup(window_patch.stop)
+
     def test_theme_defaults_to_light_when_missing(self) -> None:
         controller = ThemeController()
         self.assertEqual(controller.configure({}), "light")

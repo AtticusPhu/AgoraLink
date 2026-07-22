@@ -9,7 +9,6 @@ from enum import Enum
 from typing import Callable, MutableMapping, Optional
 
 from kivy.clock import Clock
-from kivy.core.window import Window
 from kivy.event import EventDispatcher
 from kivy.properties import NumericProperty, OptionProperty
 
@@ -102,6 +101,8 @@ class ThemeController(EventDispatcher):
 
     def _apply_window_theme(self) -> None:
         try:
+            from kivy.core.window import Window
+
             Window.clearcolor = self.color("window_bg")
         except Exception as exc:
             self._last_apply_errors.append(f"Window: {exc}")
