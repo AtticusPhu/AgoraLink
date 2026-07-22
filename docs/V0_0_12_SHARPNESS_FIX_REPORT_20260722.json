@@ -1,0 +1,41 @@
+{
+  "type": "V0_0_12_SHARPNESS_FIX_REPORT",
+  "date": "2026-07-22",
+  "status": "SOURCE_PASS_PORTABLE_COMPARISON_PENDING",
+  "primary_blur_contributor_confirmed": "partial",
+  "pixel_snapping_decision": "PIXEL_SNAPPING_CONFIRMED",
+  "retained_pre_fix_source_pngs": 9,
+  "retained_pre_fix_portable_matrix": false,
+  "ab": {
+    "sample_count": 41,
+    "fractional_samples_before": 41,
+    "fractional_samples_after": 0,
+    "fractional_ratio_before": 1.0,
+    "fractional_ratio_after": 0.0,
+    "font_changed": false,
+    "font_size_changed": false,
+    "colors_changed": false,
+    "scrollview_removed": false
+  },
+  "accepted_source_matrix": {
+    "root": "_local_artifacts/V0_0_12_THEME_SHARPNESS_FIX/after_final_source_v2",
+    "screenshots": 70,
+    "light": 35,
+    "dark": 35,
+    "chinese": 38,
+    "english": 32,
+    "resolutions": ["1280x720", "1366x768", "1599x900", "1600x900", "1601x900", "1920x1080"],
+    "fractional_cases": 0,
+    "client_size_mismatches": 0,
+    "capture_backend": "win32-bitblt-getdibits",
+    "primary_surface": "receive_only_not_chat"
+  },
+  "dpi": {
+    "actual_100_percent": "PASS",
+    "simulated_125_percent_geometry": "PASS",
+    "simulated_150_percent_geometry": "PASS",
+    "actual_125_percent": "MANUAL_REQUIRED",
+    "actual_150_percent": "MANUAL_REQUIRED"
+  },
+  "portable_comparison": "NOT_RUN_PENDING_FINAL_PUSHED_COMMIT"
+}
