@@ -9,6 +9,7 @@ from unittest import mock
 
 from screen_runtime import (
     DEFAULT_NATIVE_SCREEN_PRESET,
+    NATIVE_MEDIA_EXPECTED_SHA256,
     NATIVE_SCREEN_PRESETS,
     ScreenRuntime,
     native_media_file_identity,
@@ -55,6 +56,12 @@ class R4NativeScreenPresetTests(unittest.TestCase):
                 "convert_backend": "auto",
                 "render_backend": "d3d11",
             },
+        )
+
+    def test_release_native_hash_matches_canonical_v0_0_12_binary(self) -> None:
+        self.assertEqual(
+            NATIVE_MEDIA_EXPECTED_SHA256,
+            "D70B52EDFC2ABDE2C0B34D334FEB7AC1A4EF8B0893F901F05A3CCD8B66038DBF",
         )
 
     def test_existing_valid_preset_ids_remain_selected(self) -> None:
