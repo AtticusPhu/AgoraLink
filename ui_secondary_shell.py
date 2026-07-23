@@ -9,11 +9,14 @@ from kivy.graphics import Color, Line, Rectangle
 from kivy.metrics import dp, sp
 from kivy.properties import StringProperty
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.widget import Widget
 
 from ui_form_components import _BackgroundBox, _bind_wrapped, _label, secondary_button, secondary_color
+from ui_geometry import centered_content_geometry, snap_dp, snap_px
+from ui_theme_controller import ThemableMixin
 
 
 class SecondaryPageHeader(_BackgroundBox):
@@ -30,18 +33,18 @@ class SecondaryPageHeader(_BackgroundBox):
     ) -> None:
         kwargs.setdefault("orientation", "horizontal")
         kwargs.setdefault("size_hint_y", None)
-        kwargs.setdefault("height", dp(74))
-        kwargs.setdefault("spacing", dp(14))
-        kwargs.setdefault("padding", (dp(24), dp(12), dp(18), dp(10)))
+        kwargs.setdefault("height", snap_dp(74))
+        kwargs.setdefault("spacing", snap_dp(14))
+        kwargs.setdefault("padding", (snap_dp(24), snap_dp(12), snap_dp(18), snap_dp(10)))
         kwargs.setdefault("background_color", secondary_color("surface"))
         super().__init__(**kwargs)
-        titles = BoxLayout(orientation="vertical", size_hint_x=1, spacing=dp(1))
+        titles = BoxLayout(orientation="vertical", size_hint_x=1, spacing=snap_dp(1))
         self.title_label = _label(
             title,
             font_size=18,
             bold=True,
             size_hint_y=None,
-            height=dp(30),
+            height=snap_dp(30),
             halign="left",
         )
         _bind_wrapped(self.title_label)
@@ -49,9 +52,9 @@ class SecondaryPageHeader(_BackgroundBox):
         self.description_label = _label(
             description,
             color_name="text_muted",
-            font_size=11,
+            font_size=12,
             size_hint_y=None,
-            height=dp(22),
+            height=snap_dp(22),
             halign="left",
         )
         _bind_wrapped(self.description_label)
@@ -70,7 +73,13 @@ class SecondaryPageHeader(_BackgroundBox):
         self.bind(pos=self._sync_header_border, size=self._sync_header_border)
 
     def _sync_header_border(self, *_args) -> None:
-        self._header_border.points = (self.x, self.y, self.right, self.y)
+        baseline = snap_px(self.y)
+        self._header_border.points = (snap_px(self.x), baseline, snap_px(self.right), baseline)
+
+    def apply_theme(self, theme) -> None:
+        super().apply_theme(theme)
+        if hasattr(self, "_header_border_color"):
+            self._header_border_color.rgba = secondary_color("border")
 
     def set_page(self, title: str, description: str = "") -> None:
         self.title_label.text = str(title or "")
@@ -90,9 +99,9 @@ class SettingsSidebar(_BackgroundBox):
     ) -> None:
         kwargs.setdefault("orientation", "vertical")
         kwargs.setdefault("size_hint_x", None)
-        kwargs.setdefault("width", dp(216))
-        kwargs.setdefault("padding", (dp(16), dp(18), dp(14), dp(18)))
-        kwargs.setdefault("spacing", dp(5))
+        kwargs.setdefault("width", snap_dp(216))
+        kwargs.setdefault("padding", (snap_dp(16), snap_dp(18), snap_dp(14), snap_dp(18)))
+        kwargs.setdefault("spacing", snap_dp(5))
         kwargs.setdefault("background_color", secondary_color("surface"))
         super().__init__(**kwargs)
         self._on_select = on_select
@@ -101,10 +110,10 @@ class SettingsSidebar(_BackgroundBox):
         for key, label in entries:
             button = secondary_button(label, variant="ghost", compact=False)
             button.size_hint_y = None
-            button.height = dp(44)
+            button.height = snap_dp(44)
             button.halign = "left"
             button.valign = "middle"
-            button.text_size = (dp(166), dp(44))
+            button.text_size = (snap_dp(166), snap_dp(44))
             button.bind(on_release=lambda _button, item_key=key: self.select(item_key))
             self._buttons[str(key)] = button
             self.add_widget(button)
@@ -116,7 +125,15 @@ class SettingsSidebar(_BackgroundBox):
         self._sync_selection()
 
     def _sync_side_border(self, *_args) -> None:
-        self._side_border.points = (self.right, self.y, self.right, self.top)
+        right = snap_px(self.right)
+        self._side_border.points = (right, snap_px(self.y), right, snap_px(self.top))
+
+    def apply_theme(self, theme) -> None:
+        super().apply_theme(theme)
+        if hasattr(self, "_side_border_color"):
+            self._side_border_color.rgba = secondary_color("border")
+        if hasattr(self, "_buttons"):
+            self._sync_selection()
 
     def select(self, key: str, *, notify: bool = True) -> None:
         value = str(key or "")
@@ -133,8 +150,8 @@ class SettingsSidebar(_BackgroundBox):
             button.bg_normal = secondary_color("accent" if active else "transparent")
             button.bg_hover = secondary_color("accent_hover" if active else "surface_muted")
             button.bg_down = secondary_color("accent_hover" if active else "accent_soft")
-            button.text_normal = secondary_color("white" if active else "text_secondary")
-            button.text_down = secondary_color("white" if active else "text_primary")
+            button.text_normal = secondary_color("on_accent" if active else "text_secondary")
+            button.text_down = secondary_color("on_accent" if active else "text_primary")
             button.border_color = secondary_color("accent" if active else "transparent")
             try:
                 button._refresh_button_state(animated=False)
@@ -160,6 +177,7 @@ class SecondaryPageShell(_BackgroundBox):
     ) -> None:
         kwargs.setdefault("orientation", "vertical")
         kwargs.setdefault("background_color", secondary_color("background"))
+        kwargs.setdefault("background_token", "background")
         super().__init__(**kwargs)
         self.header = SecondaryPageHeader(
             title=title,
@@ -180,7 +198,7 @@ class SecondaryPageShell(_BackgroundBox):
         self.content_host = BoxLayout(
             orientation="vertical",
             size_hint_x=1,
-            padding=(dp(24), dp(18), dp(24), dp(18)),
+            padding=(snap_dp(24), snap_dp(18), snap_dp(24), snap_dp(18)),
         )
         self.body.add_widget(self.content_host)
         self.add_widget(self.body)
@@ -193,27 +211,37 @@ class SecondaryPageShell(_BackgroundBox):
         self.content_host.add_widget(widget)
 
 
+class _FixedActionFooter(_BackgroundBox):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        with self.canvas.after:
+            self._footer_border_color = Color(*secondary_color("border"))
+            self._footer_border = Line(points=(self.x, self.top, self.right, self.top), width=1)
+        self.bind(pos=self._sync_footer, size=self._sync_footer)
+
+    def _sync_footer(self, *_args) -> None:
+        top = snap_px(self.top)
+        self._footer_border.points = (snap_px(self.x), top, snap_px(self.right), top)
+
+    def apply_theme(self, theme) -> None:
+        super().apply_theme(theme)
+        if hasattr(self, "_footer_border_color"):
+            self._footer_border_color.rgba = secondary_color("border")
+
+
 def fixed_action_footer(
     *,
     left_actions: Sequence[Widget] = (),
     right_actions: Sequence[Widget] = (),
 ) -> _BackgroundBox:
-    footer = _BackgroundBox(
+    footer = _FixedActionFooter(
         orientation="horizontal",
         size_hint_y=None,
-        height=dp(64),
-        padding=(dp(20), dp(12), dp(20), dp(12)),
-        spacing=dp(10),
+        height=snap_dp(64),
+        padding=(snap_dp(20), snap_dp(12), snap_dp(20), snap_dp(12)),
+        spacing=snap_dp(10),
         background_color=secondary_color("surface"),
     )
-    with footer.canvas.after:
-        footer._footer_border_color = Color(*secondary_color("border"))
-        footer._footer_border = Line(points=(footer.x, footer.top, footer.right, footer.top), width=1)
-
-    def _sync_footer(*_args) -> None:
-        footer._footer_border.points = (footer.x, footer.top, footer.right, footer.top)
-
-    footer.bind(pos=_sync_footer, size=_sync_footer)
     for item in left_actions:
         footer.add_widget(item)
     footer.add_widget(Widget(size_hint_x=1))
@@ -222,27 +250,51 @@ def fixed_action_footer(
     return footer
 
 
+class PixelSnappedContentContainer(FloatLayout):
+    """Centers one fixed-width content column without half-pixel spacers."""
+
+    def __init__(self, *, content: BoxLayout, max_width: float, **kwargs) -> None:
+        kwargs.setdefault("size_hint_y", None)
+        super().__init__(**kwargs)
+        self.content = content
+        self.max_width_dp = float(max_width)
+        self.add_widget(content)
+        self.bind(pos=self._sync_content_geometry, size=self._sync_content_geometry)
+        content.bind(height=self._sync_content_geometry)
+        self._sync_content_geometry()
+
+    def _sync_content_geometry(self, *_args) -> None:
+        content_x, content_width = centered_content_geometry(self.x, self.width, dp(self.max_width_dp))
+        self.content.size_hint = (None, None)
+        self.content.width = content_width
+        self.content.x = content_x
+        self.content.y = snap_px(self.y)
+        self.height = snap_px(self.content.height)
+
+
+class ThemedScrollView(ThemableMixin, ScrollView):
+    def __init__(self, **kwargs) -> None:
+        kwargs.setdefault("bar_color", secondary_color("scrollbar"))
+        kwargs.setdefault("bar_inactive_color", secondary_color("border_soft"))
+        super().__init__(**kwargs)
+        self.attach_theme_controller()
+
+    def apply_theme(self, _theme) -> None:
+        self.bar_color = secondary_color("scrollbar")
+        self.bar_inactive_color = secondary_color("border_soft")
+
+
 def scrollable_content(*, max_width: float = 900) -> Tuple[ScrollView, BoxLayout]:
-    scroll = ScrollView(size_hint=(1, 1), do_scroll_x=False)
-    outer = BoxLayout(orientation="horizontal", size_hint_y=None)
-    outer.bind(minimum_height=outer.setter("height"))
-    outer.add_widget(Widget(size_hint_x=1))
+    scroll = ThemedScrollView(size_hint=(1, 1), do_scroll_x=False)
     content = BoxLayout(
         orientation="vertical",
         size_hint_x=None,
-        width=dp(max_width),
+        width=snap_dp(max_width),
         size_hint_y=None,
-        spacing=dp(22),
-        padding=(0, 0, 0, dp(24)),
+        spacing=snap_dp(22),
+        padding=(0, 0, 0, snap_dp(24)),
     )
     content.bind(minimum_height=content.setter("height"))
-    outer.add_widget(content)
-    outer.add_widget(Widget(size_hint_x=1))
-
-    def _fit_content(instance: BoxLayout, width: float) -> None:
-        available = max(dp(420), width - dp(4))
-        content.width = min(dp(max_width), available)
-
-    outer.bind(width=_fit_content)
+    outer = PixelSnappedContentContainer(content=content, max_width=max_width)
     scroll.add_widget(outer)
     return scroll, content

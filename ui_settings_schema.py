@@ -123,9 +123,8 @@ SETTING_DEFINITIONS: Tuple[SettingDefinition, ...] = (
     ),
     SettingDefinition(
         "theme_mode", "general", 20, "外观", "Appearance",
-        "使用系统外观，或固定使用浅色或深色界面。", "Follow Windows appearance or choose a light or dark interface.",
-        "select", "system", choices=(
-            _choice("system", "跟随系统", "Follow system"),
+        "选择浅色或深色界面，更改会立即生效。", "Choose a light or dark interface. Changes apply immediately.",
+        "select", "light", choices=(
             _choice("light", "浅色", "Light"),
             _choice("dark", "深色", "Dark"),
         ),

@@ -113,7 +113,7 @@ class GroupManagementPage(SecondaryPageShell):
         state = str(member.get("member_state") or "active")
         role_text = "群主" if self.lang == "zh" and role == "owner" else "成员" if self.lang == "zh" else "Owner" if role == "owner" else "Member"
         status_text = "正常" if self.lang == "zh" and state == "active" else "已离开" if self.lang == "zh" else "Active" if state == "active" else "Left"
-        subtitle = _label(f"{role_text} · {status_text}", color_name="text_muted", font_size=11, size_hint_y=None, height=dp(20), halign="left")
+        subtitle = _label(f"{role_text} · {status_text}", color_name="text_muted", font_size=12, size_hint_y=None, height=dp(20), halign="left")
         _bind_wrapped(subtitle)
         details.add_widget(subtitle)
         row.add_widget(details)

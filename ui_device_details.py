@@ -5,14 +5,13 @@ from __future__ import annotations
 
 from typing import Callable, Mapping, Optional
 
-from kivy.graphics import Color, RoundedRectangle
 from kivy.metrics import dp, sp
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 
 from ui_copy import tr
 from ui_form_components import (
+    AccentMonogram,
     AdvancedDisclosure,
     ConfirmationDialog,
     DangerZone,
@@ -124,23 +123,12 @@ class ContactDetailsPage(SecondaryPageShell):
     def _profile_header(self) -> BoxLayout:
         name = _display_name(self.contact)
         header = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(94), spacing=dp(18))
-        avatar = Label(
-            text=_initials(name),
-            font_name="RUDP_UI",
+        avatar = AccentMonogram(
+            _initials(name),
+            radius=dp(35),
             font_size=sp(22),
-            color=secondary_color("white"),
             size_hint=(None, None),
             size=(dp(70), dp(70)),
-            halign="center",
-            valign="middle",
-        )
-        avatar.text_size = avatar.size
-        with avatar.canvas.before:
-            avatar._avatar_color = Color(*secondary_color("accent"))
-            avatar._avatar_rect = RoundedRectangle(pos=avatar.pos, size=avatar.size, radius=[dp(35)])
-        avatar.bind(
-            pos=lambda inst, _value: setattr(inst._avatar_rect, "pos", inst.pos),
-            size=lambda inst, _value: setattr(inst._avatar_rect, "size", inst.size),
         )
         header.add_widget(avatar)
         details = BoxLayout(orientation="vertical", spacing=0)
@@ -162,7 +150,7 @@ class ContactDetailsPage(SecondaryPageShell):
         ip = str(self.contact.get("peer_ip") or "").strip()
         port = str(self.contact.get("peer_port") or "").strip()
         endpoint = f"{ip}:{port}" if ip and port else ip or "-"
-        endpoint_label = _label(endpoint, color_name="text_muted", font_size=11, size_hint_y=None, height=dp(22), halign="left")
+        endpoint_label = _label(endpoint, color_name="text_muted", font_size=12, size_hint_y=None, height=dp(22), halign="left")
         _bind_wrapped(endpoint_label)
         details.add_widget(endpoint_label)
         header.add_widget(details)

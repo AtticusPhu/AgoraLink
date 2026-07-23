@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Callable, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from kivy.clock import Clock
+from kivy.core.window import Window
 from kivy.graphics import Color, Line, Rectangle, RoundedRectangle
 from kivy.metrics import dp, sp
 from kivy.properties import BooleanProperty, ListProperty, StringProperty
@@ -17,21 +18,18 @@ from kivy.uix.spinner import Spinner, SpinnerOption
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
-from ui_components import RoundedButton
+from ui_components import UI_FONT as COMPONENT_UI_FONT, RoundedButton
 from ui_copy import tr
-from ui_theme import SECONDARY_DARK_THEME
+from ui_geometry import popup_geometry, setting_row_column_widths, snap_dp, snap_px, split_integer_width
 from ui_settings_schema import danger_action_requires_confirmation
+from ui_theme_controller import ThemableMixin, theme_color, theme_controller
 
 
-PALETTE = SECONDARY_DARK_THEME.colors
-UI_FONT = "RUDP_UI"
+UI_FONT = COMPONENT_UI_FONT
 
 
 def secondary_color(name: str, alpha: Optional[float] = None) -> List[float]:
-    value = list(PALETTE.get(name, PALETTE["text_primary"]))
-    if alpha is not None:
-        value[3] = float(alpha)
-    return value
+    return theme_color(name, alpha)
 
 
 def _bind_wrapped(label: Label, *, horizontal_padding: float = 0) -> Label:
@@ -41,6 +39,63 @@ def _bind_wrapped(label: Label, *, horizontal_padding: float = 0) -> Label:
     label.bind(width=_sync)
     _sync(label)
     return label
+
+
+class ThemedLabel(ThemableMixin, Label):
+    def __init__(self, *, theme_token: str = "text_primary", **kwargs) -> None:
+        self.theme_token = str(theme_token or "text_primary")
+        kwargs.setdefault("color", secondary_color(self.theme_token))
+        super().__init__(**kwargs)
+        self.attach_theme_controller()
+
+    def apply_theme(self, _theme) -> None:
+        self.color = secondary_color(self.theme_token)
+
+
+class ThemedTextInput(ThemableMixin, TextInput):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.bind(focus=self.apply_theme)
+        self.attach_theme_controller()
+
+    def apply_theme(self, *_args) -> None:
+        self.background_color = secondary_color("input_bg_active" if self.focus else "input_bg")
+        self.foreground_color = secondary_color("text_primary")
+        self.hint_text_color = secondary_color("text_muted")
+        self.cursor_color = secondary_color("accent")
+        self.selection_color = secondary_color("selection")
+
+
+class AccentMonogram(ThemedLabel):
+    def __init__(self, text: str, *, radius: float, **kwargs) -> None:
+        self._monogram_radius = float(radius)
+        kwargs.setdefault("theme_token", "on_accent")
+        kwargs.setdefault("font_name", UI_FONT)
+        kwargs.setdefault("halign", "center")
+        kwargs.setdefault("valign", "middle")
+        super().__init__(text=str(text or ""), **kwargs)
+        self.text_size = self.size
+        with self.canvas.before:
+            self._monogram_color = Color(*secondary_color("accent"))
+            self._monogram_rect = RoundedRectangle(
+                pos=self.pos,
+                size=self.size,
+                radius=[self._monogram_radius],
+            )
+        self.bind(pos=self._sync_monogram, size=self._sync_monogram)
+        self._sync_monogram()
+
+    def apply_theme(self, theme) -> None:
+        super().apply_theme(theme)
+        if hasattr(self, "_monogram_color"):
+            self._monogram_color.rgba = secondary_color("accent")
+
+    def _sync_monogram(self, *_args) -> None:
+        self.text_size = self.size
+        if hasattr(self, "_monogram_rect"):
+            self._monogram_rect.pos = self.pos
+            self._monogram_rect.size = self.size
+            self._monogram_rect.radius = [self._monogram_radius]
 
 
 def _label(
@@ -55,15 +110,75 @@ def _label(
 ) -> Label:
     kwargs.setdefault("font_name", UI_FONT)
     kwargs.setdefault("font_size", sp(font_size))
-    kwargs.setdefault("color", secondary_color(color_name))
     kwargs.setdefault("halign", halign)
     kwargs.setdefault("valign", valign)
     kwargs.setdefault("bold", bold)
-    return Label(text=str(text or ""), **kwargs)
+    return ThemedLabel(text=str(text or ""), theme_token=color_name, **kwargs)
 
 
-class SecondaryPopup(Popup):
+class SecondaryPopup(ThemableMixin, Popup):
     """Modal secondary surface that always supports the desktop Esc shortcut."""
+
+    def __init__(self, **kwargs):
+        requested_size_hint = kwargs.pop("size_hint", (None, None))
+        width_hint = requested_size_hint[0] if requested_size_hint else None
+        height_hint = requested_size_hint[1] if requested_size_hint else None
+        explicit_size = kwargs.get("size")
+        density = max(0.001, float(dp(1)))
+        default_max_width = (
+            float(explicit_size[0]) / density
+            if explicit_size and width_hint is None
+            else 900
+            if width_hint and width_hint <= 0.75
+            else 1180
+        )
+        default_max_height = (
+            float(explicit_size[1]) / density
+            if explicit_size and height_hint is None
+            else 720
+            if height_hint and height_hint <= 0.86
+            else 820
+        )
+        self._maximum_width_dp = float(kwargs.pop("maximum_width", default_max_width))
+        self._maximum_height_dp = float(kwargs.pop("maximum_height", default_max_height))
+        self._minimum_width_dp = float(kwargs.pop("minimum_width", min(680, default_max_width)))
+        self._minimum_height_dp = float(kwargs.pop("minimum_height", min(520, default_max_height)))
+        kwargs["size_hint"] = (None, None)
+        super().__init__(**kwargs)
+        self._window_geometry_bound = False
+        self.bind(on_open=self._bind_window_geometry, on_dismiss=self._unbind_window_geometry)
+        self._sync_window_geometry()
+        self.attach_theme_controller()
+
+    def _bind_window_geometry(self, *_args) -> None:
+        self.attach_theme_controller()
+        if not self._window_geometry_bound:
+            Window.bind(size=self._sync_window_geometry)
+            self._window_geometry_bound = True
+        self._sync_window_geometry()
+
+    def _unbind_window_geometry(self, *_args) -> None:
+        if self._window_geometry_bound:
+            Window.unbind(size=self._sync_window_geometry)
+            self._window_geometry_bound = False
+        self.detach_theme_controller()
+
+    def apply_theme(self, _theme) -> None:
+        self.background_color = secondary_color("background")
+
+    def _sync_window_geometry(self, *_args) -> None:
+        x, y, width, height = popup_geometry(
+            Window.width,
+            Window.height,
+            desired_width=snap_dp(self._maximum_width_dp),
+            desired_height=snap_dp(self._maximum_height_dp),
+            horizontal_margin=snap_dp(24),
+            vertical_margin=snap_dp(24),
+            minimum_width=snap_dp(self._minimum_width_dp),
+            minimum_height=snap_dp(self._minimum_height_dp),
+        )
+        self.size = (width, height)
+        self.pos = (x, y)
 
     def _handle_keyboard(self, window, key, *args):
         if key == 27:
@@ -76,9 +191,36 @@ class KeyboardRoundedButton(FocusBehavior, RoundedButton):
     """Rounded button with visible keyboard focus and desktop activation keys."""
 
     def __init__(self, **kwargs):
+        self._secondary_variant = str(kwargs.pop("secondary_variant", "secondary"))
         super().__init__(**kwargs)
         self._resting_border_color = list(self.border_color)
         self.bind(focus=self._sync_keyboard_focus, disabled=self._sync_keyboard_focus)
+        self.attach_theme_controller()
+
+    def apply_theme(self, theme) -> None:
+        role = self._secondary_variant
+        if role == "primary":
+            tokens = ("accent", "accent_hover", "accent_pressed", "on_accent", "on_accent", "accent")
+        elif role == "danger":
+            tokens = ("transparent", "danger_soft", "danger_soft", "danger", "danger", "transparent")
+        elif role == "ghost":
+            tokens = ("transparent", "surface_muted", "surface_selected", "text_secondary", "text_primary", "transparent")
+        else:
+            tokens = ("surface_muted", "surface_selected", "accent_soft", "text_primary", "text_primary", "border")
+        (
+            self.bg_normal,
+            self.bg_hover,
+            self.bg_down,
+            self.text_normal,
+            self.text_down,
+            resting_border,
+        ) = (secondary_color(token) for token in tokens)
+        self._resting_border_color = list(resting_border)
+        self._sync_keyboard_focus()
+        try:
+            self._refresh_button_state(animated=False)
+        except Exception:
+            pass
 
     def _sync_keyboard_focus(self, *_args) -> None:
         if self.focus and not self.disabled:
@@ -94,13 +236,23 @@ class KeyboardRoundedButton(FocusBehavior, RoundedButton):
         return super().keyboard_on_key_down(window, keycode, text, modifiers)
 
 
-class KeyboardSpinner(FocusBehavior, Spinner):
+class KeyboardSpinner(ThemableMixin, FocusBehavior, Spinner):
     """Compact spinner that can be traversed and changed without a mouse."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._resting_background_color = list(self.background_color)
         self.bind(focus=self._sync_keyboard_focus, disabled=self._sync_keyboard_focus)
+        self.attach_theme_controller()
+
+    def apply_theme(self, _theme) -> None:
+        if self.is_open:
+            self.is_open = False
+        self._resting_background_color = secondary_color("input_bg")
+        self.background_color = secondary_color("focus_ring", 0.22) if self.focus and not self.disabled else list(
+            self._resting_background_color
+        )
+        self.color = secondary_color("text_disabled" if self.disabled else "text_primary")
 
     def _sync_keyboard_focus(self, *_args) -> None:
         self.background_color = secondary_color("accent_soft") if self.focus and not self.disabled else list(
@@ -126,13 +278,15 @@ class KeyboardSpinner(FocusBehavior, Spinner):
         return super().keyboard_on_key_down(window, keycode, text, modifiers)
 
 
-class _BackgroundBox(BoxLayout):
+class _BackgroundBox(ThemableMixin, BoxLayout):
     background_color = ListProperty(secondary_color("surface"))
     border_color = ListProperty(secondary_color("border_soft"))
     border_width = 0
     radius = 0
 
     def __init__(self, **kwargs):
+        self.background_token = str(kwargs.pop("background_token", "surface"))
+        self.border_token = str(kwargs.pop("border_token", "border_soft"))
         background = kwargs.pop("background_color", secondary_color("surface"))
         border = kwargs.pop("border_color", secondary_color("border_soft"))
         self.border_width = float(kwargs.pop("border_width", 0))
@@ -156,6 +310,11 @@ class _BackgroundBox(BoxLayout):
             border_color=self._sync_canvas,
         )
         self._sync_canvas()
+        self.attach_theme_controller()
+
+    def apply_theme(self, _theme) -> None:
+        self.background_color = secondary_color(self.background_token)
+        self.border_color = secondary_color(self.border_token)
 
     def _sync_canvas(self, *_args) -> None:
         self._surface_color.rgba = self.background_color
@@ -192,8 +351,8 @@ def secondary_button(
             "bg_normal": secondary_color("accent"),
             "bg_hover": secondary_color("accent_hover"),
             "bg_down": secondary_color("accent_hover"),
-            "text_normal": secondary_color("white"),
-            "text_down": secondary_color("white"),
+            "text_normal": secondary_color("on_accent"),
+            "text_down": secondary_color("on_accent"),
             "border_color": secondary_color("accent"),
         }
     elif role == "danger":
@@ -209,7 +368,7 @@ def secondary_button(
         style = {
             "bg_normal": secondary_color("transparent"),
             "bg_hover": secondary_color("surface_muted"),
-            "bg_down": secondary_color("surface_blue"),
+            "bg_down": secondary_color("surface_selected"),
             "text_normal": secondary_color("text_secondary"),
             "text_down": secondary_color("text_primary"),
             "border_color": secondary_color("transparent"),
@@ -217,7 +376,7 @@ def secondary_button(
     else:
         style = {
             "bg_normal": secondary_color("surface_muted"),
-            "bg_hover": secondary_color("surface_blue"),
+            "bg_hover": secondary_color("surface_selected"),
             "bg_down": secondary_color("accent_soft"),
             "text_normal": secondary_color("text_primary"),
             "text_down": secondary_color("text_primary"),
@@ -226,6 +385,7 @@ def secondary_button(
     button = KeyboardRoundedButton(
         text=str(text or ""),
         variant="custom",
+        secondary_variant=role,
         compact=compact,
         radius=dp(5),
         **style,
@@ -238,7 +398,7 @@ def secondary_button(
     return button
 
 
-class DarkSpinnerOption(SpinnerOption):
+class DarkSpinnerOption(ThemableMixin, SpinnerOption):
     def __init__(self, **kwargs):
         kwargs.setdefault("font_name", UI_FONT)
         kwargs.setdefault("font_size", sp(13))
@@ -250,6 +410,11 @@ class DarkSpinnerOption(SpinnerOption):
         self.background_color = secondary_color("surface_muted")
         self.color = secondary_color("text_primary")
         self.bind(state=self._sync_state)
+        self.attach_theme_controller()
+
+    def apply_theme(self, _theme) -> None:
+        self.color = secondary_color("text_primary")
+        self._sync_state()
 
     def _sync_state(self, *_args) -> None:
         self.background_color = secondary_color(
@@ -269,14 +434,14 @@ def dark_spinner(*, text: str, values: Iterable[str]) -> KeyboardSpinner:
         background_normal="",
         background_down="",
         background_disabled_normal="",
-        background_color=secondary_color("surface_muted"),
+        background_color=secondary_color("input_bg"),
         color=secondary_color("text_primary"),
     )
     return spinner
 
 
 def dark_input(*, text: str = "", input_filter=None, password: bool = False) -> TextInput:
-    widget = TextInput(
+    widget = ThemedTextInput(
         text=str(text if text is not None else ""),
         multiline=False,
         input_filter=input_filter,
@@ -288,38 +453,36 @@ def dark_input(*, text: str = "", input_filter=None, password: bool = False) -> 
         padding=(dp(10), dp(9), dp(10), dp(7)),
         background_normal="",
         background_active="",
-        background_color=secondary_color("surface_muted"),
+        background_color=secondary_color("input_bg"),
         foreground_color=secondary_color("text_primary"),
         hint_text_color=secondary_color("text_muted"),
         cursor_color=secondary_color("accent"),
-        selection_color=secondary_color("accent", 0.35),
+        selection_color=secondary_color("selection"),
     )
     return widget
 
 
-class SettingDescription(Label):
+class SettingDescription(ThemedLabel):
     def __init__(self, text: str = "", **kwargs):
         kwargs.setdefault("font_name", UI_FONT)
-        kwargs.setdefault("font_size", sp(12))
-        kwargs.setdefault("color", secondary_color("text_muted"))
+        kwargs.setdefault("font_size", sp(13))
         kwargs.setdefault("halign", "left")
         kwargs.setdefault("valign", "top")
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("height", dp(34))
-        super().__init__(text=str(text or ""), **kwargs)
+        super().__init__(text=str(text or ""), theme_token="text_muted", **kwargs)
         _bind_wrapped(self)
 
 
-class FormErrorText(Label):
+class FormErrorText(ThemedLabel):
     def __init__(self, text: str = "", **kwargs):
         kwargs.setdefault("font_name", UI_FONT)
         kwargs.setdefault("font_size", sp(11))
-        kwargs.setdefault("color", secondary_color("danger"))
         kwargs.setdefault("halign", "right")
         kwargs.setdefault("valign", "middle")
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("height", dp(18) if text else 0)
-        super().__init__(text=str(text or ""), **kwargs)
+        super().__init__(text=str(text or ""), theme_token="danger", **kwargs)
         _bind_wrapped(self)
 
     def set_error(self, text: str) -> None:
@@ -327,7 +490,7 @@ class FormErrorText(Label):
         self.height = dp(18) if self.text else 0
 
 
-class SettingRow(BoxLayout):
+class SettingRow(ThemableMixin, BoxLayout):
     """Desktop form row with a flexible label column and a control column."""
 
     setting_key = StringProperty("")
@@ -345,45 +508,45 @@ class SettingRow(BoxLayout):
     ) -> None:
         kwargs.setdefault("orientation", "horizontal")
         kwargs.setdefault("size_hint_y", None)
-        kwargs.setdefault("height", dp(70 if description else 54))
-        kwargs.setdefault("spacing", dp(18))
-        kwargs.setdefault("padding", (0, dp(6), 0, dp(6)))
+        kwargs.setdefault("height", snap_dp(70 if description else 54))
+        kwargs.setdefault("spacing", snap_dp(18))
+        kwargs.setdefault("padding", (0, snap_dp(6), 0, snap_dp(6)))
         super().__init__(**kwargs)
         self.setting_key = str(setting_key or "")
         self.control = control
         self.error_text = FormErrorText()
 
-        text_column = BoxLayout(
+        self.text_column = BoxLayout(
             orientation="vertical",
-            size_hint_x=0.47,
-            spacing=dp(1),
+            size_hint_x=None,
+            spacing=snap_dp(1),
         )
         title = _label(
             label,
-            font_size=13,
+            font_size=14,
             size_hint_y=None,
-            height=dp(24),
+            height=snap_dp(24),
             halign="left",
             valign="middle",
         )
         _bind_wrapped(title)
-        text_column.add_widget(title)
+        self.text_column.add_widget(title)
         if description:
-            text_column.add_widget(SettingDescription(description))
+            self.text_column.add_widget(SettingDescription(description))
         else:
-            text_column.add_widget(Widget(size_hint_y=1))
-        self.add_widget(text_column)
+            self.text_column.add_widget(Widget(size_hint_y=1))
+        self.add_widget(self.text_column)
 
         self.control_column = BoxLayout(
             orientation="vertical",
-            size_hint_x=0.53,
-            spacing=dp(1),
+            size_hint_x=None,
+            spacing=snap_dp(1),
         )
         control_line = BoxLayout(
             orientation="horizontal",
             size_hint_y=None,
-            height=dp(38),
-            spacing=dp(8),
+            height=snap_dp(38),
+            spacing=snap_dp(8),
         )
         if control is not None:
             control_line.add_widget(control)
@@ -391,9 +554,9 @@ class SettingRow(BoxLayout):
             unit_label = _label(
                 unit,
                 color_name="text_muted",
-                font_size=11,
+                font_size=12,
                 size_hint_x=None,
-                width=dp(max(38, min(90, 14 + len(unit) * 8))),
+                width=snap_dp(max(38, min(90, 14 + len(unit) * 8))),
             )
             control_line.add_widget(unit_label)
         self.control_column.add_widget(control_line)
@@ -402,11 +565,11 @@ class SettingRow(BoxLayout):
             note = _label(
                 note_text,
                 color_name="text_muted",
-                font_size=10,
+                font_size=11,
                 halign="right",
                 valign="middle",
                 size_hint_y=None,
-                height=dp(16),
+                height=snap_dp(16),
             )
             _bind_wrapped(note)
             self.control_column.add_widget(note)
@@ -416,10 +579,29 @@ class SettingRow(BoxLayout):
         with self.canvas.after:
             self._separator_color = Color(*secondary_color("border_soft"))
             self._separator = Line(points=(self.x, self.y, self.right, self.y), width=1)
-        self.bind(pos=self._sync_separator, size=self._sync_separator)
+        self.bind(pos=self._sync_separator, size=self._sync_separator, width=self._layout_columns)
+        self._layout_columns()
+        self.attach_theme_controller()
+
+    def apply_theme(self, _theme) -> None:
+        self._separator_color.rgba = secondary_color("border_soft")
 
     def _sync_separator(self, *_args) -> None:
-        self._separator.points = (self.x, self.y, self.right, self.y)
+        left = snap_px(self.x)
+        baseline = snap_px(self.y)
+        self._separator.points = (left, baseline, snap_px(self.right), baseline)
+
+    def _layout_columns(self, *_args) -> None:
+        left, right, gap = setting_row_column_widths(
+            self.width,
+            gap=snap_dp(18),
+            left_ratio=0.47,
+            minimum_left=snap_dp(260),
+            maximum_left=snap_dp(380),
+        )
+        self.spacing = gap
+        self.text_column.width = left
+        self.control_column.width = right
 
     def get_value(self):
         return getattr(self.control, "text", None)
@@ -455,9 +637,9 @@ class ToggleControl(KeyboardRoundedButton):
     def _refresh_toggle(self, *_args) -> None:
         self.text = self.enabled_text if self.active else self.disabled_text
         self.bg_normal = secondary_color("accent" if self.active else "surface_muted")
-        self.bg_hover = secondary_color("accent_hover" if self.active else "surface_blue")
+        self.bg_hover = secondary_color("accent_hover" if self.active else "surface_selected")
         self.bg_down = secondary_color("accent_hover" if self.active else "accent_soft")
-        self.text_normal = secondary_color("white" if self.active else "text_secondary")
+        self.text_normal = secondary_color("on_accent" if self.active else "text_secondary")
         self.text_down = list(self.text_normal)
         resting_border = secondary_color("accent" if self.active else "border")
         self._resting_border_color = list(resting_border)
@@ -466,6 +648,9 @@ class ToggleControl(KeyboardRoundedButton):
             self._refresh_button_state(animated=False)
         except Exception:
             pass
+
+    def apply_theme(self, theme) -> None:
+        self._refresh_toggle()
 
 
 class ToggleSettingRow(SettingRow):
@@ -478,6 +663,94 @@ class ToggleSettingRow(SettingRow):
 
     def set_value(self, value: object) -> None:
         self.toggle.active = bool(value)
+
+
+class ThemeSegmentedControl(ThemableMixin, BoxLayout):
+    """Immediate Light/Dark selector synchronized with the global controller."""
+
+    value = StringProperty("light")
+
+    def __init__(
+        self,
+        *,
+        value: object = "light",
+        light_text: str = "Light",
+        dark_text: str = "Dark",
+        on_change: Optional[Callable[[str], None]] = None,
+        **kwargs,
+    ) -> None:
+        kwargs.setdefault("orientation", "horizontal")
+        kwargs.setdefault("size_hint_y", None)
+        kwargs.setdefault("height", snap_dp(34))
+        kwargs.setdefault("spacing", snap_dp(2))
+        kwargs.setdefault("padding", (0, 0, 0, 0))
+        super().__init__(**kwargs)
+        self._on_change = on_change
+        self._buttons: dict[str, KeyboardRoundedButton] = {}
+        for mode, label in (("light", light_text), ("dark", dark_text)):
+            button = secondary_button(label, compact=True)
+            button.size_hint_x = None
+            button.bind(on_release=lambda _button, selected=mode: self._select(selected))
+            self._buttons[mode] = button
+            self.add_widget(button)
+        self.bind(width=self._layout_buttons)
+        self.value = "dark" if str(value).strip().lower() == "dark" else "light"
+        self.bind(value=self._sync_selection)
+        self.attach_theme_controller()
+        self._layout_buttons()
+        self._sync_selection()
+
+    def _layout_buttons(self, *_args) -> None:
+        light_width, dark_width, gap = split_integer_width(self.width, self.spacing, 0.5)
+        self.spacing = gap
+        self._buttons["light"].width = light_width
+        self._buttons["dark"].width = dark_width
+
+    def _select(self, mode: str) -> None:
+        normalized = "dark" if str(mode).strip().lower() == "dark" else "light"
+        self.value = normalized
+        callback = self._on_change
+        if callable(callback):
+            callback(normalized)
+        else:
+            theme_controller.set_mode(normalized)
+
+    def _sync_selection(self, *_args) -> None:
+        for mode, button in self._buttons.items():
+            button._secondary_variant = "primary" if mode == self.value else "secondary"
+            button.apply_theme(theme_controller.current_theme())
+
+    def apply_theme(self, _theme) -> None:
+        global_mode = theme_controller.mode
+        if self.value != global_mode:
+            self.value = global_mode
+        else:
+            self._sync_selection()
+
+
+class ThemeSettingRow(SettingRow):
+    def __init__(
+        self,
+        *,
+        value: object = "light",
+        light_text: str = "Light",
+        dark_text: str = "Dark",
+        on_change: Optional[Callable[[str], None]] = None,
+        **kwargs,
+    ) -> None:
+        self.selector = ThemeSegmentedControl(
+            value=value,
+            light_text=light_text,
+            dark_text=dark_text,
+            on_change=on_change,
+        )
+        super().__init__(control=self.selector, **kwargs)
+
+    def get_value(self) -> str:
+        return str(self.selector.value)
+
+    def set_value(self, value: object) -> None:
+        self.selector.value = "dark" if str(value).strip().lower() == "dark" else "light"
 
 
 class SelectSettingRow(SettingRow):
@@ -612,7 +885,7 @@ class SettingsSection(BoxLayout):
             subtitle = _label(
                 description,
                 color_name="text_muted",
-                font_size=11,
+                font_size=12,
                 size_hint_y=None,
                 height=dp(20),
                 halign="left",
@@ -646,7 +919,7 @@ class AdvancedDisclosure(BoxLayout):
         self.description_label = _label(
             description,
             color_name="text_muted",
-            font_size=11,
+            font_size=12,
             size_hint_y=None,
             height=dp(22 if description else 0),
             halign="left",
@@ -686,7 +959,7 @@ class DangerZone(_BackgroundBox):
         title_label = _label(title, color_name="danger", font_size=14, bold=True, size_hint_y=None, height=dp(26), halign="left")
         _bind_wrapped(title_label)
         self.add_widget(title_label)
-        description_label = _label(description, color_name="text_muted", font_size=11, size_hint_y=None, height=dp(34), halign="left", valign="top")
+        description_label = _label(description, color_name="text_muted", font_size=12, size_hint_y=None, height=dp(34), halign="left", valign="top")
         _bind_wrapped(description_label)
         self.add_widget(description_label)
         self.actions = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(36), spacing=dp(8))
@@ -708,6 +981,7 @@ class EmptyStatePanel(_BackgroundBox):
         kwargs.setdefault("spacing", dp(8))
         kwargs.setdefault("radius", dp(6))
         kwargs.setdefault("background_color", secondary_color("surface_muted"))
+        kwargs.setdefault("background_token", "surface_muted")
         super().__init__(**kwargs)
         self.add_widget(_label(title, font_size=16, bold=True, size_hint_y=None, height=dp(28), halign="center"))
         detail = _label(description, color_name="text_muted", font_size=12, size_hint_y=None, height=dp(44), halign="center", valign="top")
@@ -861,12 +1135,12 @@ class ErrorStateDialog:
         self.popup.dismiss()
 
 
-class ToastMessage(Label):
+class ToastMessage(ThemableMixin, Label):
     def __init__(self, text: str, *, kind: str = "neutral", **kwargs):
-        color_name = "success" if kind == "success" else "danger" if kind == "danger" else "text_primary"
+        self.theme_token = "success" if kind == "success" else "danger" if kind == "danger" else "text_primary"
         kwargs.setdefault("font_name", UI_FONT)
         kwargs.setdefault("font_size", sp(12))
-        kwargs.setdefault("color", secondary_color(color_name))
+        kwargs.setdefault("color", secondary_color(self.theme_token))
         kwargs.setdefault("size_hint", (None, None))
         kwargs.setdefault("height", dp(38))
         kwargs.setdefault("width", dp(300))
@@ -878,6 +1152,12 @@ class ToastMessage(Label):
             self._toast_bg_color = Color(*secondary_color("surface_muted", 0.98))
             self._toast_bg = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(5)])
         self.bind(pos=self._sync_toast, size=self._sync_toast)
+        self.attach_theme_controller()
+
+    def apply_theme(self, _theme) -> None:
+        self.color = secondary_color(self.theme_token)
+        if hasattr(self, "_toast_bg_color"):
+            self._toast_bg_color.rgba = secondary_color("surface_elevated", 0.98)
 
     def _sync_toast(self, *_args) -> None:
         self._toast_bg.pos = self.pos

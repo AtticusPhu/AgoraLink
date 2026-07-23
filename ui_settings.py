@@ -7,12 +7,12 @@ from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 
 from ui_copy import tr
 from ui_form_components import (
     AdvancedDisclosure,
+    AccentMonogram,
     ConfirmationDialog,
     DangerZone,
     InlineStatusRow,
@@ -23,11 +23,11 @@ from ui_form_components import (
     SettingRow,
     SettingsSection,
     TextSettingRow,
+    ThemeSettingRow,
     ToggleSettingRow,
     _bind_wrapped,
     _label,
     secondary_button,
-    secondary_color,
 )
 from ui_secondary_shell import SecondaryPageShell, fixed_action_footer, scrollable_content
 from ui_settings_schema import (
@@ -39,6 +39,7 @@ from ui_settings_schema import (
     ordered_sections,
     settings_for_section,
 )
+from ui_theme_controller import theme_controller
 
 
 GROUP_COPY = {
@@ -96,6 +97,7 @@ class SettingsCenter(SecondaryPageShell):
         initial_values: Optional[Mapping[str, object]] = None,
         context: Optional[Mapping[str, object]] = None,
         on_save: Optional[Callable[[Dict[str, object]], object]] = None,
+        on_theme_change: Optional[Callable[[str], object]] = None,
         on_close: Optional[Callable] = None,
         on_browse_directory: Optional[Callable[[Callable[[str], None]], None]] = None,
         actions: Optional[Mapping[str, Callable]] = None,
@@ -106,6 +108,7 @@ class SettingsCenter(SecondaryPageShell):
         self.model = SettingsModel(initial_values, context=context)
         self.context = dict(context or {})
         self.on_save_callback = on_save
+        self.on_theme_change_callback = on_theme_change
         self.on_close_callback = on_close
         self.on_browse_directory = on_browse_directory
         self.actions: Dict[str, Callable] = dict(actions or {})
@@ -131,7 +134,7 @@ class SettingsCenter(SecondaryPageShell):
         self.footer_status = _label(
             "",
             color_name="text_muted",
-            font_size=11,
+            font_size=12,
             size_hint_x=None,
             width=dp(230),
             halign="left",
@@ -210,25 +213,12 @@ class SettingsCenter(SecondaryPageShell):
         if section_key != "about":
             return
         hero = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(78), spacing=dp(16))
-        monogram = Label(
-            text="A",
-            font_name="RUDP_UI",
+        monogram = AccentMonogram(
+            "A",
+            radius=dp(8),
             font_size=dp(24),
-            color=secondary_color("white"),
             size_hint=(None, None),
             size=(dp(54), dp(54)),
-            halign="center",
-            valign="middle",
-        )
-        monogram.text_size = monogram.size
-        from kivy.graphics import Color, RoundedRectangle
-
-        with monogram.canvas.before:
-            monogram._badge_color = Color(*secondary_color("accent"))
-            monogram._badge_rect = RoundedRectangle(pos=monogram.pos, size=monogram.size, radius=[dp(8)])
-        monogram.bind(
-            pos=lambda inst, _value: setattr(inst._badge_rect, "pos", inst.pos),
-            size=lambda inst, _value: setattr(inst._badge_rect, "size", inst.size),
         )
         hero.add_widget(monogram)
         text = BoxLayout(orientation="vertical", spacing=0)
@@ -257,7 +247,17 @@ class SettingsCenter(SecondaryPageShell):
             "unit": definition.unit(self.lang),
             "restart_note": tr(self.lang, "needs_restart") if definition.restart_required else "",
         }
-        if definition.control_type == "toggle":
+        if definition.key == "theme_mode":
+            value = theme_controller.mode
+            self.model.values[definition.key] = value
+            row = ThemeSettingRow(
+                value=value,
+                light_text="浅色" if self.lang == "zh" else "Light",
+                dark_text="深色" if self.lang == "zh" else "Dark",
+                on_change=self._apply_theme_change,
+                **common,
+            )
+        elif definition.control_type == "toggle":
             row = ToggleSettingRow(
                 value=bool(value),
                 on_text=tr(self.lang, "enabled"),
@@ -291,6 +291,18 @@ class SettingsCenter(SecondaryPageShell):
         else:
             row = ReadOnlyInfoRow(value=value, **common)
         return row
+
+    def _apply_theme_change(self, mode: str) -> None:
+        normalized = "dark" if str(mode).strip().lower() == "dark" else "light"
+        self.model.set_value("theme_mode", normalized)
+        callback = self.on_theme_change_callback
+        if callable(callback):
+            callback(normalized)
+        else:
+            theme_controller.set_mode(normalized)
+        self.footer_status.theme_token = "text_secondary"
+        self.footer_status.apply_theme(theme_controller.current_theme())
+        self.footer_status.text = "已立即应用" if self.lang == "zh" else "Applied immediately"
 
     def _bind_dynamic_rows(self, section: str) -> None:
         if section == "screen" and "screen_native_preset" in self.rows:
@@ -425,7 +437,8 @@ class SettingsCenter(SecondaryPageShell):
                 row = self.rows.get(key)
                 if row is not None:
                     row.set_error(self._error_text(SETTING_BY_KEY[key], code))
-            self.footer_status.color = secondary_color("danger")
+            self.footer_status.theme_token = "danger"
+            self.footer_status.apply_theme(theme_controller.current_theme())
             self.footer_status.text = tr(self.lang, "invalid_value")
             return False
         values = self.model.serializable_values()
@@ -441,15 +454,19 @@ class SettingsCenter(SecondaryPageShell):
             except Exception as exc:
                 self.footer_status.text = str(exc)
                 result = False
-        self.footer_status.color = secondary_color("success" if result else "danger")
+        self.footer_status.theme_token = "success" if result else "danger"
+        self.footer_status.apply_theme(theme_controller.current_theme())
         if not self.footer_status.text:
             self.footer_status.text = tr(self.lang, "changes_saved" if result else "changes_not_saved")
         return result
 
     def reset_current_section(self) -> None:
         self.model.reset_section(self.current_section)
+        if self.current_section == "general":
+            self.model.values["theme_mode"] = theme_controller.mode
         self.show_section(self.current_section)
-        self.footer_status.color = secondary_color("text_muted")
+        self.footer_status.theme_token = "text_muted"
+        self.footer_status.apply_theme(theme_controller.current_theme())
         self.footer_status.text = tr(self.lang, "confirm_reset_message")
 
     def confirm_reset_current_section(self) -> None:
