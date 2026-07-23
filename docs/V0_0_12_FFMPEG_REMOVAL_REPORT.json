@@ -1,0 +1,56 @@
+{
+  "type": "V0_0_12_FFMPEG_REMOVAL_REPORT",
+  "date": "2026-07-21",
+  "source_commit": "ba4369dfffc0d3efdba622050586f39c0c16404d",
+  "status": "PASS",
+  "removed": {
+    "runtime_paths": true,
+    "ui_options": true,
+    "capability_probe": true,
+    "command_builders": true,
+    "process_lifecycle": true,
+    "packaging_entries": true,
+    "installer_guidance": true,
+    "path_discovery": true,
+    "optional_kivy_media_providers": true
+  },
+  "allowed_legacy_references": [
+    "config_migration.py",
+    "tests",
+    "historical changelog/audit documents",
+    "portable rejection scanner"
+  ],
+  "migration": {
+    "legacy_backends": ["ffmpeg", "external"],
+    "target_backend": "native",
+    "obsolete_keys_removed": true,
+    "warning_once": "legacy_ffmpeg_config_migrated_to_native",
+    "idempotent": true
+  },
+  "portable": {
+    "path": "_local_artifacts/V0_0_12_RELEASE_FINAL_ba4369d/AgoraLink_v0.0.12_portable.zip",
+    "size_bytes": 41881098,
+    "sha256": "9927AE652064670E9CE771B4BA93D0F13B38BA33DDCE697E60F7ECFAB4CCF479",
+    "zip_entries": 1447,
+    "files_scanned": 1434,
+    "ffmpeg_files": 0,
+    "ffprobe_files": 0,
+    "ffplay_files": 0,
+    "named_ffmpeg_libraries": 0,
+    "optional_kivy_media_provider_files": 0,
+    "external_media_bundle_directories": 0,
+    "pdb_files": 0,
+    "dmp_files": 0,
+    "source_files": 0,
+    "staging_scan": "PASS",
+    "extracted_scan": "PASS"
+  },
+  "residual_processes": {
+    "ffmpeg": 0,
+    "ffprobe": 0,
+    "ffplay": 0,
+    "agoralink_media": 0
+  },
+  "hardware_smoke": "NOT_RUN",
+  "dual_host_smoke": "NOT_RUN"
+}

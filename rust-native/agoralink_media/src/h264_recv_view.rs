@@ -64,7 +64,7 @@ impl AudioRecvMode {
 mod platform {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::io::{self, Write};
-    use std::net::UdpSocket;
+    use std::net::{SocketAddr, UdpSocket};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
@@ -334,6 +334,11 @@ mod platform {
         transition_failure_stage: Option<&'static str>,
         stream_close_received: u64,
         stream_close_ack_sent: u64,
+        stream_close_rejected_pre_session: u64,
+        stream_close_rejected_peer: u64,
+        stream_close_rejected_session: u64,
+        stream_close_rejected_invalid: u64,
+        stream_close_duplicate: u64,
         stream_close_sent: u64,
         stream_close_retry_count: u64,
         stream_close_ack_received: bool,
@@ -427,12 +432,84 @@ mod platform {
         repair_packets_dropped_no_frame: u64,
         stream_close_received: u64,
         stream_close_ack_sent: u64,
+        stream_close_rejected_pre_session: u64,
+        stream_close_rejected_peer: u64,
+        stream_close_rejected_session: u64,
+        stream_close_rejected_invalid: u64,
+        stream_close_duplicate: u64,
         stream_close_sent: u64,
         stream_close_retry_count: u64,
         stream_close_ack_received: bool,
         stream_close_handshake_timeout: bool,
         peer_timeout_triggered: bool,
         peer_last_valid_age_ms: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum IncomingStreamCloseDecision {
+        Accept(crate::media_control::StreamClose),
+        Duplicate(crate::media_control::StreamClose),
+        RejectPreSession,
+        RejectPeer,
+        RejectSession,
+        RejectInvalid,
+    }
+
+    fn classify_incoming_stream_close(
+        datagram: &[u8],
+        source: SocketAddr,
+        pinned_peer: Option<SocketAddr>,
+        active_session_id: Option<u64>,
+        accepted_close: Option<(SocketAddr, crate::media_control::StreamClose)>,
+    ) -> IncomingStreamCloseDecision {
+        let Ok(close) = crate::media_control::StreamClose::decode(datagram) else {
+            return IncomingStreamCloseDecision::RejectInvalid;
+        };
+        if pinned_peer.is_none() || active_session_id.is_none() || active_session_id == Some(0) {
+            return IncomingStreamCloseDecision::RejectPreSession;
+        }
+        if pinned_peer != Some(source) {
+            return IncomingStreamCloseDecision::RejectPeer;
+        }
+        if close.stream_id != crate::STREAM_VIDEO
+            || close.video_session_id == 0
+            || active_session_id != Some(close.video_session_id)
+        {
+            return IncomingStreamCloseDecision::RejectSession;
+        }
+        if let Some((accepted_source, accepted)) = accepted_close {
+            if accepted_source == source
+                && accepted.video_session_id == close.video_session_id
+                && accepted.close_id == close.close_id
+            {
+                return IncomingStreamCloseDecision::Duplicate(close);
+            }
+            return IncomingStreamCloseDecision::RejectInvalid;
+        }
+        IncomingStreamCloseDecision::Accept(close)
+    }
+
+    fn classify_short_or_nack(datagram: &[u8]) -> (bool, bool) {
+        let nack = datagram.len() >= 4 && &datagram[..4] == b"NACK";
+        (datagram.len() < 4 || nack, nack)
+    }
+
+    fn send_stream_close_ack(
+        socket: &UdpSocket,
+        source: SocketAddr,
+        close: crate::media_control::StreamClose,
+    ) -> bool {
+        close
+            .ack()
+            .encode()
+            .ok()
+            .and_then(|bytes| {
+                socket
+                    .send_to(&bytes, source)
+                    .ok()
+                    .map(|sent| sent == bytes.len())
+            })
+            .unwrap_or(false)
     }
 
     #[derive(Default)]
@@ -944,6 +1021,17 @@ mod platform {
         };
         let shutdown_coordinator = crate::shutdown::ShutdownCoordinator::new();
         let cancellation = shutdown_coordinator.token();
+        let _local_control = if config.mode == H264RecvViewMode::Screen {
+            match crate::local_control::spawn_stdin_listener(cancellation.clone()) {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    print_startup_failure(&config, &error);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let event_context = crate::shutdown::RuntimeEventContext::new(crate::make_session_id());
         let socket = match UdpSocket::bind(format!("{}:{}", config.bind, config.port)) {
             Ok(socket) => socket,
@@ -1514,6 +1602,7 @@ mod platform {
         let mut next_feedback_at = Instant::now() + Duration::from_millis(capability_feedback_ms);
         let mut last_valid_peer_activity: Option<Instant> = None;
         let mut peer_close_linger_until: Option<Instant> = None;
+        let mut accepted_peer_close: Option<(SocketAddr, crate::media_control::StreamClose)> = None;
 
         while !stop.load(Ordering::SeqCst)
             || peer_close_linger_until.is_some_and(|deadline| Instant::now() < deadline)
@@ -1527,31 +1616,19 @@ mod platform {
                         datagrams_this_tick += 1;
                         let received_at = Instant::now();
                         if crate::media_control::is_stream_close(&datagram[..length]) {
-                            match crate::media_control::StreamClose::decode(&datagram[..length]) {
-                                Ok(close)
-                                    if close.stream_id == crate::STREAM_VIDEO
-                                        && peer.is_none_or(|pinned| pinned == source_peer)
-                                        && reassembler.session_id().is_none_or(|session_id| {
-                                            close.video_session_id == 0
-                                                || close.video_session_id == session_id
-                                        }) =>
-                                {
+                            match classify_incoming_stream_close(
+                                &datagram[..length],
+                                source_peer,
+                                peer,
+                                reassembler.session_id(),
+                                accepted_peer_close,
+                            ) {
+                                IncomingStreamCloseDecision::Accept(close) => {
                                     last_valid_peer_activity = Some(received_at);
-                                    peer.get_or_insert(source_peer);
+                                    accepted_peer_close = Some((source_peer, close));
                                     dispatch_stats.stream_close_received =
                                         dispatch_stats.stream_close_received.saturating_add(1);
-                                    if close
-                                        .ack()
-                                        .encode()
-                                        .ok()
-                                        .and_then(|bytes| {
-                                            socket
-                                                .send_to(&bytes, source_peer)
-                                                .ok()
-                                                .map(|sent| sent == bytes.len())
-                                        })
-                                        .unwrap_or(false)
-                                    {
+                                    if send_stream_close_ack(&socket, source_peer, close) {
                                         dispatch_stats.stream_close_ack_sent =
                                             dispatch_stats.stream_close_ack_sent.saturating_add(1);
                                     }
@@ -1563,9 +1640,37 @@ mod platform {
                                     cancellation.cancel(crate::shutdown::StopReason::PeerClosed);
                                     continue;
                                 }
-                                _ => {
-                                    dispatch_stats.unknown_packets_received =
-                                        dispatch_stats.unknown_packets_received.saturating_add(1);
+                                IncomingStreamCloseDecision::Duplicate(close) => {
+                                    dispatch_stats.stream_close_duplicate =
+                                        dispatch_stats.stream_close_duplicate.saturating_add(1);
+                                    if send_stream_close_ack(&socket, source_peer, close) {
+                                        dispatch_stats.stream_close_ack_sent =
+                                            dispatch_stats.stream_close_ack_sent.saturating_add(1);
+                                    }
+                                    continue;
+                                }
+                                IncomingStreamCloseDecision::RejectPreSession => {
+                                    dispatch_stats.stream_close_rejected_pre_session =
+                                        dispatch_stats
+                                            .stream_close_rejected_pre_session
+                                            .saturating_add(1);
+                                    continue;
+                                }
+                                IncomingStreamCloseDecision::RejectPeer => {
+                                    dispatch_stats.stream_close_rejected_peer =
+                                        dispatch_stats.stream_close_rejected_peer.saturating_add(1);
+                                    continue;
+                                }
+                                IncomingStreamCloseDecision::RejectSession => {
+                                    dispatch_stats.stream_close_rejected_session = dispatch_stats
+                                        .stream_close_rejected_session
+                                        .saturating_add(1);
+                                    continue;
+                                }
+                                IncomingStreamCloseDecision::RejectInvalid => {
+                                    dispatch_stats.stream_close_rejected_invalid = dispatch_stats
+                                        .stream_close_rejected_invalid
+                                        .saturating_add(1);
                                     continue;
                                 }
                             }
@@ -1630,9 +1735,11 @@ mod platform {
                                 }
                             }
                         }
-                        if datagram.len() < 4 || &datagram[..4] == b"NACK" {
+                        let (reject_non_media, is_nack) =
+                            classify_short_or_nack(&datagram[..length]);
+                        if reject_non_media {
                             dispatch_stats.unknown_packets_received += 1;
-                            if datagram.len() >= 4 && &datagram[..4] == b"NACK" {
+                            if is_nack {
                                 dispatch_stats.nack_control_packets_received += 1;
                                 dispatch_stats.repair_packets_dropped_wrong_type += 1;
                             }
@@ -2494,6 +2601,11 @@ mod platform {
             new_session_first_packet_wait_ms_max: profile.new_session_first_packet_wait_ms_max,
             stream_close_received: dispatch_stats.stream_close_received,
             stream_close_ack_sent: dispatch_stats.stream_close_ack_sent,
+            stream_close_rejected_pre_session: dispatch_stats.stream_close_rejected_pre_session,
+            stream_close_rejected_peer: dispatch_stats.stream_close_rejected_peer,
+            stream_close_rejected_session: dispatch_stats.stream_close_rejected_session,
+            stream_close_rejected_invalid: dispatch_stats.stream_close_rejected_invalid,
+            stream_close_duplicate: dispatch_stats.stream_close_duplicate,
             stream_close_sent: dispatch_stats.stream_close_sent,
             stream_close_retry_count: dispatch_stats.stream_close_retry_count,
             stream_close_ack_received: dispatch_stats.stream_close_ack_received,
@@ -3299,7 +3411,7 @@ mod platform {
         let video_packet_dispatch_ms_max =
             snapshot.video_packet_dispatch_ns_max as f64 / 1_000_000.0;
         let mut output = format!(
-            r#""udp_recv_buffer_bytes":{},"udp_recv_buffer_bytes_requested":{},"udp_recv_buffer_bytes_actual":{},"packets_per_second":{:.2},"udp_recv_packets_per_second":{:.2},"udp_recv_loop_overruns":{},"complete_frame_queue_len":{},"complete_frame_queue_peak":{},"complete_frame_queue_drops":{},"reassembly_frames_active":{},"reassembly_packets_active":{},"reassembly_fast_path_enabled":true,"reassembly_allocations_estimate":{},"reassembly_complete_scan_count":{},"playout_delay_ms":{},"playout_buffer_frames":{},"playout_buffer_peak_frames":{},"playout_late_frames":{},"playout_dropped_late_frames":{},"playout_dropped_discontinuity_frames":{},"playout_delay_actual_ms_avg":{:.3},"playout_delay_actual_ms_max":{:.3},"media_clock":"instant",{},"decoder_configured_fps":{},"decoder_sample_duration_us":{},"decoder_input_fps":{:.2},"render_output_fps":{:.2},"active_render_fps":{:.2},"decode_thread_fps":{:.2},"render_thread_fps":{:.2},"decoded_frame_queue_len":{},"decoded_frame_queue_peak":{},"decoded_frame_queue_drops":{},"decoded_frames_replaced_by_latest":{},"render_latest_slot_replacements":{},"decoder_blocked_by_render_count":0,"frames_missing_packets":{},"frames_dropped_incomplete":{},"fec_mode":"{}","fec_packets_received":{},"fec_frames_recovered":{},"fec_packets_recovered":{},"fec_recovery_failed_multi_missing":{},"fec_recovery_failed_no_parity":{},"fec_recovery_failed_invalid":{},"frames_missing_after_fec":{},"frames_dropped_after_fec":{},"keyframe_recovery_count":{},"last_keyframe_id":{},"decoder_resets":{},"drop_damaged_gop":{},"damaged_gop_count":{},"frames_discarded_damaged_gop":{},"frames_discarded_waiting_keyframe":{},"waiting_keyframe_entries":{},"waiting_keyframe_exits":{},"idr_frames_received":{},"idr_frames_used_for_recovery":{},"non_idr_frames_discarded_waiting":{},"recovery_wait_ms_avg":{:.3},"recovery_wait_ms_max":{:.3},"recovery_wait_frames_avg":{:.3},"recovery_wait_frames_max":{},"next_decode_frame_id":{},"decode_gate_stalls":{},"decode_gate_gap_events":{},"decode_gate_gap_to_damage_ms_avg":{:.3},"decode_gate_gap_to_damage_ms_max":{:.3},"frames_buffered_waiting_order":{},"frames_discarded_decode_gate":{},"reorder_wait_ms":{},"video_packet_dispatch_ms_avg":{:.6},"video_packet_dispatch_ms_max":{:.6},{},{},{}"#,
+            r#""udp_recv_buffer_bytes":{},"udp_recv_buffer_bytes_requested":{},"udp_recv_buffer_bytes_actual":{},"packets_per_second":{:.2},"udp_recv_packets_per_second":{:.2},"udp_recv_loop_overruns":{},"complete_frame_queue_len":{},"complete_frame_queue_peak":{},"complete_frame_queue_drops":{},"reassembly_frames_active":{},"reassembly_packets_active":{},"reassembly_packet_slots_reserved":{},"reassembly_payload_bytes_reserved":{},"reassembly_budget_rejected_frames":{},"reassembly_oversize_frames":{},"reassembly_fast_path_enabled":true,"reassembly_allocations_estimate":{},"reassembly_complete_scan_count":{},"playout_delay_ms":{},"playout_buffer_frames":{},"playout_buffer_peak_frames":{},"playout_late_frames":{},"playout_dropped_late_frames":{},"playout_dropped_discontinuity_frames":{},"playout_delay_actual_ms_avg":{:.3},"playout_delay_actual_ms_max":{:.3},"media_clock":"instant",{},"decoder_configured_fps":{},"decoder_sample_duration_us":{},"decoder_input_fps":{:.2},"render_output_fps":{:.2},"active_render_fps":{:.2},"decode_thread_fps":{:.2},"render_thread_fps":{:.2},"decoded_frame_queue_len":{},"decoded_frame_queue_peak":{},"decoded_frame_queue_drops":{},"decoded_frames_replaced_by_latest":{},"render_latest_slot_replacements":{},"decoder_blocked_by_render_count":0,"frames_missing_packets":{},"frames_dropped_incomplete":{},"fec_mode":"{}","fec_packets_received":{},"fec_frames_recovered":{},"fec_packets_recovered":{},"fec_recovery_failed_multi_missing":{},"fec_recovery_failed_no_parity":{},"fec_recovery_failed_invalid":{},"frames_missing_after_fec":{},"frames_dropped_after_fec":{},"keyframe_recovery_count":{},"last_keyframe_id":{},"decoder_resets":{},"drop_damaged_gop":{},"damaged_gop_count":{},"frames_discarded_damaged_gop":{},"frames_discarded_waiting_keyframe":{},"waiting_keyframe_entries":{},"waiting_keyframe_exits":{},"idr_frames_received":{},"idr_frames_used_for_recovery":{},"non_idr_frames_discarded_waiting":{},"recovery_wait_ms_avg":{:.3},"recovery_wait_ms_max":{:.3},"recovery_wait_frames_avg":{:.3},"recovery_wait_frames_max":{},"next_decode_frame_id":{},"decode_gate_stalls":{},"decode_gate_gap_events":{},"decode_gate_gap_to_damage_ms_avg":{:.3},"decode_gate_gap_to_damage_ms_max":{:.3},"frames_buffered_waiting_order":{},"frames_discarded_decode_gate":{},"reorder_wait_ms":{},"video_packet_dispatch_ms_avg":{:.6},"video_packet_dispatch_ms_max":{:.6},{},{},{}"#,
             snapshot.udp_recv_buffer_bytes,
             snapshot.udp_recv_buffer_bytes_requested,
             snapshot.udp_recv_buffer_bytes,
@@ -3311,6 +3423,10 @@ mod platform {
             snapshot.complete_frame_queue_drops,
             snapshot.reassembly.reassembly_frames_active,
             snapshot.reassembly.reassembly_packets_active,
+            snapshot.reassembly.reassembly_packet_slots_reserved,
+            snapshot.reassembly.reassembly_payload_bytes_reserved,
+            snapshot.reassembly.reassembly_budget_rejected_frames,
+            snapshot.reassembly.reassembly_oversize_frames,
             snapshot.reassembly.reassembly_allocations_estimate,
             snapshot.reassembly.reassembly_complete_scan_count,
             snapshot.playout_delay_ms,
@@ -3590,7 +3706,7 @@ mod platform {
             snapshot.repair_deadline_ms_total / snapshot.repair_deadline_samples as f64
         };
         format!(
-            r#""repair_mode":"{}","video_data_packets_received":{},"video_fec_packets_received":{},"audio_packets_received":{},"unknown_packets_received":{},"nack_control_packets_received":{},"packet_type_dispatch_counts":{{"video_data":{},"video_fec":{},"audio":{},"unknown":{},"nack_control":{}}},"nack_packets_sent":{},"nack_items_sent":{},"nack_frames_requested":{},"nack_rounds_sent":{},"nack_candidate_frames":{},"nack_suppressed_progressing_frames":{},"nack_suppressed_too_early":{},"nack_suppressed_already_requested":{},"nack_suppressed_item_limit":{},"nack_items_deduped":{},"nack_items_per_requested_frame_avg":{:.3},"nack_items_per_requested_frame_max":{},"repair_packets_received":{},"repair_packets_inserted":{},"repair_packets_matched_inflight":{},"repair_duplicate_packets":{},"repair_packets_dropped_wrong_type":{},"repair_packets_dropped_late":{},"repair_packets_dropped_no_frame":{},"repair_late_packets":{},"repair_frames_completed":{},"repair_deadline_missed":{},"repair_deadline_ms_avg":{:.3},"repair_deadline_ms_max":{:.3},"frames_missing_after_repair":{},"frames_dropped_after_repair":{},"repair_wait_ms_avg":{:.3},"repair_wait_ms_max":{:.3},"repair_send_errors":{},"repair_cancelled_frame_complete":{},"repair_overhead_packets":{},"repair_overhead_ratio_vs_data":{:.6},"stream_close_received":{},"stream_close_ack_sent":{},"stream_close_sent":{},"stream_close_retry_count":{},"stream_close_ack_received":{},"stream_close_handshake_timeout":{},"peer_timeout_triggered":{},"peer_last_valid_age_ms":{}"#,
+            r#""repair_mode":"{}","video_data_packets_received":{},"video_fec_packets_received":{},"audio_packets_received":{},"unknown_packets_received":{},"nack_control_packets_received":{},"packet_type_dispatch_counts":{{"video_data":{},"video_fec":{},"audio":{},"unknown":{},"nack_control":{}}},"nack_packets_sent":{},"nack_items_sent":{},"nack_frames_requested":{},"nack_rounds_sent":{},"nack_candidate_frames":{},"nack_suppressed_progressing_frames":{},"nack_suppressed_too_early":{},"nack_suppressed_already_requested":{},"nack_suppressed_item_limit":{},"nack_items_deduped":{},"nack_items_per_requested_frame_avg":{:.3},"nack_items_per_requested_frame_max":{},"repair_packets_received":{},"repair_packets_inserted":{},"repair_packets_matched_inflight":{},"repair_duplicate_packets":{},"repair_packets_dropped_wrong_type":{},"repair_packets_dropped_late":{},"repair_packets_dropped_no_frame":{},"repair_late_packets":{},"repair_frames_completed":{},"repair_deadline_missed":{},"repair_deadline_ms_avg":{:.3},"repair_deadline_ms_max":{:.3},"frames_missing_after_repair":{},"frames_dropped_after_repair":{},"repair_wait_ms_avg":{:.3},"repair_wait_ms_max":{:.3},"repair_send_errors":{},"repair_cancelled_frame_complete":{},"repair_overhead_packets":{},"repair_overhead_ratio_vs_data":{:.6},"stream_close_received":{},"stream_close_ack_sent":{},"stream_close_rejected_pre_session":{},"stream_close_rejected_peer":{},"stream_close_rejected_session":{},"stream_close_rejected_invalid":{},"stream_close_duplicate":{},"stream_close_sent":{},"stream_close_retry_count":{},"stream_close_ack_received":{},"stream_close_handshake_timeout":{},"peer_timeout_triggered":{},"peer_last_valid_age_ms":{}"#,
             snapshot.repair_mode.name(),
             snapshot.video_data_packets_received,
             snapshot.video_fec_packets_received,
@@ -3640,6 +3756,11 @@ mod platform {
             repair_overhead_ratio,
             snapshot.stream_close_received,
             snapshot.stream_close_ack_sent,
+            snapshot.stream_close_rejected_pre_session,
+            snapshot.stream_close_rejected_peer,
+            snapshot.stream_close_rejected_session,
+            snapshot.stream_close_rejected_invalid,
+            snapshot.stream_close_duplicate,
             snapshot.stream_close_sent,
             snapshot.stream_close_retry_count,
             snapshot.stream_close_ack_received,
@@ -3939,6 +4060,151 @@ mod platform {
             }
         }
 
+        fn test_peer() -> std::net::SocketAddr {
+            "127.0.0.1:55134".parse().unwrap()
+        }
+
+        #[test]
+        fn pre_session_close_is_ignored() {
+            let close = test_close(1);
+            let decision = super::classify_incoming_stream_close(
+                &close.encode().unwrap(),
+                test_peer(),
+                None,
+                None,
+                None,
+            );
+            assert_eq!(
+                decision,
+                super::IncomingStreamCloseDecision::RejectPreSession
+            );
+        }
+
+        #[test]
+        fn zero_session_close_is_ignored() {
+            let close = crate::media_control::StreamClose {
+                video_session_id: 0,
+                ..test_close(2)
+            };
+            let decision = super::classify_incoming_stream_close(
+                &close.encode().unwrap(),
+                test_peer(),
+                Some(test_peer()),
+                Some(17),
+                None,
+            );
+            assert_eq!(decision, super::IncomingStreamCloseDecision::RejectSession);
+        }
+
+        #[test]
+        fn foreign_peer_close_is_ignored() {
+            let close = test_close(3);
+            let decision = super::classify_incoming_stream_close(
+                &close.encode().unwrap(),
+                "127.0.0.1:55135".parse().unwrap(),
+                Some(test_peer()),
+                Some(17),
+                None,
+            );
+            assert_eq!(decision, super::IncomingStreamCloseDecision::RejectPeer);
+        }
+
+        #[test]
+        fn stale_session_close_is_ignored() {
+            let close = crate::media_control::StreamClose {
+                video_session_id: 16,
+                ..test_close(4)
+            };
+            let decision = super::classify_incoming_stream_close(
+                &close.encode().unwrap(),
+                test_peer(),
+                Some(test_peer()),
+                Some(17),
+                None,
+            );
+            assert_eq!(decision, super::IncomingStreamCloseDecision::RejectSession);
+        }
+
+        #[test]
+        fn valid_close_is_acked_and_stops() {
+            let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+            receiver
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let close = test_close(5);
+            let source = receiver.local_addr().unwrap();
+            assert_eq!(
+                super::classify_incoming_stream_close(
+                    &close.encode().unwrap(),
+                    source,
+                    Some(source),
+                    Some(17),
+                    None,
+                ),
+                super::IncomingStreamCloseDecision::Accept(close)
+            );
+            assert!(super::send_stream_close_ack(&sender, source, close));
+            let mut bytes = [0u8; 64];
+            let (length, _) = receiver.recv_from(&mut bytes).unwrap();
+            assert!(
+                crate::media_control::StreamCloseAck::decode(&bytes[..length])
+                    .unwrap()
+                    .matches(close)
+            );
+            let cancellation = crate::shutdown::CancellationToken::new();
+            assert!(cancellation.cancel(crate::shutdown::StopReason::PeerClosed));
+            assert_eq!(
+                cancellation.reason(),
+                Some(crate::shutdown::StopReason::PeerClosed)
+            );
+        }
+
+        #[test]
+        fn duplicate_close_is_idempotent() {
+            let close = test_close(6);
+            let peer = test_peer();
+            let cancellation = crate::shutdown::CancellationToken::new();
+            assert!(cancellation.cancel(crate::shutdown::StopReason::PeerClosed));
+            assert_eq!(
+                super::classify_incoming_stream_close(
+                    &close.encode().unwrap(),
+                    peer,
+                    Some(peer),
+                    Some(17),
+                    Some((peer, close)),
+                ),
+                super::IncomingStreamCloseDecision::Duplicate(close)
+            );
+            assert!(!cancellation.cancel(crate::shutdown::StopReason::PeerClosed));
+        }
+
+        #[test]
+        fn short_datagram_uses_received_length() {
+            let mut buffer = [0u8; 64];
+            buffer[..4].copy_from_slice(b"NACK");
+            for length in 0..4 {
+                assert_eq!(
+                    super::classify_short_or_nack(&buffer[..length]),
+                    (true, false)
+                );
+            }
+            buffer[..4].copy_from_slice(b"NOPE");
+            assert_eq!(super::classify_short_or_nack(&buffer[..4]), (false, false));
+        }
+
+        #[test]
+        fn reused_buffer_does_not_misclassify_short_packet() {
+            let mut buffer = [0u8; 64];
+            buffer[..4].copy_from_slice(b"NACK");
+            assert_eq!(super::classify_short_or_nack(&buffer[..4]), (true, true));
+            buffer[0] = b'X';
+            assert_eq!(super::classify_short_or_nack(&buffer[..1]), (true, false));
+            buffer[..4].copy_from_slice(b"MCLS");
+            buffer[..2].copy_from_slice(b"OK");
+            assert_eq!(super::classify_short_or_nack(&buffer[..2]), (true, false));
+        }
+
         #[test]
         fn receiver_feedback_requires_readiness_and_transition_settle() {
             super::capability_feedback_readiness_self_test().unwrap();
@@ -3998,13 +4264,20 @@ mod platform {
             local
                 .set_read_timeout(Some(Duration::from_millis(5)))
                 .unwrap();
+            remote
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
             let remote_address = remote.local_addr().unwrap();
             let close = test_close(101);
             let peer = thread::spawn(move || {
                 let mut bytes = [0u8; 256];
                 let (length, source) = remote.recv_from(&mut bytes).unwrap();
                 let observed = crate::media_control::StreamClose::decode(&bytes[..length]).unwrap();
-                thread::sleep(Duration::from_millis(35));
+                let (retry_length, retry_source) = remote.recv_from(&mut bytes).unwrap();
+                let retried =
+                    crate::media_control::StreamClose::decode(&bytes[..retry_length]).unwrap();
+                assert_eq!(retry_source, source);
+                assert_eq!(retried, observed);
                 let ack = observed.ack().encode().unwrap();
                 remote.send_to(&ack, source).unwrap();
             });

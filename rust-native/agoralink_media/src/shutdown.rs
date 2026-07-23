@@ -45,7 +45,7 @@ impl StopReason {
         }
     }
 
-    fn from_code(code: u8) -> Option<Self> {
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
         match code {
             1 => Some(Self::Duration),
             2 => Some(Self::CtrlC),

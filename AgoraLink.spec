@@ -57,11 +57,25 @@ excludes += [
     'pandas',
     'scipy',
     'PIL.ImageQt',
+    # AgoraLink does not use Kivy's optional file-video/media providers. Keep
+    # the native screen runtime as the only packaged media implementation.
+    'ffpyplayer',
+    'kivy.core.video',
+    'kivy.core.video.video_ffmpeg',
+    'kivy.core.video.video_ffpyplayer',
+    'kivy.core.video.video_gstplayer',
+    'kivy.lib.gstplayer',
 ]
 
 # Data files. collect_data_files('kivy') is safe; it does not scan kivy.garden submodules.
 datas = []
-datas += collect_data_files('kivy')
+datas += collect_data_files(
+    'kivy',
+    excludes=[
+        '**/core/video/**',
+        '**/lib/gstplayer/**',
+    ],
+)
 
 # cryptography is usually handled by PyInstaller hooks, but package metadata/data makes
 # the folder build less sensitive to hook-version differences.
@@ -86,28 +100,21 @@ fonts_dir = project_dir / 'assets' / 'fonts'
 if fonts_dir.exists():
     datas.append((str(fonts_dir), 'assets/fonts'))
 
-package_flavor = str(os.environ.get('AGORALINK_PACKAGE_FLAVOR') or '').strip().lower()
-include_ffmpeg = package_flavor != 'native_lite'
-
-ffmpeg_dir = project_dir / 'tools' / 'ffmpeg'
-if include_ffmpeg and ffmpeg_dir.exists():
-    datas.append((str(ffmpeg_dir), 'tools/ffmpeg'))
-
 rust_media_dir = Path(
     os.environ.get('AGORALINK_NATIVE_RUNTIME_DIR')
     or project_dir / 'rust-native' / 'agoralink_media' / 'target' / 'release'
 ).resolve()
 rust_media_exe = rust_media_dir / 'agoralink_media.exe'
-rust_media_pdb = rust_media_dir / 'agoralink_media.pdb'
-if rust_media_exe.exists():
-    datas.append((str(rust_media_exe), 'tools/agoralink_media'))
-if rust_media_pdb.exists():
-    datas.append((str(rust_media_pdb), 'tools/agoralink_media'))
+if not rust_media_exe.exists():
+    raise FileNotFoundError(
+        f"Required native media runtime not found: {rust_media_exe}"
+    )
+datas.append((str(rust_media_exe), 'tools/agoralink_media'))
 
 for src, dest in [
     (project_dir / 'assets' / 'app.png', 'assets'),
     (project_dir / 'assets' / 'app.ico', 'assets'),
-    (project_dir / 'requirements.txt', '.'),
+    (project_dir / 'requirements.lock', '.'),
     (project_dir / 'allow_firewall_udp_9999_admin.bat', '.'),
 ]:
     if src.exists():

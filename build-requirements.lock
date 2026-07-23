@@ -1,0 +1,11 @@
+# AgoraLink v0.0.12 build dependencies.
+-r requirements.lock
+
+PyInstaller==6.20.0
+pyinstaller-hooks-contrib==2026.5
+altgraph==0.17.5
+packaging==26.2
+pefile==2024.8.26; sys_platform == "win32"
+pywin32-ctypes==0.2.3; sys_platform == "win32"
+setuptools==82.0.1
+wheel==0.47.0

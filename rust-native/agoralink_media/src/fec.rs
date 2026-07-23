@@ -36,6 +36,9 @@ impl FecParity {
         if self.data_packet_count == 0 {
             return Err("FEC data packet count must be greater than zero".to_string());
         }
+        if usize::from(self.data_packet_count) > crate::MAX_VIDEO_PACKET_COUNT {
+            return Err("FEC data packet count exceeds video frame limit".to_string());
+        }
         if self.data_payload_size == 0 || self.parity.len() > self.data_payload_size as usize {
             return Err("FEC parity length exceeds data payload size".to_string());
         }
@@ -82,6 +85,7 @@ impl FecParity {
         let last_data_payload_len = u16::from_be_bytes([payload[9], payload[10]]);
         let parity_len = u16::from_be_bytes([payload[11], payload[12]]) as usize;
         if data_packet_count == 0
+            || usize::from(data_packet_count) > crate::MAX_VIDEO_PACKET_COUNT
             || data_payload_size == 0
             || last_data_payload_len > data_payload_size
             || parity_len > data_payload_size as usize
@@ -125,6 +129,13 @@ pub fn packetize_frame(
     mode: FecMode,
     udp_payload_size: usize,
 ) -> Result<PacketizedFrame, String> {
+    if payload.len() > crate::MAX_VIDEO_FRAME_BYTES {
+        return Err(format!(
+            "encoded frame exceeds byte limit: {} > {}",
+            payload.len(),
+            crate::MAX_VIDEO_FRAME_BYTES
+        ));
+    }
     crate::validate_udp_payload_size(udp_payload_size)?;
     let media_payload_size = udp_payload_size - HEADER_LEN;
     let data_payload_size = match mode {
@@ -134,7 +145,7 @@ pub fn packetize_frame(
             .ok_or_else(|| "UDP payload size is too small for FEC metadata".to_string())?,
     };
     let data_packet_count = payload.len().div_ceil(data_payload_size).max(1);
-    if data_packet_count > u16::MAX as usize {
+    if data_packet_count > crate::MAX_VIDEO_PACKET_COUNT {
         return Err(format!(
             "encoded frame too large: {data_packet_count} packets"
         ));
@@ -212,4 +223,21 @@ pub fn packetize_frame(
         fec_packet_count: usize::from(mode == FecMode::SingleXor),
         fec_bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fec_count_over_limit_rejected() {
+        let count = u16::try_from(crate::MAX_VIDEO_PACKET_COUNT + 1).unwrap();
+        let parity = FecParity {
+            data_packet_count: count,
+            data_payload_size: 1,
+            last_data_payload_len: 1,
+            parity: vec![0],
+        };
+        assert!(parity.encode().is_err());
+    }
 }

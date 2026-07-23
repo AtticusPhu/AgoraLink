@@ -21,8 +21,7 @@ New-Item -ItemType Directory -Path $CaseDir -Force | Out-Null
 
 $GuiExe = Join-Path $PortableDir "AgoraLink.exe"
 $NativeExe = Join-Path $PortableDir "_internal\tools\agoralink_media\agoralink_media.exe"
-$NativePdb = Join-Path $PortableDir "_internal\tools\agoralink_media\agoralink_media.pdb"
-foreach ($required in @($GuiExe, $NativeExe, $NativePdb, (Join-Path $PortableDir "BUILD_INFO.json"))) {
+foreach ($required in @($GuiExe, $NativeExe, (Join-Path $PortableDir "BUILD_INFO.json"))) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Required portable file is missing: $required"
     }
@@ -99,8 +98,7 @@ $PrepareSummary = [ordered]@{
     gui_exe_sha256 = (Get-FileHash -LiteralPath $GuiExe -Algorithm SHA256).Hash
     native_exe = $NativeExe
     native_exe_sha256 = $NativeHash
-    native_pdb = $NativePdb
-    native_pdb_sha256 = (Get-FileHash -LiteralPath $NativePdb -Algorithm SHA256).Hash
+    symbols_in_portable = $false
     processes_before = $ProcessesBefore
     udp_ports_before = $PortsBefore
     crash_dump_dir = $CrashDumpDir

@@ -35,6 +35,7 @@ mod h264_reassembly;
 mod h264_recv_dump;
 mod h264_recv_view;
 mod h264_send_probe;
+mod local_control;
 mod media_clock;
 mod media_control;
 mod nv12_synthetic;
@@ -67,7 +68,17 @@ pub(crate) const LEGACY_UDP_PAYLOAD_SIZE: usize = 1200;
 pub(crate) const DEFAULT_REALTIME_UDP_PAYLOAD_SIZE: usize = 1452;
 pub(crate) const MAX_UDP_PAYLOAD_SIZE: usize = 1472;
 pub(crate) const MAX_MEDIA_PAYLOAD: usize = MAX_UDP_PAYLOAD_SIZE - HEADER_LEN;
+pub(crate) const MIN_MEDIA_PAYLOAD: usize = MIN_UDP_PAYLOAD_SIZE - HEADER_LEN;
 pub(crate) const LEGACY_MEDIA_PAYLOAD: usize = LEGACY_UDP_PAYLOAD_SIZE - HEADER_LEN;
+pub(crate) const MAX_VIDEO_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const FEC_PARITY_PACKET_ALLOWANCE: usize = 1;
+const VIDEO_PACKET_COUNT_SAFETY_MARGIN: usize = 4;
+pub(crate) const MAX_VIDEO_PACKET_COUNT: usize = MAX_VIDEO_FRAME_BYTES.div_ceil(MIN_MEDIA_PAYLOAD)
+    + FEC_PARITY_PACKET_ALLOWANCE
+    + VIDEO_PACKET_COUNT_SAFETY_MARGIN;
+pub(crate) const MAX_INFLIGHT_PACKET_SLOTS: usize = 64 * 1024;
+pub(crate) const MAX_INFLIGHT_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_INFLIGHT_FRAMES: usize = 120;
 const FRAME_TTL: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, Clone)]
@@ -101,6 +112,12 @@ impl MediaPacket {
         }
         if self.packet_count == 0 {
             return Err("packet_count must be greater than zero".to_string());
+        }
+        if usize::from(self.packet_count) > MAX_VIDEO_PACKET_COUNT {
+            return Err(format!(
+                "packet_count exceeds video frame limit: {} > {}",
+                self.packet_count, MAX_VIDEO_PACKET_COUNT
+            ));
         }
         if self.packet_index >= self.packet_count {
             return Err("packet_index must be less than packet_count".to_string());
@@ -146,6 +163,11 @@ impl MediaPacket {
 
         if packet_count == 0 {
             return Err("packet_count is zero".to_string());
+        }
+        if usize::from(packet_count) > MAX_VIDEO_PACKET_COUNT {
+            return Err(format!(
+                "packet_count exceeds video frame limit: {packet_count} > {MAX_VIDEO_PACKET_COUNT}"
+            ));
         }
         if packet_index >= packet_count {
             return Err("packet_index out of range".to_string());
@@ -319,7 +341,7 @@ fn main() {
                 );
                 process::exit(1);
             }
-            println!(r#"{{"type":"SELF_TEST","ok":true,"packet_format":"AGM1"}}"#);
+            println!("{}", self_test_success_json());
         }
         Ok(Command::Sender {
             host,
@@ -447,6 +469,18 @@ fn main() {
             process::exit(2);
         }
     }
+}
+
+fn self_test_success_json() -> String {
+    format!(
+        concat!(
+            r#"{{"type":"SELF_TEST","ok":true,"version":"{}","#,
+            r#""packet_format":"AGM1","capabilities":{{"#,
+            r#""screen_send":true,"screen_recv":true,"audio_send":true,"#,
+            r#""audio_recv_play":true,"hardware_runtime_probe_required":true}}}}"#
+        ),
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 fn parse_args(args: Vec<String>) -> Result<Command, String> {
@@ -2487,8 +2521,13 @@ fn build_frame_packets(
     payload_size: usize,
     keyframe: bool,
 ) -> Result<Vec<Vec<u8>>, String> {
+    if payload_size > MAX_VIDEO_FRAME_BYTES {
+        return Err(format!(
+            "frame exceeds encoded byte limit: {payload_size} > {MAX_VIDEO_FRAME_BYTES}"
+        ));
+    }
     let packet_count = payload_size.div_ceil(LEGACY_MEDIA_PAYLOAD).max(1);
-    if packet_count > u16::MAX as usize {
+    if packet_count > MAX_VIDEO_PACKET_COUNT {
         return Err(format!("frame too large: {} packets", packet_count));
     }
 
@@ -2528,8 +2567,14 @@ pub(crate) fn packetize_media_payload(
     payload: &[u8],
     frame_flags: u16,
 ) -> Result<Vec<Vec<u8>>, String> {
+    if payload.len() > MAX_VIDEO_FRAME_BYTES {
+        return Err(format!(
+            "encoded frame exceeds byte limit: {} > {MAX_VIDEO_FRAME_BYTES}",
+            payload.len()
+        ));
+    }
     let packet_count = payload.len().div_ceil(LEGACY_MEDIA_PAYLOAD).max(1);
-    if packet_count > u16::MAX as usize {
+    if packet_count > MAX_VIDEO_PACKET_COUNT {
         return Err(format!("encoded frame too large: {packet_count} packets"));
     }
 
@@ -2983,5 +3028,61 @@ mod r4_cli_policy_tests {
 
         assert!((config.bitrate_mbps - expected).abs() < 0.001);
         assert_eq!(config.bitrate_selection.source.name(), "quality-bpf");
+    }
+}
+
+#[cfg(test)]
+mod media_packet_boundary_tests {
+    use super::*;
+
+    fn encoded_packet_with_count(packet_count: u16) -> Vec<u8> {
+        let mut bytes = MediaPacket {
+            stream_id: STREAM_VIDEO,
+            flags: FLAG_END_OF_FRAME,
+            session_id: 1,
+            frame_id: 2,
+            packet_index: 0,
+            packet_count: 1,
+            timestamp_ms: 3,
+            payload: vec![0x41],
+        }
+        .encode()
+        .unwrap();
+        bytes[26..28].copy_from_slice(&packet_count.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn packet_count_zero_rejected() {
+        assert!(MediaPacket::decode(&encoded_packet_with_count(0)).is_err());
+    }
+
+    #[test]
+    fn packet_count_over_limit_rejected_before_allocation() {
+        let over_limit = u16::try_from(MAX_VIDEO_PACKET_COUNT + 1).unwrap();
+        assert!(MediaPacket::decode(&encoded_packet_with_count(over_limit)).is_err());
+    }
+
+    #[test]
+    fn max_legal_packet_count_accepted() {
+        let max_legal = u16::try_from(MAX_VIDEO_PACKET_COUNT).unwrap();
+        let packet = MediaPacket::decode(&encoded_packet_with_count(max_legal)).unwrap();
+        assert_eq!(packet.packet_count, max_legal);
+    }
+}
+
+#[cfg(test)]
+mod self_test_output_tests {
+    use super::self_test_success_json;
+
+    #[test]
+    fn self_test_success_includes_version_and_capabilities() {
+        let output = self_test_success_json();
+
+        assert!(output.contains(r#""type":"SELF_TEST""#));
+        assert!(output.contains(r#""ok":true"#));
+        assert!(output.contains(concat!(r#""version":""#, env!("CARGO_PKG_VERSION"), r#"""#)));
+        assert!(output.contains(r#""capabilities":{"#));
+        assert!(output.contains(r#""hardware_runtime_probe_required":true"#));
     }
 }

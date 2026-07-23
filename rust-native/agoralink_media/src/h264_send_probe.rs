@@ -2921,6 +2921,17 @@ mod platform {
                 return Err(error);
             }
         };
+        let _local_control = if config.mode == H264SendMode::Screen {
+            match crate::local_control::spawn_stdin_listener(observer.cancellation.clone()) {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    print_startup_failure(&config, &error);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         if config.verbose {
             eprintln!(
                 "h264-send-probe target={} duration_sec={} target_fps={} bitrate_mbps={} output={}x{} encoder={} convert_backend={} packet_pacing={} keyframe_interval_sec={:.3} udp_send_buffer_bytes={} color_matrix={} range={} packet_payload_max=1200",

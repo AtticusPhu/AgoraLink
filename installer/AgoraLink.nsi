@@ -4,12 +4,16 @@
 !define APP_NAME "AgoraLink"
 !define APP_PUBLISHER "AgoraLink"
 !define APP_EXE "AgoraLink.exe"
-!define APP_VERSION "1.0.0"
-!define FFMPEG_EXE "${ROOT}\dist\AgoraLink\_internal\tools\ffmpeg\bin\ffmpeg.exe"
-!define FFPLAY_EXE "${ROOT}\dist\AgoraLink\_internal\tools\ffmpeg\bin\ffplay.exe"
+!ifndef APP_VERSION
+!define APP_VERSION "0.0.12"
+!endif
+!ifndef INSTALLER_OUTFILE
+!define INSTALLER_OUTFILE "..\dist\AgoraLink_Setup_v${APP_VERSION}.exe"
+!endif
+!define RUST_MEDIA_EXE "${ROOT}\dist\AgoraLink\_internal\tools\agoralink_media\agoralink_media.exe"
 
 Name "${APP_NAME}"
-OutFile "..\dist\AgoraLink_Setup_v0.0.8.exe"
+OutFile "${INSTALLER_OUTFILE}"
 InstallDir "$LOCALAPPDATA\Programs\${APP_NAME}"
 InstallDirRegKey HKCU "Software\${APP_NAME}" "InstallDir"
 RequestExecutionLevel user
@@ -17,15 +21,11 @@ RequestExecutionLevel user
 !define MUI_ABORTWARNING
 !define MUI_ICON "${ROOT}\assets\app.ico"
 !define MUI_UNICON "${ROOT}\assets\app.ico"
-!define MUI_FINISHPAGE_TEXT "AgoraLink uses UDP 9999 for chat and file transfer. Screen sharing uses UDP 50020 or an automatically selected UDP port.$\r$\n$\r$\nOn first run, allow Windows Firewall access for private networks. AgoraLink does not modify firewall rules automatically. If needed, run allow_firewall_udp_9999_admin.bat as Administrator from the install folder."
+!define MUI_FINISHPAGE_TEXT "AgoraLink uses UDP 9999 for chat and file transfer. Native screen sharing uses an automatically selected high UDP port.$\r$\n$\r$\nOn first run, allow Windows Firewall access for private networks. AgoraLink does not modify firewall rules automatically. If needed, run allow_firewall_udp_9999_admin.bat as Administrator from the install folder."
 
-!if /FILEEXISTS "${FFMPEG_EXE}"
+!if /FILEEXISTS "${RUST_MEDIA_EXE}"
 !else
-    !error "Missing bundled FFmpeg: ${FFMPEG_EXE}. Build PyInstaller output before running NSIS."
-!endif
-!if /FILEEXISTS "${FFPLAY_EXE}"
-!else
-    !error "Missing bundled FFplay: ${FFPLAY_EXE}. Build PyInstaller output before running NSIS."
+    !error "Missing bundled native media runtime: ${RUST_MEDIA_EXE}. Build PyInstaller output before running NSIS."
 !endif
 
 !insertmacro MUI_PAGE_WELCOME

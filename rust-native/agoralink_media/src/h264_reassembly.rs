@@ -1,4 +1,3 @@
-use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
@@ -98,6 +97,10 @@ pub struct ReassemblyStats {
     pub frames_dropped_after_fec: u64,
     pub reassembly_frames_active: u64,
     pub reassembly_packets_active: u64,
+    pub reassembly_packet_slots_reserved: u64,
+    pub reassembly_payload_bytes_reserved: u64,
+    pub reassembly_budget_rejected_frames: u64,
+    pub reassembly_oversize_frames: u64,
     pub reassembly_allocations_estimate: u64,
     pub reassembly_complete_scan_count: u64,
     pub nack_requests_cancelled_by_progress: u64,
@@ -310,6 +313,7 @@ impl DamagedGopTracker {
 
 struct FrameAssembly {
     packet_count: u16,
+    reserved_payload_bytes: usize,
     packets: Vec<Option<Vec<u8>>>,
     received_count: u16,
     missing_count: u16,
@@ -332,9 +336,16 @@ struct FrameAssembly {
 }
 
 impl FrameAssembly {
-    fn new(packet_count: u16, now: Instant, timestamp_ms: u64, fec_expected: bool) -> Self {
+    fn new(
+        packet_count: u16,
+        reserved_payload_bytes: usize,
+        now: Instant,
+        timestamp_ms: u64,
+        fec_expected: bool,
+    ) -> Self {
         Self {
             packet_count,
+            reserved_payload_bytes,
             packets: (0..packet_count).map(|_| None).collect(),
             received_count: 0,
             missing_count: packet_count,
@@ -378,6 +389,8 @@ pub struct H264Reassembler {
     last_timing_frame: Option<(u64, u64)>,
     observed_frame_interval_ms: Option<f64>,
     repair_window: Option<Duration>,
+    inflight_packet_slots: usize,
+    inflight_payload_bytes: usize,
     stats: ReassemblyStats,
 }
 
@@ -408,6 +421,8 @@ impl H264Reassembler {
             last_timing_frame: None,
             observed_frame_interval_ms: None,
             repair_window: None,
+            inflight_packet_slots: 0,
+            inflight_payload_bytes: 0,
             stats: ReassemblyStats {
                 reorder_wait_ms: initial_reorder_wait_ms,
                 ..ReassemblyStats::default()
@@ -476,9 +491,13 @@ impl H264Reassembler {
         self.blocked_since = None;
         self.last_timing_frame = None;
         self.observed_frame_interval_ms = None;
+        self.inflight_packet_slots = 0;
+        self.inflight_payload_bytes = 0;
         self.stats.next_decode_frame_id = None;
         self.stats.reassembly_frames_active = 0;
         self.stats.reassembly_packets_active = 0;
+        self.stats.reassembly_packet_slots_reserved = 0;
+        self.stats.reassembly_payload_bytes_reserved = 0;
         Ok(())
     }
 
@@ -690,19 +709,6 @@ impl H264Reassembler {
         if self.next_frame.is_some_and(|next| packet.frame_id < next) {
             return;
         }
-        if !self.inflight.contains_key(&packet.frame_id)
-            && self.inflight.len() >= self.config.max_inflight_frames
-        {
-            if let Some(oldest) = self
-                .inflight
-                .iter()
-                .min_by_key(|(_, frame)| frame.first_seen)
-                .map(|(frame_id, _)| *frame_id)
-            {
-                self.expire_inflight_frame(oldest);
-            }
-        }
-
         if is_fec {
             self.accept_fec_packet(packet, now);
         } else {
@@ -712,19 +718,28 @@ impl H264Reassembler {
 
     fn accept_data_packet(&mut self, packet: MediaPacket, now: Instant) {
         let is_fec_protected = packet.flags & FLAG_FEC_PROTECTED != 0;
-        let entry = match self.inflight.entry(packet.frame_id) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                self.stats.reassembly_frames_active += 1;
-                self.stats.reassembly_allocations_estimate += 1;
-                entry.insert(FrameAssembly::new(
-                    packet.packet_count,
-                    now,
-                    packet.timestamp_ms,
-                    is_fec_protected,
-                ))
-            }
-        };
+        if !self.ensure_inflight_frame(
+            packet.frame_id,
+            packet.packet_count,
+            now,
+            packet.timestamp_ms,
+            is_fec_protected,
+        ) {
+            return;
+        }
+        if self.inflight.get(&packet.frame_id).is_some_and(|frame| {
+            frame.received_bytes.saturating_add(packet.payload.len()) > crate::MAX_VIDEO_FRAME_BYTES
+        }) {
+            self.stats.reassembly_oversize_frames =
+                self.stats.reassembly_oversize_frames.saturating_add(1);
+            self.stats.packets_invalid = self.stats.packets_invalid.saturating_add(1);
+            self.expire_inflight_frame(packet.frame_id);
+            return;
+        }
+        let entry = self
+            .inflight
+            .get_mut(&packet.frame_id)
+            .expect("reserved frame must exist before packet insertion");
         if entry.packet_count != packet.packet_count {
             self.stats.packets_invalid += 1;
             return;
@@ -774,19 +789,19 @@ impl H264Reassembler {
                 return;
             }
         };
-        let entry = match self.inflight.entry(packet.frame_id) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                self.stats.reassembly_frames_active += 1;
-                self.stats.reassembly_allocations_estimate += 1;
-                entry.insert(FrameAssembly::new(
-                    parity.data_packet_count,
-                    now,
-                    packet.timestamp_ms,
-                    true,
-                ))
-            }
-        };
+        if !self.ensure_inflight_frame(
+            packet.frame_id,
+            parity.data_packet_count,
+            now,
+            packet.timestamp_ms,
+            true,
+        ) {
+            return;
+        }
+        let entry = self
+            .inflight
+            .get_mut(&packet.frame_id)
+            .expect("reserved frame must exist before FEC insertion");
         if entry.packet_count != parity.data_packet_count {
             self.stats.fec_recovery_failed_invalid += 1;
             return;
@@ -921,6 +936,12 @@ impl H264Reassembler {
 
     fn remove_inflight_frame(&mut self, frame_id: u64) -> Option<FrameAssembly> {
         let frame = self.inflight.remove(&frame_id)?;
+        self.inflight_packet_slots = self
+            .inflight_packet_slots
+            .saturating_sub(usize::from(frame.packet_count));
+        self.inflight_payload_bytes = self
+            .inflight_payload_bytes
+            .saturating_sub(frame.reserved_payload_bytes);
         self.stats.reassembly_frames_active = self.stats.reassembly_frames_active.saturating_sub(1);
         let active_packets =
             u64::from(frame.received_count) + u64::from(frame.fec_parity.is_some());
@@ -928,7 +949,80 @@ impl H264Reassembler {
             .stats
             .reassembly_packets_active
             .saturating_sub(active_packets);
+        self.stats.reassembly_packet_slots_reserved = self.inflight_packet_slots as u64;
+        self.stats.reassembly_payload_bytes_reserved = self.inflight_payload_bytes as u64;
         Some(frame)
+    }
+
+    fn ensure_inflight_frame(
+        &mut self,
+        frame_id: u64,
+        packet_count: u16,
+        now: Instant,
+        timestamp_ms: u64,
+        fec_expected: bool,
+    ) -> bool {
+        if self.inflight.contains_key(&frame_id) {
+            return true;
+        }
+        let packet_slots = usize::from(packet_count);
+        let Some(reserved_payload_bytes) = frame_payload_reservation(packet_count) else {
+            self.reject_new_frame_for_budget(frame_id, packet_count);
+            return false;
+        };
+        let frame_limit = self
+            .config
+            .max_inflight_frames
+            .min(crate::MAX_INFLIGHT_FRAMES);
+        let slots_fit = self
+            .inflight_packet_slots
+            .checked_add(packet_slots)
+            .is_some_and(|total| total <= crate::MAX_INFLIGHT_PACKET_SLOTS);
+        let bytes_fit = self
+            .inflight_payload_bytes
+            .checked_add(reserved_payload_bytes)
+            .is_some_and(|total| total <= crate::MAX_INFLIGHT_PAYLOAD_BYTES);
+        if self.inflight.len() >= frame_limit || !slots_fit || !bytes_fit {
+            self.reject_new_frame_for_budget(frame_id, packet_count);
+            return false;
+        }
+
+        self.inflight_packet_slots += packet_slots;
+        self.inflight_payload_bytes += reserved_payload_bytes;
+        self.stats.reassembly_frames_active = self.stats.reassembly_frames_active.saturating_add(1);
+        self.stats.reassembly_packet_slots_reserved = self.inflight_packet_slots as u64;
+        self.stats.reassembly_payload_bytes_reserved = self.inflight_payload_bytes as u64;
+        self.stats.reassembly_allocations_estimate =
+            self.stats.reassembly_allocations_estimate.saturating_add(1);
+        self.inflight.insert(
+            frame_id,
+            FrameAssembly::new(
+                packet_count,
+                reserved_payload_bytes,
+                now,
+                timestamp_ms,
+                fec_expected,
+            ),
+        );
+        true
+    }
+
+    fn reject_new_frame_for_budget(&mut self, frame_id: u64, packet_count: u16) {
+        self.stats.packets_invalid = self.stats.packets_invalid.saturating_add(1);
+        self.stats.reassembly_budget_rejected_frames = self
+            .stats
+            .reassembly_budget_rejected_frames
+            .saturating_add(1);
+        self.stats.frames_incomplete_expired =
+            self.stats.frames_incomplete_expired.saturating_add(1);
+        self.stats.frames_missing_after_fec = self.stats.frames_missing_after_fec.saturating_add(1);
+        self.stats.frames_dropped_after_fec = self.stats.frames_dropped_after_fec.saturating_add(1);
+        self.stats.packets_lost_estimate = self
+            .stats
+            .packets_lost_estimate
+            .saturating_add(u64::from(packet_count));
+        self.stats.last_damaged_frame_id = Some(frame_id);
+        self.skipped.insert(frame_id);
     }
 
     fn take_ready(&mut self, now: Instant, force: bool) -> Vec<EncodedFrame> {
@@ -1027,6 +1121,17 @@ impl H264Reassembler {
         }
         ready
     }
+}
+
+fn frame_payload_reservation(packet_count: u16) -> Option<usize> {
+    let packet_count = usize::from(packet_count);
+    if packet_count == 0 || packet_count > crate::MAX_VIDEO_PACKET_COUNT {
+        return None;
+    }
+    packet_count
+        .checked_mul(crate::MAX_MEDIA_PAYLOAD)
+        .map(|bytes| bytes.min(crate::MAX_VIDEO_FRAME_BYTES))?
+        .checked_add(crate::MAX_MEDIA_PAYLOAD)
 }
 
 fn recover_missing_payload(
@@ -1701,8 +1806,106 @@ pub fn run_self_test() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{H264Reassembler, ReassemblyConfig, ReorderWait};
+
+    fn config() -> ReassemblyConfig {
+        ReassemblyConfig {
+            frame_timeout: Duration::from_millis(10),
+            reorder_wait: ReorderWait::Fixed(Duration::from_millis(5)),
+            max_inflight_frames: crate::MAX_INFLIGHT_FRAMES,
+        }
+    }
+
+    fn packet(frame_id: u64, packet_count: u16, packet_index: u16) -> crate::MediaPacket {
+        crate::MediaPacket {
+            stream_id: crate::STREAM_VIDEO,
+            flags: 0,
+            session_id: 1,
+            frame_id,
+            packet_index,
+            packet_count,
+            timestamp_ms: frame_id,
+            payload: vec![0x41],
+        }
+    }
+
     #[test]
     fn deterministic_reassembly_and_recovery_regressions() {
         super::run_self_test().expect("H.264 reassembly self-test");
+    }
+
+    #[test]
+    fn aggregate_slot_budget_enforced() {
+        let now = Instant::now();
+        let mut reassembler = H264Reassembler::new(config()).unwrap();
+        let packet_count = 30_000u16;
+        reassembler.accept_packet(packet(0, packet_count, 0), now);
+        reassembler.accept_packet(packet(1, packet_count, 0), now);
+        reassembler.accept_packet(packet(2, packet_count, 0), now);
+        let stats = reassembler.stats();
+        assert_eq!(reassembler.inflight_len(), 2);
+        assert_eq!(stats.reassembly_budget_rejected_frames, 1);
+        assert!(
+            stats.reassembly_packet_slots_reserved as usize <= crate::MAX_INFLIGHT_PACKET_SLOTS
+        );
+    }
+
+    #[test]
+    fn aggregate_byte_budget_enforced() {
+        let now = Instant::now();
+        let mut reassembler = H264Reassembler::new(config()).unwrap();
+        for frame_id in 0..10 {
+            reassembler.accept_packet(packet(frame_id, 5_000, 0), now);
+        }
+        let stats = reassembler.stats();
+        assert_eq!(reassembler.inflight_len(), 9);
+        assert_eq!(stats.reassembly_budget_rejected_frames, 1);
+        assert!(
+            stats.reassembly_payload_bytes_reserved as usize <= crate::MAX_INFLIGHT_PAYLOAD_BYTES
+        );
+    }
+
+    #[test]
+    fn budget_released_after_completion() {
+        let now = Instant::now();
+        let mut reassembler = H264Reassembler::new(config()).unwrap();
+        reassembler.accept_packet(packet(0, 1, 0), now);
+        let stats = reassembler.stats();
+        assert_eq!(reassembler.inflight_len(), 0);
+        assert_eq!(stats.reassembly_packet_slots_reserved, 0);
+        assert_eq!(stats.reassembly_payload_bytes_reserved, 0);
+    }
+
+    #[test]
+    fn budget_released_after_timeout() {
+        let now = Instant::now();
+        let mut reassembler = H264Reassembler::new(config()).unwrap();
+        reassembler.accept_packet(packet(0, 2, 0), now);
+        assert!(reassembler.stats().reassembly_packet_slots_reserved > 0);
+        reassembler.expire(now + Duration::from_millis(20));
+        let stats = reassembler.stats();
+        assert_eq!(reassembler.inflight_len(), 0);
+        assert_eq!(stats.reassembly_packet_slots_reserved, 0);
+        assert_eq!(stats.reassembly_payload_bytes_reserved, 0);
+    }
+
+    #[test]
+    fn duplicate_packet_does_not_change_reservation() {
+        let now = Instant::now();
+        let mut reassembler = H264Reassembler::new(config()).unwrap();
+        reassembler.accept_packet(packet(0, 2, 0), now);
+        let before = reassembler.stats();
+        reassembler.accept_packet(packet(0, 2, 0), now + Duration::from_millis(1));
+        let after = reassembler.stats();
+        assert_eq!(
+            after.reassembly_packet_slots_reserved,
+            before.reassembly_packet_slots_reserved
+        );
+        assert_eq!(
+            after.reassembly_payload_bytes_reserved,
+            before.reassembly_payload_bytes_reserved
+        );
     }
 }

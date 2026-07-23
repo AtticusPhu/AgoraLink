@@ -18,7 +18,6 @@ $RepoRoot = (Resolve-Path -LiteralPath (Join-Path $ScriptDir "..")).Path
 $SpecPath = Join-Path $RepoRoot "AgoraLink.spec"
 $CrateRoot = Join-Path $RepoRoot "rust-native\agoralink_media"
 $NativeExeSource = Join-Path $CrateRoot "target\release\agoralink_media.exe"
-$NativePdbSource = Join-Path $CrateRoot "target\release\agoralink_media.pdb"
 $OwnedRoot = Join-Path $RepoRoot "_local_artifacts"
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path $OwnedRoot "R4_GUI_PORTABLE_20260720"
@@ -174,15 +173,12 @@ function Invoke-PythonChecks {
 
 function Stage-NativeRuntime {
     Assert-Hash -Path $NativeExeSource -Expected $ExpectedNativeHash | Out-Null
-    Assert-File $NativePdbSource
     New-Item -ItemType Directory -Path $StageDir -Force | Out-Null
     Get-ChildItem -LiteralPath $StageDir -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -in @("agoralink_media.exe", "agoralink_media.pdb") } |
+        Where-Object { $_.Name -eq "agoralink_media.exe" } |
         Remove-Item -Force
     Copy-Item -LiteralPath $NativeExeSource -Destination (Join-Path $StageDir "agoralink_media.exe") -Force
-    Copy-Item -LiteralPath $NativePdbSource -Destination (Join-Path $StageDir "agoralink_media.pdb") -Force
     Assert-Hash -Path (Join-Path $StageDir "agoralink_media.exe") -Expected $ExpectedNativeHash | Out-Null
-    Assert-File (Join-Path $StageDir "agoralink_media.pdb")
 }
 
 function Assert-PortablePolicy {
@@ -213,16 +209,15 @@ function Assert-PortablePolicy {
 }
 
 function Write-PortableMetadata {
-    param([string]$GitBranch, [string]$GitCommit, [string]$PdbHash)
+    param([string]$GitBranch, [string]$GitCommit)
     $buildInfo = [ordered]@{
         release = $Release
         build_date = $BuildDate
         app_version = Get-AppVersion
-        package_flavor = "native_lite"
+        package_flavor = "native"
         git_branch = $GitBranch
         git_commit = $GitCommit
         native_exe_sha256 = $ExpectedNativeHash
-        native_pdb_sha256 = $PdbHash
         default_preset = "r4_default"
         default_width = 1920
         default_height = 1080
@@ -242,7 +237,7 @@ AgoraLink R4 Portable
 
 Launch: AgoraLink.exe
 Native runtime: _internal\tools\agoralink_media\agoralink_media.exe
-Symbols: _internal\tools\agoralink_media\agoralink_media.pdb
+Symbols are distributed separately from the public portable package.
 Default screen preset: r4_default (1920x1080, 60 FPS, 22 Mbps, NACK, adaptive off)
 Build date: 2026-07-20
 "@ | Set-Content -LiteralPath (Join-Path $PortableDir "PORTABLE_README.txt") -Encoding UTF8
@@ -262,7 +257,6 @@ Build date: 2026-07-20
     $required = @(
         "AgoraLink.exe",
         "_internal\tools\agoralink_media\agoralink_media.exe",
-        "_internal\tools\agoralink_media\agoralink_media.pdb",
         "BUILD_INFO.json",
         "PORTABLE_CONTENTS.json"
     )
@@ -293,7 +287,6 @@ function Invoke-NativeSelfTest {
 Assert-File $SpecPath
 Assert-File (Join-Path $RepoRoot "app_paths.py")
 Assert-File $NativeExeSource
-Assert-File $NativePdbSource
 Initialize-OutputRoot
 
 $Python = Resolve-Python
@@ -305,16 +298,13 @@ if ($gitBranch -ne "r4-default-adaptive-ladder") {
 }
 
 $nativeHash = Assert-Hash -Path $NativeExeSource -Expected $ExpectedNativeHash
-$pdbHash = (Get-FileHash -LiteralPath $NativePdbSource -Algorithm SHA256).Hash.ToUpperInvariant()
 Stage-NativeRuntime
 Invoke-PythonChecks -PythonExe $Python
 
-$oldFlavor = $env:AGORALINK_PACKAGE_FLAVOR
 $oldRuntimeDir = $env:AGORALINK_NATIVE_RUNTIME_DIR
 $oldKivyHome = $env:KIVY_HOME
 $oldCachePrefix = $env:PYTHONPYCACHEPREFIX
 try {
-    $env:AGORALINK_PACKAGE_FLAVOR = "native_lite"
     $env:AGORALINK_NATIVE_RUNTIME_DIR = $StageDir
     $env:KIVY_HOME = Join-Path $OutputRoot "kivy_home"
     $env:PYTHONPYCACHEPREFIX = Join-Path $OutputRoot "python_cache"
@@ -328,7 +318,6 @@ try {
     Invoke-Checked -FilePath $pyInstallerCommand.FilePath -Arguments $arguments -Step "PyInstaller R4 portable build"
 }
 finally {
-    $env:AGORALINK_PACKAGE_FLAVOR = $oldFlavor
     $env:AGORALINK_NATIVE_RUNTIME_DIR = $oldRuntimeDir
     $env:KIVY_HOME = $oldKivyHome
     $env:PYTHONPYCACHEPREFIX = $oldCachePrefix
@@ -337,9 +326,8 @@ finally {
 $PyDistApp = Join-Path $PyInstallerDist "AgoraLink"
 Assert-File (Join-Path $PyDistApp "AgoraLink.exe")
 Assert-Hash -Path (Join-Path $PyDistApp "_internal\tools\agoralink_media\agoralink_media.exe") -Expected $ExpectedNativeHash | Out-Null
-Assert-File (Join-Path $PyDistApp "_internal\tools\agoralink_media\agoralink_media.pdb")
 Copy-Item -LiteralPath $PyDistApp -Destination $PortableDir -Recurse
-Write-PortableMetadata -GitBranch $gitBranch -GitCommit $gitCommit -PdbHash $pdbHash
+Write-PortableMetadata -GitBranch $gitBranch -GitCommit $gitCommit
 Assert-PortablePolicy -Root $PortableDir
 
 Invoke-NativeSelfTest `
@@ -356,7 +344,6 @@ Expand-Archive -LiteralPath $PortableZip -DestinationPath $VerifyDir
 $ExtractedPortable = Join-Path $VerifyDir (Split-Path -Leaf $PortableDir)
 Assert-File (Join-Path $ExtractedPortable "AgoraLink.exe")
 Assert-Hash -Path (Join-Path $ExtractedPortable "_internal\tools\agoralink_media\agoralink_media.exe") -Expected $ExpectedNativeHash | Out-Null
-Assert-File (Join-Path $ExtractedPortable "_internal\tools\agoralink_media\agoralink_media.pdb")
 Assert-PortablePolicy -Root $ExtractedPortable
 Invoke-NativeSelfTest `
     -NativeExe (Join-Path $ExtractedPortable "_internal\tools\agoralink_media\agoralink_media.exe") `
@@ -370,7 +357,6 @@ $buildResult = [ordered]@{
     python = $Python
     native_source = $NativeExeSource
     native_exe_sha256 = $nativeHash
-    native_pdb_sha256 = $pdbHash
     bundled_native = Join-Path $PortableDir "_internal\tools\agoralink_media\agoralink_media.exe"
     portable_dir = $PortableDir
     portable_zip = $PortableZip

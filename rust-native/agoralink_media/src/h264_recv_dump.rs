@@ -339,9 +339,13 @@ mod platform {
         let stats = tracker.stats();
         let reassembly = reassembler.stats();
         format!(
-            r#""reassembly_frames_active":{},"reassembly_packets_active":{},"reassembly_fast_path_enabled":true,"reassembly_allocations_estimate":{},"reassembly_complete_scan_count":{},"fec_mode":"{}","fec_packets_received":{},"fec_frames_recovered":{},"fec_packets_recovered":{},"fec_recovery_failed_multi_missing":{},"fec_recovery_failed_no_parity":{},"fec_recovery_failed_invalid":{},"frames_missing_after_fec":{},"frames_dropped_after_fec":{},"damaged_gop_count":{},"frames_discarded_damaged_gop":{},"frames_discarded_waiting_keyframe":{},"waiting_keyframe":{},"waiting_keyframe_entries":{},"waiting_keyframe_exits":{},"idr_frames_received":{},"idr_frames_used_for_recovery":{},"non_idr_frames_discarded_waiting":{},"recovery_wait_ms_avg":{:.3},"recovery_wait_ms_max":{:.3},"recovery_wait_frames_avg":{:.3},"recovery_wait_frames_max":{},"next_decode_frame_id":{},"decode_gate_stalls":{},"decode_gate_gap_events":{},"decode_gate_gap_to_damage_ms_avg":{:.3},"decode_gate_gap_to_damage_ms_max":{:.3},"frames_buffered_waiting_order":{},"frames_discarded_decode_gate":{},"reorder_wait_ms":{}"#,
+            r#""reassembly_frames_active":{},"reassembly_packets_active":{},"reassembly_packet_slots_reserved":{},"reassembly_payload_bytes_reserved":{},"reassembly_budget_rejected_frames":{},"reassembly_oversize_frames":{},"reassembly_fast_path_enabled":true,"reassembly_allocations_estimate":{},"reassembly_complete_scan_count":{},"fec_mode":"{}","fec_packets_received":{},"fec_frames_recovered":{},"fec_packets_recovered":{},"fec_recovery_failed_multi_missing":{},"fec_recovery_failed_no_parity":{},"fec_recovery_failed_invalid":{},"frames_missing_after_fec":{},"frames_dropped_after_fec":{},"damaged_gop_count":{},"frames_discarded_damaged_gop":{},"frames_discarded_waiting_keyframe":{},"waiting_keyframe":{},"waiting_keyframe_entries":{},"waiting_keyframe_exits":{},"idr_frames_received":{},"idr_frames_used_for_recovery":{},"non_idr_frames_discarded_waiting":{},"recovery_wait_ms_avg":{:.3},"recovery_wait_ms_max":{:.3},"recovery_wait_frames_avg":{:.3},"recovery_wait_frames_max":{},"next_decode_frame_id":{},"decode_gate_stalls":{},"decode_gate_gap_events":{},"decode_gate_gap_to_damage_ms_avg":{:.3},"decode_gate_gap_to_damage_ms_max":{:.3},"frames_buffered_waiting_order":{},"frames_discarded_decode_gate":{},"reorder_wait_ms":{}"#,
             reassembly.reassembly_frames_active,
             reassembly.reassembly_packets_active,
+            reassembly.reassembly_packet_slots_reserved,
+            reassembly.reassembly_payload_bytes_reserved,
+            reassembly.reassembly_budget_rejected_frames,
+            reassembly.reassembly_oversize_frames,
             reassembly.reassembly_allocations_estimate,
             reassembly.reassembly_complete_scan_count,
             if reassembly.fec_packets_received > 0

@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.0.12 - 2026-07-20
+
+- Rejected pre-session, foreign-peer, stale-session, malformed, zero-ID, and replayed native screen close control messages.
+- Bounded H.264 packet counts and aggregate in-flight reassembly slots/payload before allocation.
+- Fixed short UDP datagram classification to use the length returned by `recv_from`.
+- Removed the external media runtime, capability, UI, configuration, packaging, and process-control paths; screen sharing now uses the bundled native Windows runtime only.
+- Added one-time migration of legacy backend/path settings to the native backend.
+- Added a local JSON stop channel and finite graceful, terminate, and force-kill deadlines for native screen subprocesses.
+- Made Python test discovery deterministic and added a zero-test guard, locked Python/Rust environments, and Windows CI definitions.
+- Removed PDB files from the public portable, added fail-closed portable privacy scanning, and added a separate privacy-gated symbols workflow.
+- Excluded unused Kivy file-video, ffpyplayer, and GStreamer provider modules/data from the native-only portable and extended the extracted-asset rejection scan accordingly.
+- Preserved the R4 default profile, NACK repair, adaptive ladder semantics, WGC/QSV/WMF/D3D11 media behavior, chat, file transfer, discovery, and database contracts.
+- Deferred the large Rust/Python module split to a later architecture-only change.
+
 ## R4 - 2026-07-17
 
 - Changed the fixed Rust native `screen-send` default to 1920x1080, 60 FPS, 22 Mbps, NACK repair, and adaptive quality off.
